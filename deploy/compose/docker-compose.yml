@@ -82,6 +82,25 @@ services:
       retries: 6
       start_period: 10s
 
+  # Решения о доступе (раздел 5): «может ли роль вызвать эндпоинт». --watch — правка .rego и
+  # data.yaml применяется сразу. Тесты политик (*_test.rego) серверу не нужны.
+  opa:
+    image: openpolicyagent/opa:1.21.3
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "--watch",
+              "--ignore=..*", "--ignore=*_test.rego",
+              "--set=decision_logs.console=true",  # каждое решение — строкой в лог
+              "/policies"]
+    volumes: [../../policies:/policies:ro]
+    ports: ["127.0.0.1:8181:8181"]
+    # Сервер отвечает и роли загружены (раздел 5: «не должен быть пустым»). В образе нет
+    # shell, wget и curl — HTTP-запрос к самому себе делает opa eval через http.send.
+    healthcheck:
+      test: ["CMD", "/opa", "eval", "--fail",
+             "http.send({\"method\": \"get\", \"url\": \"http://127.0.0.1:8181/v1/data/saleshub/roles\"}).body.result.org_admin"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # --- Веб-интерфейсы (раздел 11)
 
   pgadmin:

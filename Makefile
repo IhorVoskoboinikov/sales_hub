@@ -1,9 +1,11 @@
 # Команды проекта. Список с описаниями: make help
 COMPOSE = docker compose -f deploy/compose/docker-compose.yml
+# opa из Docker — ставить его локально не нужно. Версия — как в compose и CI.
+OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.21.3
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt
+.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -60,3 +62,12 @@ lint:  ## ruff + mypy, как в CI
 
 fmt:  ## отформатировать код и исправить то, что ruff умеет сам
 	$(BACKEND) uv run ruff format . && uv run ruff check --fix .
+
+policy-test:  ## тесты политик OPA: формат, проверка, opa test с покрытием
+	$(OPA) fmt --list --fail /policies
+	$(OPA) check --strict /policies
+	$(OPA) test -b /policies -v --coverage --format=json | python3 -c "import json,sys; print('покрытие', round(json.load(sys.stdin)['coverage'], 1), '%')"
+	$(OPA) test -b /policies
+
+policy-fmt:  ## отформатировать .rego
+	docker run --rm -v $(CURDIR)/policies:/policies openpolicyagent/opa:1.21.3 fmt -w /policies

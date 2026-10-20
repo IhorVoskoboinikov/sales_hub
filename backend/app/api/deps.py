@@ -22,6 +22,7 @@ from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.invites import InviteService
+from app.services.members import MemberService
 from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
 from app.uow import UnitOfWork
@@ -131,6 +132,12 @@ def get_org_service(uow: UnitOfWork = Depends(get_uow)) -> OrganizationService:
 
 def get_team_service(uow: UnitOfWork = Depends(get_uow)) -> TeamService:
     return TeamService(uow)
+
+
+def get_member_service(
+    uow: UnitOfWork = Depends(get_uow), cache: UserCache = Depends(get_user_cache)
+) -> MemberService:
+    return MemberService(uow, cache)
 
 
 def get_client_info(request: Request) -> ClientInfo:

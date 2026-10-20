@@ -14,6 +14,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import CITEXT
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -78,3 +79,9 @@ class User(Base):
     timezone: Mapped[str | None] = mapped_column(String(64))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    @hybrid_property
+    def owner_id(self) -> uuid.UUID:
+        """Для Access (раздел 5): «своя» запись о пользователе — это он сам. Работает и для
+        объекта в памяти, и в SQL (User.owner_id → users.id)."""
+        return self.id

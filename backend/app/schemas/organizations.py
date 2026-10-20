@@ -5,6 +5,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 
+from app.models import Role
+
 
 def _check_timezone(name: str) -> str:
     try:
@@ -62,3 +64,24 @@ class TeamOut(BaseModel):
     id: uuid.UUID
     name: str
     created_at: datetime
+
+
+class MemberOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    email: str
+    role: str | None
+    team_id: uuid.UUID | None
+    is_active: bool
+    last_login_at: datetime | None
+    created_at: datetime
+
+
+class MemberUpdate(BaseModel):
+    """Поля, которых нет в запросе, не меняются. team_id: null — снять отдел.
+    При смене роли на org_admin или viewer отдел снимается сам."""
+
+    role: Role | None = None
+    team_id: uuid.UUID | None = None
+    is_active: bool | None = None

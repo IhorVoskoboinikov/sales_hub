@@ -7,10 +7,10 @@
 from typing import Any
 
 import httpx
-from fastapi import FastAPI
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
 
+from app.api.v1 import admin_router, protected_router
 from app.authz.deps import opa_decision
 from app.authz.opa import OpaClient
 
@@ -19,14 +19,17 @@ def needs_opa(dependant: Dependant) -> bool:
     return any(d.call is opa_decision or needs_opa(d) for d in dependant.dependencies)
 
 
-def opa_routes(app: FastAPI) -> set[str]:
-    """Все «METHOD /шаблон», которые спрашивают OPA (роутеры protected и admin)."""
-    return {
-        f"{method} {route.path}"
-        for route in app.routes
-        if isinstance(route, APIRoute) and needs_opa(route.dependant)
-        for method in route.methods
-    }
+def opa_routes() -> set[str]:
+    """Все «METHOD /шаблон» роутеров protected и admin. С FastAPI 0.151 app.routes хранит не
+    маршруты, а обёртки подключённых роутеров, поэтому берём маршруты у самих роутеров."""
+    routes = [
+        route
+        for router in (protected_router, admin_router)
+        for route in router.routes
+        if isinstance(route, APIRoute)
+    ]
+    assert all(needs_opa(route.dependant) for route in routes), "маршрут без проверки OPA"
+    return {f"{method} {route.path}" for route in routes for method in route.methods}
 
 
 async def route_actions(opa_url: str) -> dict[str, Any]:
@@ -34,7 +37,8 @@ async def route_actions(opa_url: str) -> dict[str, Any]:
         return await OpaClient(http, opa_url).route_actions()
 
 
-async def test_every_protected_route_is_in_routes_rego(app: FastAPI, opa_url: str) -> None:
-    missing = opa_routes(app) - set(await route_actions(opa_url))
+async def test_routes_match_policy(opa_url: str) -> None:
+    in_app, in_policy = opa_routes(), set(await route_actions(opa_url))
 
-    assert missing == set(), f"добавьте строки в policies/saleshub/routes.rego: {missing}"
+    assert in_app - in_policy == set(), "эндпоинты без строки в policies/saleshub/routes.rego"
+    assert in_policy - in_app == set(), "строки routes.rego без эндпоинта (устарели?)"

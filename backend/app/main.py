@@ -15,6 +15,7 @@ from app.api.v1 import (  # noqa: F401 — модули с эндпоинтам�
     organizations,
     protected_router,
     teams,
+    users,
 )
 from app.authz.opa import OpaClient
 from app.authz.roles import RoleCatalog

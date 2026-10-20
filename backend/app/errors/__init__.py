@@ -20,6 +20,9 @@ class AppError(Exception):
         self.details = details
         super().__init__(self.code)
 
+    def response_headers(self) -> dict[str, str] | None:
+        return self.headers
+
     @property
     def title(self) -> str:
         # Текст своего кода, иначе — ближайшего родителя, у которого он есть:
@@ -58,6 +61,11 @@ class ValidationFailed(AppError):
 class RateLimited(AppError):
     status = 429
     code = "rate_limited"
+
+    def response_headers(self) -> dict[str, str] | None:
+        # Через сколько секунд можно повторить (RFC 9110). То же число — в details.retry_after.
+        retry_after = self.details.get("retry_after")
+        return {"Retry-After": str(retry_after)} if retry_after is not None else None
 
 
 class ServiceUnavailable(AppError):

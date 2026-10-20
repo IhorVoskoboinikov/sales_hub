@@ -7,6 +7,8 @@ from app.emails.render import render_email
 from app.emails.sender import Mailer
 from app.errors import ValidationFailed
 from app.models import EmailTokenPurpose
+from app.repositories import rate_limiter
+from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
 from app.services.auth import cached_user, ensure_can_sign_in
 from app.services.email_tokens import format_expiry, issue_email_token, use_email_token
@@ -19,18 +21,22 @@ class PasswordResetService:
         uow: UnitOfWork,
         mailer: Mailer,
         cache: UserCache,
+        limiter: RateLimiter,
         ttl: timedelta,
         docs_url: str,
     ) -> None:
         self.uow = uow
         self.mailer = mailer
         self.cache = cache
+        self.limiter = limiter
         self.ttl = ttl
         self.docs_url = docs_url
 
     async def forgot(self, email: str) -> None:
         """Письмо со ссылкой — только существующему и активному пользователю. Снаружи разницы
-        не видно: ответ всегда 202, а письмо уходит после ответа."""
+        не видно: ответ всегда 202, а письмо уходит после ответа. Лимит — 3 запроса в час на
+        email, и для несуществующих тоже: иначе 429 выдавал бы, что email есть в базе."""
+        await self.limiter.hit(rate_limiter.PASSWORD_FORGOT, email.casefold())
         user = await self.uow.users.get_by_email(email)
         if user is None or not user.is_active:
             return

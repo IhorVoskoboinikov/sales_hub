@@ -16,6 +16,7 @@ from app.core.jwt import KeySet
 from app.emails.mailer import BackgroundMailer
 from app.emails.sender import EmailSender, Mailer
 from app.errors import Forbidden, Unauthorized
+from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.invites import InviteService
@@ -67,22 +68,32 @@ def get_user_cache(redis: Redis = Depends(get_redis)) -> UserCache:
     return UserCache(redis)
 
 
+def get_rate_limiter(redis: Redis = Depends(get_redis)) -> RateLimiter:
+    return RateLimiter(redis)
+
+
 def get_auth_service(
     uow: UnitOfWork = Depends(get_uow),
     keys: KeySet = Depends(get_key_set),
     cache: UserCache = Depends(get_user_cache),
+    limiter: RateLimiter = Depends(get_rate_limiter),
     settings: Settings = Depends(get_app_settings),
 ) -> AuthService:
-    return AuthService(uow, keys, cache, timedelta(days=settings.refresh_ttl_days))
+    return AuthService(uow, keys, cache, limiter, timedelta(days=settings.refresh_ttl_days))
 
 
 def get_invite_service(
     uow: UnitOfWork = Depends(get_uow),
     mailer: Mailer = Depends(get_mailer),
+    limiter: RateLimiter = Depends(get_rate_limiter),
     settings: Settings = Depends(get_app_settings),
 ) -> InviteService:
     return InviteService(
-        uow, mailer, timedelta(days=settings.invite_ttl_days), f"{settings.public_url}/docs"
+        uow,
+        mailer,
+        limiter,
+        timedelta(days=settings.invite_ttl_days),
+        f"{settings.public_url}/docs",
     )
 
 
@@ -90,12 +101,14 @@ def get_password_reset_service(
     uow: UnitOfWork = Depends(get_uow),
     mailer: Mailer = Depends(get_mailer),
     cache: UserCache = Depends(get_user_cache),
+    limiter: RateLimiter = Depends(get_rate_limiter),
     settings: Settings = Depends(get_app_settings),
 ) -> PasswordResetService:
     return PasswordResetService(
         uow,
         mailer,
         cache,
+        limiter,
         timedelta(minutes=settings.reset_password_ttl_minutes),
         f"{settings.public_url}/docs",
     )

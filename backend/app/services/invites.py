@@ -1,6 +1,7 @@
 """Приглашения (раздел 4). Этап 2: только супер-админ и без организации — организация, отдел
 и роль появятся в приглашении на этапе 3."""
 
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -9,6 +10,8 @@ from app.emails.render import render_email
 from app.emails.sender import Mailer
 from app.errors import Conflict
 from app.models import EmailTokenPurpose, User
+from app.repositories import rate_limiter
+from app.repositories.rate_limiter import RateLimiter
 from app.services.email_tokens import format_expiry, issue_email_token, use_email_token
 from app.uow import UnitOfWork
 
@@ -20,13 +23,23 @@ class Invite:
 
 
 class InviteService:
-    def __init__(self, uow: UnitOfWork, mailer: Mailer, ttl: timedelta, docs_url: str) -> None:
+    def __init__(
+        self,
+        uow: UnitOfWork,
+        mailer: Mailer,
+        limiter: RateLimiter,
+        ttl: timedelta,
+        docs_url: str,
+    ) -> None:
         self.uow = uow
         self.mailer = mailer
+        self.limiter = limiter
         self.ttl = ttl
         self.docs_url = docs_url
 
-    async def invite(self, email: str) -> Invite:
+    async def invite(self, email: str, inviter_id: uuid.UUID) -> Invite:
+        # 50 приглашений в час. Этап 2 — на того, кто приглашает; с этапа 3 — на организацию.
+        await self.limiter.hit(rate_limiter.INVITE, str(inviter_id))
         if await self.uow.users.get_by_email(email) is not None:
             raise Conflict("invite.email_taken")
         token = await issue_email_token(self.uow, EmailTokenPurpose.INVITE, email, self.ttl)

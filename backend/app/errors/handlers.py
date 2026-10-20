@@ -59,7 +59,9 @@ async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)
     log = logger.warning if exc.status < 500 else logger.error
     log("app_error", code=exc.code, status=exc.status)
-    return problem(exc.status, exc.code, exc.details, headers=exc.headers, title=exc.title)
+    return problem(
+        exc.status, exc.code, exc.details, headers=exc.response_headers(), title=exc.title
+    )
 
 
 async def validation_error_handler(request: Request, exc: Exception) -> JSONResponse:

@@ -17,6 +17,8 @@ from app.core.security import (
 )
 from app.errors import Forbidden, NotFound, Unauthorized, ValidationFailed
 from app.models import RefreshToken, User
+from app.repositories import rate_limiter
+from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import CachedUser, UserCache
 from app.uow import UnitOfWork
 
@@ -67,20 +69,27 @@ class AuthService:
         uow: UnitOfWork,
         keys: KeySet,
         cache: UserCache,
+        limiter: RateLimiter,
         refresh_ttl: timedelta,
     ) -> None:
         self.uow = uow
         self.keys = keys
         self.cache = cache
+        self.limiter = limiter
         self.refresh_ttl = refresh_ttl
 
     async def login(self, email: str, password: str, client: ClientInfo) -> TokenPair:
+        # Считаем только неудачные попытки: 5 за 15 минут на пару email + IP.
+        attempt = f"{email.casefold()}:{client.ip}"
+        await self.limiter.ensure_not_exceeded(rate_limiter.LOGIN, attempt)
         user = await self.uow.users.get_by_email(email)
         if user is None:
             await verify_dummy_password(password)  # то же время ответа, что и с настоящим email
+            await self.limiter.add_attempt(rate_limiter.LOGIN, attempt)
             raise Unauthorized("auth.invalid_credentials")
         ok, new_hash = await verify_password(password, user.password_hash)
         if not ok:
+            await self.limiter.add_attempt(rate_limiter.LOGIN, attempt)
             raise Unauthorized("auth.invalid_credentials")
         # Причину отказа говорим только тому, кто знает пароль.
         ensure_can_sign_in(cached_user(user))

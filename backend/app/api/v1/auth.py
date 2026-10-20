@@ -33,7 +33,11 @@ from app.uow import UnitOfWork
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
-AUTH_ERRORS: dict[int | str, dict[str, Any]] = {401: {"model": ErrorOut}, 403: {"model": ErrorOut}}
+AUTH_ERRORS: dict[int | str, dict[str, Any]] = {
+    401: {"model": ErrorOut},
+    403: {"model": ErrorOut},
+}
+RATE_LIMITED: dict[int | str, dict[str, Any]] = {429: {"model": ErrorOut}}
 
 
 def token_out(pair: TokenPair) -> TokenOut:
@@ -44,7 +48,7 @@ def token_out(pair: TokenPair) -> TokenOut:
     )
 
 
-@router.post("/login", responses=AUTH_ERRORS)
+@router.post("/login", responses={**AUTH_ERRORS, **RATE_LIMITED})
 async def login(
     form: OAuth2PasswordRequestForm = Depends(),
     client: ClientInfo = Depends(get_client_info),
@@ -53,7 +57,8 @@ async def login(
     """Вход по email и паролю. Поле username — это email (так требует OAuth2).
 
     Неверный email и неверный пароль дают одинаковый ответ 401 `auth.invalid_credentials`:
-    по нему нельзя узнать, есть ли такой пользователь."""
+    по нему нельзя узнать, есть ли такой пользователь. После 5 неудачных попыток за 15 минут
+    с одного IP для этого email — 429 и заголовок Retry-After."""
     return token_out(await auth.login(form.username.strip(), form.password, client))
 
 
@@ -138,7 +143,7 @@ async def accept_invite(
     return MeOut.model_validate(await invites.accept(body.token, body.password))
 
 
-@router.post("/password/forgot", status_code=status.HTTP_202_ACCEPTED)
+@router.post("/password/forgot", status_code=status.HTTP_202_ACCEPTED, responses=RATE_LIMITED)
 async def forgot_password(
     body: PasswordForgotIn,
     passwords: PasswordResetService = Depends(get_password_reset_service),

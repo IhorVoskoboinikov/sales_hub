@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from structlog.testing import capture_logs
 
-from app.errors import AppError, Conflict, NotFound, Unauthorized
+from app.errors import AppError, Conflict, NotFound, RateLimited, Unauthorized
 from app.texts import uk
 
 router = APIRouter(prefix="/test")
@@ -186,3 +186,8 @@ async def test_other_integrity_error_is_500(client: AsyncClient) -> None:
 
     assert resp.status_code == 500
     assert resp.json()["code"] == "internal"
+
+
+def test_rate_limited_sets_retry_after_header() -> None:
+    assert RateLimited(retry_after=42).response_headers() == {"Retry-After": "42"}
+    assert RateLimited().response_headers() is None

@@ -181,7 +181,7 @@ sales_hub/
 | `refresh_tokens` | id, user\_id, family\_id (= `sid`), token\_hash (unique), created\_at, expires\_at, revoked\_at, replaced\_by, user\_agent, ip | раздел 4 |
 | `email_tokens` | id, user\_id, email, purpose (`invite` / `reset_password`), token\_hash, payload jsonb (org\_id, team\_id, role для приглашения), created\_at, expires\_at, used\_at | раздел 4 |
 | `organizations` | id, name, slug (unique), plan, display\_currency (по умолчанию UAH), timezone (по умолчанию Europe/Kyiv), created\_at | тенант: компания, которая пользуется CRM; создаёт только супер-админ |
-| `teams` | id, org\_id, name, created\_at | отдел продаж; UNIQUE (id, org\_id) для составного FK из `users`; отдел с людьми удалить нельзя — 409 |
+| `teams` | id, org\_id, name, created\_at | отдел продаж; UNIQUE (id, org\_id) для составного FK из `users`; UNIQUE (org\_id, name) — два одинаковых отдела в организации путают (409 `team.name_taken`); отдел с людьми удалить нельзя — 409 `team.has_members` |
 
 ### CRM-сущности
 
@@ -201,7 +201,7 @@ sales_hub/
 | `bulk_jobs` | id, kind (`import_contacts`, `reassign_owner`, `move_team`, `close_stale_deals`, `add_tags`, `export`, `reindex`), status, stage (шаг импорта), params jsonb (фильтр + `Access` того, кто запустил), idempotency\_key, total, processed, failed, error, org\_id (NULL у задач супер-админа), team\_id, owner\_id (кто запустил — по этим полям работают `bulk_job:read` и `bulk_job:cancel`), timestamps |
 | `import_errors` | job\_id, row\_no, raw jsonb, error — строки CSV, которые не прошли валидацию |
 | `outbox_events` | transactional outbox: события и письма |
-| `audit_log` | кто что изменил, `PARTITION BY RANGE (occurred_at)` |
+| `audit_log` | кто что изменил: id, occurred\_at, org\_id, actor\_id (оба без FK — журнал переживает удаление), action (`member.updated`, `team.created`, `invite.created`…), entity\_type, entity\_id, changes jsonb (`{"role": ["viewer", "org_admin"]}` — было и стало), request\_id. Запись — в той же транзакции, что и изменение. Этап 3 — обычная таблица с индексом (org\_id, occurred\_at); `PARTITION BY RANGE (occurred_at)` и `GET /audit` — этап 4 |
 | fx\_rates | rate\_date, currency, rate\_uah numeric(14,6) (гривен за 1 единицу валюты), source = NBU, fetched\_at; PK (rate\_date, currency) — курсы НБУ |
 | failed\_tasks | задачи Celery, упавшие после всех ретраев: имя, аргументы, ошибка, request\_id, replayed\_at (раздел 15) |
 | sent\_notifications | dedup\_key (unique), channel, user\_id, sent\_at — защита от повторной отправки писем и сообщений |
@@ -504,7 +504,7 @@ LIMIT 50;
 
 А `PATCH /api/v1/deals/42` от того же менеджера: репозиторий ищет сделку по id **с тем же фильтром** (`get_visible_or_404`). Сделка чужая — 404 (не раскрываем, что она существует), своя — изменяется.
 
-**Почему одно правило записано в трёх формах и как они не разойдутся.** `matches()` проверяет объект в памяти, `sql_filter()` — строки в Postgres, `es_filter()` — документы в Elasticsearch. Все три лежат рядом в `access.py`, и каждая — это три ветки `own / team / org`. Тест на hypothesis генерирует сотни случайных пользователей и объектов и проверяет, что все три формы отвечают одинаково. Это главная защита от ситуации «в списке не видно, а по прямой ссылке открывается».
+**Почему одно правило записано в трёх формах и как они не разойдутся.** `matches()` проверяет объект в памяти, `sql_filter()` — строки в Postgres, `es_filter()` — документы в Elasticsearch. Все три лежат рядом в `access.py`, и каждая — это три ветки `own / team / org`. Тест `test_access_forms` перебирает все сочетания «кто спрашивает» (уровень × пользователь × организация × отдел, включая «без отдела») и «чья запись» (организация × отдел × ответственный, включая NULL) — их всего несколько десятков, поэтому полный перебор надёжнее случайной генерации (hypothesis) — и проверяет на настоящем Postgres, что формы отвечают одинаково. Это главная защита от ситуации «в списке не видно, а по прямой ссылке открывается».
 
 ### Где что хранится
 
@@ -610,7 +610,7 @@ roles:
 
 ### Политики
 
-Проверены `opa test` на OPA 1.4.2: 11 тестов проходят, `opa fmt` и `opa check` без замечаний; намеренная опечатка в имени действия, неверный уровень и слишком широкий `export:run` роняют тесты.
+В проекте — OPA 1.21.3 (compose, testcontainers и CI). `make policy-test` запускает OPA из Docker: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies -v` и покрытие `--coverage --threshold 90`; тот же make-таргет — job `policy` в CI. Тесты на маршруты этапов 4–9 добавляются в `authz_test.rego` вместе с маршрутами. Намеренная опечатка в имени действия, неверный уровень и слишком широкий `export:run` роняют тесты.
 
 **Как читать Rego.** Обращение к отсутствующему ключу в Rego даёт не ошибку, а «нет значения» (undefined). Правило, в котором встретилось такое значение, просто не срабатывает, и берётся значение `default`. Поэтому для неописанного эндпоинта: `action` нет → ни одно `allow` не сработало → `allow = false`, `decision = {allow: false}`. Строка `permissions[action]` проверяет только, что ключ есть: значение `own` / `team` / `org` в условии считается истиной.
 
@@ -917,7 +917,7 @@ class Access:
    - у `team_lead` и `sales_rep` отдел обязателен, у `org_admin` и `viewer` его нет; отдел — из той же организации;
    - `super_admin` нельзя назначить через API;
    - приглашение на email, который уже есть в базе, не создаётся, но ответ тот же 202, а человеку уходит письмо «вы уже состоите в другой организации» — админ чужой организации не узнаёт, что email занят (как в `password/forgot`). При `invite/accept` сервис ещё раз проверяет, что email свободен и отдел существует (иначе 409 `invite.stale`).
-   Причина отказа возвращается в теле ответа (`code` = `member.cannot_change_self`, `member.team_required` и т. д.).
+   Причина отказа возвращается в теле ответа: 403 `member.cannot_change_self`, 409 `member.last_admin`, 422 `member.team_required` / `member.team_not_allowed` / `member.team_not_found`. Через обычный API `member.last_admin` недостижим (сам себе админ ничего не меняет, значит, пока он снимает другого, остаётся он сам) — правило срабатывает при гонке, и проверяет его тест на настоящих транзакциях.
 5. Перевод менеджера в другой отдел запускает bulk job `move_team`: `team_id` всех его записей переносится теми же чанками, что и при передаче клиентов (раздел 6), — клиенты переходят в новый отдел вместе с ним.
 6. Любое изменение `role`, `team_id`, `is_active` → **после** `commit` удалить пользователя из кэша Redis + запись в `audit_log`. Токен перевыпускать не нужно: роли нет в JWT, новая роль действует со следующего запроса (60 с — лишь страховка, если удаление ключа не прошло). Отключение пользователя дополнительно делает `token_version += 1` и отзывает все его refresh-токены — доступ пропадает сразу.
 7. Изменить права роли (что может `sales_rep`) — PR в `data.yaml` + `opa test` в CI + деплой.
@@ -926,16 +926,16 @@ class Access:
 
 - **Сайдкар** в поде `api`: `opa run --server --addr=127.0.0.1:8181 --watch --ignore='..*' /policies`. Запрос по localhost — около миллисекунды.
 - **Kubernetes.** Политики попадают в под через ConfigMap: Helm собирает `routes.rego`, `authz.rego` и `data.yaml` (без `*_test.rego`). ConfigMap не хранит подпапки, поэтому он монтируется в `mountPath: /policies/saleshub` — тогда `data.yaml` оказывается в `data.saleshub.roles`. `--ignore='..*'` нужен из-за служебных папок `..data` и `..<время>`, которые Kubernetes кладёт в каждый ConfigMap: без него OPA видит файлы трижды и не стартует, а с `--bundle` кладёт данные не туда, и все получают 403 (проверено на OPA 1.4.2). Тот же ConfigMap монтируется и в контейнер `api` (`POLICIES_DIR=/policies`), поэтому OPA и бэкенд читают один файл. В шаблоне пода — аннотация `checksum/policies`: при правке политик Helm перезапускает под, и обе стороны перечитывают правила. Позже (этап CD) — бандлом: CI делает `opa build` и публикует bundle в GHCR как OCI-артефакт.
-- **Compose.** Папка `./policies` монтируется и в `opa` (та же команда), и в `api`; uvicorn запускается с `--reload --reload-dir /policies --reload-include 'data.yaml'`, иначе он следит только за `.py`. Правка `.rego` и `data.yaml` применяется сразу в обоих. В Tilt — то же через `sync`.
+- **Compose.** Папка `./policies` монтируется и в `opa` (та же команда плюс `--ignore=*_test.rego` и decision logs в консоль), и в `api`; uvicorn запускается с `--reload --reload-dir /policies --reload-include 'data.yaml'`, иначе он следит только за `.py`. В образе OPA нет shell, wget и curl, поэтому healthcheck — `opa eval --fail` с `http.send` к самому серверу: он проверяет, что `/v1/data/saleshub/roles` не пустой, и `api` стартует только после этого. Правка `.rego` и `data.yaml` применяется сразу в обоих. В Tilt — то же через `sync`.
 - **Проверка после деплоя:** `curl localhost:8181/v1/data/saleshub/roles` не должен быть пустым.
 - **Fail closed:** OPA недоступен → 503, алерт `OpaUnavailable` (раздел 8).
 - **Decision logs:** OPA пишет каждое решение (вход + результат) в stdout → Loki → Grafana: видно, кому и почему отказали.
 
 ### Права в Swagger и тест покрытия
 
-- При старте приложение читает `data.saleshub.routes.actions` из OPA и дописывает в описание каждой операции «Требуется: `deal:write`», а также роли и уровни из `data.yaml`: «org\_admin — org, team\_lead — team, sales\_rep — own».
+- При старте приложение читает `data.saleshub.routes.actions` из OPA (до 5 попыток раз в секунду; не ответил — Swagger без прав, приложение всё равно стартует) и дописывает в описание каждой операции «Требуется: `deal:write`», а также роли и уровни из `data.yaml`: «org\_admin — org, team\_lead — team, sales\_rep — own». То же действие — в расширении `x-required-action` для генераторов клиентов.
 - `GET /api/v1/auth/me` возвращает роль и `permissions` — действия роли из `data.yaml` с уровнями; фронт по ним прячет кнопки. У супер-админа — `is_superadmin: true` и пустой `permissions`.
-- `test_routes_match_policy` (pytest): множество маршрутов роутеров `protected` и `admin` должно совпадать с ключами `actions` в `routes.rego`. Новый эндпоинт без правила или устаревшее правило без эндпоинта — CI падает. Второй тест перехватывает `input`, который `opa_decision` реально отправляет в OPA, и проверяет, что `METHOD route` есть среди ключей, — так ловится ошибка с префиксом пути.
+- `test_routes_match_policy` (pytest): множество маршрутов роутеров `protected_router` и `admin_router` (`app/api/v1/__init__.py`) должно совпадать с ключами `actions` в `routes.rego`. Маршруты берутся у самих роутеров: в FastAPI 0.151 `include_router` кладёт в `app.routes` не маршруты, а обёртки `_IncludedRouter`. Новый эндпоинт без правила или устаревшее правило без эндпоинта — CI падает. Второй тест перехватывает `input`, который `opa_decision` реально отправляет в OPA, и проверяет, что `METHOD route` есть среди ключей, — так ловится ошибка с префиксом пути.
 
 ### Нужен ли Auth0
 
@@ -1207,14 +1207,23 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 ### Матрица прав (генерируется)
 
 ```python
-CASES = build_matrix(app.routes)   # маршруты — из OPA (data.saleshub.routes.actions), уровни — из data.yaml
+# tests/integration/test_access_matrix.py (сокращённо)
+CASES = {   # как вызвать каждый маршрут routes.rego: тело и чьи объекты подставлять в путь
+    "PATCH /api/v1/teams/{team_id}": Case(lambda: {"name": unique("Відділ")}, ("same_org", "other_org")),
+    ...
+}
 
-@pytest.mark.parametrize("role,route,target,expected", CASES)
-async def test_access(role, route, target, expected, client_as):
-    # target: own | same_team | same_org | other_org
-    resp = await client_as(role).request(route.method, route.url_for(target))
-    assert resp.status_code == expected   # 2xx / 403 / 404
+def test_every_route_has_a_case(route_actions):          # маршруты — у живого OPA
+    assert set(route_actions) == set(CASES)              # новый маршрут без кейса — CI падает
+
+@pytest.mark.parametrize(("role", "route", "target"), all_cases())
+async def test_access(role, route, target, route_actions, client, ...):
+    world = await build_world(...)                       # две организации, люди всех ролей
+    resp = await client.request(method, url_for(route, target, world), ...)
+    assert resp.status_code == expected_status(role, route_actions[route], target, success)
 ```
+
+На этапе 3 цели — `same_org` и `other_org` (объекты организации); `own` и `same_team` добавятся с CRM-данными на этапе 4. Чтобы сотня кейсов шла за секунды, хэш пароля считается один раз на запуск, а access-токен выпускается напрямую через `KeySet` — без логина с argon2.
 
 Ожидаемый ответ считается из `data.yaml`: действия нет у роли → 403; чтение или изменение одного объекта: объект в уровне роли → 2xx, вне уровня → 404; создание или изменение, после которого объект выходит из уровня (чужой ответственный или отдел) → 403 `out_of_scope`; список → 200, но без строк вне уровня. Супер-админ на обычных эндпоинтах → 403.
 

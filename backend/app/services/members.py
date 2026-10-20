@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from app.authz.access import Access
 from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
 from app.models import ROLES_WITH_TEAM, Role, User
+from app.repositories.audit import diff
 from app.repositories.user_cache import UserCache
 from app.uow import UnitOfWork
 
@@ -64,7 +65,18 @@ class MemberService:
             # Отключение действует сразу: все сессии закрыты, живые access-токены мертвы.
             user.token_version += 1
             await self.uow.refresh_tokens.revoke_all_for_user(user.id, datetime.now(UTC))
+        before = {"role": user.role, "team_id": user.team_id, "is_active": user.is_active}
         user.role, user.team_id, user.is_active = role, team_id, is_active
+        after = {"role": user.role, "team_id": user.team_id, "is_active": user.is_active}
+        if changed := diff(before, after):
+            self.uow.audit.record(
+                actor_id=access.user_id,
+                org_id=access.org_id,
+                action="member.updated",
+                entity_type="user",
+                entity_id=user.id,
+                changes=changed,
+            )
         await self.uow.commit()
         # После коммита: иначе другой запрос успел бы положить в кэш старую роль.
         await self.cache.invalidate(user.id)

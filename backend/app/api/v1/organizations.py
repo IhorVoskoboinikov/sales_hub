@@ -5,13 +5,14 @@ import uuid
 
 from fastapi import Depends, status
 
-from app.api.deps import get_invite_service, get_org_service
+from app.api.deps import current_user, get_invite_service, get_org_service
 from app.api.v1 import admin_router, protected_router
 from app.api.v1.errors import CONFLICT, NOT_FOUND, PROTECTED, RATE_LIMITED
 from app.authz.access import Access
 from app.authz.deps import authorize
 from app.schemas.auth import InviteIn, InviteOut
 from app.schemas.organizations import OrgCreate, OrgOut, OrgUpdate
+from app.services.auth import CurrentUser
 from app.services.invites import InviteService
 from app.services.organizations import OrganizationService
 
@@ -26,11 +27,13 @@ async def list_orgs(orgs: OrganizationService = Depends(get_org_service)) -> lis
     "/orgs", status_code=status.HTTP_201_CREATED, responses={**PROTECTED, **CONFLICT}
 )
 async def create_org(
-    body: OrgCreate, orgs: OrganizationService = Depends(get_org_service)
+    body: OrgCreate,
+    admin: CurrentUser = Depends(current_user),
+    orgs: OrganizationService = Depends(get_org_service),
 ) -> OrgOut:
     """Создать организацию. Дальше — пригласить её первого админа:
     POST /api/v1/admin/orgs/{org_id}/invites."""
-    return OrgOut.model_validate(await orgs.create(body.model_dump()))
+    return OrgOut.model_validate(await orgs.create(body.model_dump(), admin.id))
 
 
 @admin_router.post(
@@ -39,12 +42,16 @@ async def create_org(
     responses={**PROTECTED, **NOT_FOUND, **RATE_LIMITED},
 )
 async def invite_first_admin(
-    org_id: uuid.UUID, body: InviteIn, invites: InviteService = Depends(get_invite_service)
+    org_id: uuid.UUID,
+    body: InviteIn,
+    admin: CurrentUser = Depends(current_user),
+    invites: InviteService = Depends(get_invite_service),
 ) -> InviteOut:
     """Пригласить администратора организации (роль org_admin). Письмо с токеном уйдёт после
     ответа — смотрите в Mailpit (localhost:8025). Если email уже есть в базе — тот же 202,
     а человеку уходит письмо «у вас уже есть учётная запись»."""
-    return InviteOut.model_validate(await invites.invite_first_admin(org_id, str(body.email)))
+    invite = await invites.invite_first_admin(org_id, str(body.email), admin.id)
+    return InviteOut.model_validate(invite)
 
 
 @protected_router.get("/org", tags=["org"], responses=PROTECTED)

@@ -7,6 +7,7 @@ from typing import Any
 from app.authz.access import Access
 from app.errors import Conflict, NotFound
 from app.models import Organization, Team
+from app.repositories.audit import diff
 from app.uow import UnitOfWork
 
 
@@ -17,11 +18,19 @@ class OrganizationService:
     async def list_all(self) -> list[Organization]:
         return await self.uow.organizations.list()
 
-    async def create(self, fields: dict[str, Any]) -> Organization:
+    async def create(self, fields: dict[str, Any], actor_id: uuid.UUID) -> Organization:
         if await self.uow.organizations.get_by_slug(fields["slug"]) is not None:
             raise Conflict("org.slug_taken")
         org = Organization(id=uuid.uuid4(), created_at=datetime.now(UTC), **fields)
         self.uow.organizations.add(org)
+        self.uow.audit.record(
+            actor_id=actor_id,
+            org_id=org.id,
+            action="org.created",
+            entity_type="organization",
+            entity_id=org.id,
+            changes=fields,
+        )
         await self.uow.commit()
         return org
 
@@ -33,10 +42,25 @@ class OrganizationService:
 
     async def update_mine(self, access: Access, changes: dict[str, Any]) -> Organization:
         org = await self.get_mine(access)
+        changed = diff({field: getattr(org, field) for field in changes}, changes)
         for field, value in changes.items():
             setattr(org, field, value)
+        if changed:
+            self._audit(access, "org.updated", "organization", org.id, changed)
         await self.uow.commit()
         return org
+
+    def _audit(
+        self, access: Access, action: str, entity_type: str, entity_id: object, changes: Any
+    ) -> None:
+        self.uow.audit.record(
+            actor_id=access.user_id,
+            org_id=access.org_id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            changes=changes,
+        )
 
 
 class TeamService:
@@ -52,6 +76,7 @@ class TeamService:
         await self._ensure_name_free(access.org_id, name)
         team = Team(id=uuid.uuid4(), org_id=access.org_id, name=name, created_at=datetime.now(UTC))
         self.uow.teams.add(team)
+        self._audit(access, "team.created", team.id, {"name": name})
         await self.uow.commit()
         return team
 
@@ -59,6 +84,7 @@ class TeamService:
         team = await self._get_or_404(access, team_id)
         if team.name != name:
             await self._ensure_name_free(access.org_id, name)
+            self._audit(access, "team.renamed", team.id, {"name": [team.name, name]})
             team.name = name
             await self.uow.commit()
         return team
@@ -68,6 +94,7 @@ class TeamService:
         if await self.uow.teams.count_members(team.id):
             raise Conflict("team.has_members")
         await self.uow.teams.delete(team)
+        self._audit(access, "team.deleted", team.id, {"name": team.name})
         await self.uow.commit()
 
     async def _get_or_404(self, access: Access, team_id: uuid.UUID) -> Team:
@@ -75,6 +102,16 @@ class TeamService:
         if team is None:  # отдел чужой организации — как несуществующий
             raise NotFound(entity="team", id=str(team_id))
         return team
+
+    def _audit(self, access: Access, action: str, team_id: uuid.UUID, changes: Any) -> None:
+        self.uow.audit.record(
+            actor_id=access.user_id,
+            org_id=access.org_id,
+            action=action,
+            entity_type="team",
+            entity_id=team_id,
+            changes=changes,
+        )
 
     async def _ensure_name_free(self, org_id: uuid.UUID, name: str) -> None:
         if await self.uow.teams.get_by_name(org_id, name) is not None:

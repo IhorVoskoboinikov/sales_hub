@@ -9,6 +9,7 @@
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from app.authz.access import Access
 from app.core.security import check_password_rules, hash_password
@@ -44,11 +45,13 @@ class InviteService:
         self.ttl = ttl
         self.docs_url = docs_url
 
-    async def invite_first_admin(self, org_id: uuid.UUID, email: str) -> Invite:
+    async def invite_first_admin(
+        self, org_id: uuid.UUID, email: str, actor_id: uuid.UUID
+    ) -> Invite:
         org = await self.uow.organizations.get(org_id)
         if org is None:
             raise NotFound(entity="organization", id=str(org_id))
-        return await self._invite(org, email, Role.ORG_ADMIN, team_id=None)
+        return await self._invite(org, email, Role.ORG_ADMIN, None, actor_id)
 
     async def invite_member(
         self, access: Access, email: str, role: Role, team_id: uuid.UUID | None
@@ -64,15 +67,23 @@ class InviteService:
         org = await self.uow.organizations.get(access.org_id)
         if org is None:
             raise NotFound(entity="organization")
-        return await self._invite(org, email, role, team_id)
+        return await self._invite(org, email, role, team_id, access.user_id)
 
     async def _invite(
-        self, org: Organization, email: str, role: Role, team_id: uuid.UUID | None
+        self,
+        org: Organization,
+        email: str,
+        role: Role,
+        team_id: uuid.UUID | None,
+        actor_id: uuid.UUID,
     ) -> Invite:
         # 50 приглашений в час на организацию.
         await self.limiter.hit(rate_limiter.INVITE, str(org.id))
         expires_at = datetime.now(UTC) + self.ttl
+        invite = {"role": role.value, "team_id": str(team_id) if team_id else None}
         if await self.uow.users.get_by_email(email) is not None:
+            self._audit(actor_id, org.id, "invite.email_taken", email, invite)
+            await self.uow.commit()
             # Ответ тот же 202: админ чужой организации не должен узнать, что email занят.
             # А сам человек получит письмо и поймёт, что его пытались пригласить.
             self.mailer.send_later(render_email("already_member", email, org_name=org.name))
@@ -82,12 +93,9 @@ class InviteService:
             EmailTokenPurpose.INVITE,
             email,
             self.ttl,
-            payload={
-                "org_id": str(org.id),
-                "team_id": str(team_id) if team_id else None,
-                "role": role.value,
-            },
+            payload={"org_id": str(org.id), **invite},
         )
+        self._audit(actor_id, org.id, "invite.created", email, invite)
         await self.uow.commit()
         self.mailer.send_later(
             render_email(
@@ -121,6 +129,7 @@ class InviteService:
         check_password_rules(password, token.email)
         now = datetime.now(UTC)
         user = User(
+            id=uuid.uuid4(),  # id нужен до коммита — для записи в журнал
             email=token.email,
             password_hash=await hash_password(password),
             org_id=org_id,
@@ -130,5 +139,24 @@ class InviteService:
             created_at=now,  # заполняем сами: после коммита поле читается без запроса в базу
         )
         self.uow.users.add(user)
+        self._audit(user.id, org_id, "member.joined", user.id, {"role": user.role}, "user")
         await self.uow.commit()
         return user
+
+    def _audit(
+        self,
+        actor_id: uuid.UUID,
+        org_id: uuid.UUID,
+        action: str,
+        entity_id: object,
+        changes: dict[str, Any],
+        entity_type: str = "invite",
+    ) -> None:
+        self.uow.audit.record(
+            actor_id=actor_id,
+            org_id=org_id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            changes=changes,
+        )

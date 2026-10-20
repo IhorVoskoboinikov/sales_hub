@@ -170,5 +170,5 @@ async def read_emails(mailpit: Mailpit, to: str) -> list[dict[str, Any]]:
 
 def token_from_email(email: dict[str, Any]) -> str:
     """Токен в письме стоит отдельной строкой после строки «Токен…:»."""
-    lines = [line.strip() for line in email["Text"].splitlines()]
+    lines: list[str] = [line.strip() for line in str(email["Text"]).splitlines()]
     return next(lines[i + 1] for i, line in enumerate(lines) if line.startswith("Токен"))

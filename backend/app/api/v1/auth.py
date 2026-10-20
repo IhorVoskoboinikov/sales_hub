@@ -11,13 +11,24 @@ from app.api.deps import (
     get_auth_service,
     get_client_info,
     get_invite_service,
+    get_password_reset_service,
     get_uow,
 )
 from app.errors import NotFound
-from app.schemas.auth import InviteAcceptIn, MeOut, RefreshIn, SessionOut, TokenOut
+from app.schemas.auth import (
+    InviteAcceptIn,
+    MeOut,
+    PasswordChangeIn,
+    PasswordForgotIn,
+    PasswordResetIn,
+    RefreshIn,
+    SessionOut,
+    TokenOut,
+)
 from app.schemas.errors import ErrorOut
 from app.services.auth import AuthService, ClientInfo, CurrentUser, TokenPair
 from app.services.invites import InviteService
+from app.services.password_reset import PasswordResetService
 from app.uow import UnitOfWork
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
@@ -125,3 +136,38 @@ async def accept_invite(
     """Принять приглашение: токен из письма и пароль. Email считается подтверждённым.
     Дальше — обычный вход через POST /auth/login (кнопка Authorize)."""
     return MeOut.model_validate(await invites.accept(body.token, body.password))
+
+
+@router.post("/password/forgot", status_code=status.HTTP_202_ACCEPTED)
+async def forgot_password(
+    body: PasswordForgotIn,
+    passwords: PasswordResetService = Depends(get_password_reset_service),
+) -> None:
+    """Письмо со ссылкой для сброса пароля (действует 1 час). Ответ всегда 202 — даже если
+    такого email нет: иначе по ответу можно было бы проверять, кто зарегистрирован."""
+    await passwords.forgot(str(body.email))
+
+
+@router.post(
+    "/password/reset",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={403: {"model": ErrorOut}, 422: {"model": ErrorOut}},
+)
+async def reset_password(
+    body: PasswordResetIn,
+    passwords: PasswordResetService = Depends(get_password_reset_service),
+) -> None:
+    """Новый пароль по токену из письма. Все сессии закрываются, старые токены не работают."""
+    await passwords.reset(body.token, body.new_password)
+
+
+@router.post("/password/change", responses={**AUTH_ERRORS, 422: {"model": ErrorOut}})
+async def change_password(
+    body: PasswordChangeIn,
+    user: CurrentUser = Depends(current_user),
+    client: ClientInfo = Depends(get_client_info),
+    auth: AuthService = Depends(get_auth_service),
+) -> TokenOut:
+    """Сменить пароль. Остальные сессии закрываются, их access-токены сразу перестают
+    работать; эта сессия продолжается с новой парой токенов из ответа."""
+    return token_out(await auth.change_password(user, body.old_password, body.new_password, client))

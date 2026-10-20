@@ -7,8 +7,15 @@ from datetime import UTC, datetime, timedelta
 import structlog
 
 from app.core.jwt import KeySet
-from app.core.security import hash_token, new_token, verify_dummy_password, verify_password
-from app.errors import Forbidden, NotFound, Unauthorized
+from app.core.security import (
+    check_password_rules,
+    hash_password,
+    hash_token,
+    new_token,
+    verify_dummy_password,
+    verify_password,
+)
+from app.errors import Forbidden, NotFound, Unauthorized, ValidationFailed
 from app.models import RefreshToken, User
 from app.repositories.user_cache import CachedUser, UserCache
 from app.uow import UnitOfWork
@@ -148,6 +155,35 @@ class AuthService:
         if not await self.uow.refresh_tokens.revoke_user_session(user.id, sid, datetime.now(UTC)):
             raise NotFound(entity="session", id=str(sid))
         await self.uow.commit()
+
+    async def change_password(
+        self, current: CurrentUser, old_password: str, new_password: str, client: ClientInfo
+    ) -> TokenPair:
+        """Сменить пароль: все остальные сессии закрываются, их access-токены умирают сразу
+        (token_version + 1). Текущая сессия продолжается — с новой парой токенов."""
+        user = await self.uow.users.get(current.id)
+        if user is None:
+            raise Unauthorized()
+        ok, _ = await verify_password(old_password, user.password_hash)
+        if not ok:
+            raise ValidationFailed("auth.wrong_password")
+        check_password_rules(new_password, user.email)
+        user.password_hash = await hash_password(new_password)
+        user.token_version += 1
+
+        now = datetime.now(UTC)
+        session = await self.uow.refresh_tokens.get_active_in_family(
+            user.id, current.session_id, now
+        )
+        await self.uow.refresh_tokens.revoke_all_for_user(user.id, now)
+        if session is None:  # сессию уже закрыли, а access ещё жив — начинаем новую
+            pair = self._start_session(user, client)
+        else:
+            new = self._new_refresh_token(user.id, session.family_id, session.expires_at, client)
+            pair = self._token_pair(user, session.family_id, new)
+        await self.uow.commit()
+        await self.cache.invalidate(user.id)
+        return pair
 
     async def _bump_token_version(self, user_id: uuid.UUID) -> User:
         user = await self.uow.users.get(user_id)

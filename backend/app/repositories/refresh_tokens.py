@@ -85,3 +85,16 @@ class RefreshTokenRepository:
             .order_by(RefreshToken.created_at.desc())
         )
         return [(token, started_at) for token, started_at in rows]
+
+    async def get_active_in_family(
+        self, user_id: uuid.UUID, family_id: uuid.UUID, now: datetime
+    ) -> RefreshToken | None:
+        """Текущий (последний неотозванный) токен сессии."""
+        return await self.session.scalar(
+            select(RefreshToken).where(
+                RefreshToken.user_id == user_id,
+                RefreshToken.family_id == family_id,
+                RefreshToken.revoked_at.is_(None),
+                RefreshToken.expires_at > now,
+            )
+        )

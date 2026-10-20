@@ -62,3 +62,17 @@ class InviteOut(BaseModel):
 class InviteAcceptIn(BaseModel):
     token: EmailTokenStr
     password: Password
+
+
+class PasswordForgotIn(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetIn(BaseModel):
+    token: EmailTokenStr
+    new_password: Password
+
+
+class PasswordChangeIn(BaseModel):
+    old_password: str = Field(max_length=MAX_PASSWORD_LENGTH)
+    new_password: Password

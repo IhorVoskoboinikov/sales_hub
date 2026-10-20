@@ -19,6 +19,7 @@ from app.errors import Forbidden, Unauthorized
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.invites import InviteService
+from app.services.password_reset import PasswordResetService
 from app.uow import UnitOfWork
 
 # Кнопка Authorize в Swagger: форма логина отправляется на tokenUrl.
@@ -82,6 +83,21 @@ def get_invite_service(
 ) -> InviteService:
     return InviteService(
         uow, mailer, timedelta(days=settings.invite_ttl_days), f"{settings.public_url}/docs"
+    )
+
+
+def get_password_reset_service(
+    uow: UnitOfWork = Depends(get_uow),
+    mailer: Mailer = Depends(get_mailer),
+    cache: UserCache = Depends(get_user_cache),
+    settings: Settings = Depends(get_app_settings),
+) -> PasswordResetService:
+    return PasswordResetService(
+        uow,
+        mailer,
+        cache,
+        timedelta(minutes=settings.reset_password_ttl_minutes),
+        f"{settings.public_url}/docs",
     )
 
 

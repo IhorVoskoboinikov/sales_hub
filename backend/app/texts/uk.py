@@ -13,6 +13,7 @@ ERRORS: dict[str, str] = {
     "auth.invalid_credentials": "Невірний email або пароль",
     "auth.user_inactive": "Користувача заблоковано",
     "auth.email_not_verified": "Email не підтверджено",
+    "auth.wrong_password": "Невірний поточний пароль",
     "conflict": "Конфлікт даних",
     "validation": "Помилка валідації",
     "rate_limited": "Забагато запитів, спробуйте пізніше",

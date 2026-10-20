@@ -1,10 +1,15 @@
 """Access-токены: выпуск, проверка, ротация ключей, JWKS."""
 
+import base64
+import hashlib
+import hmac
+import json
 import uuid
 from datetime import timedelta
 
 import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from freezegun import freeze_time
 from httpx import AsyncClient
@@ -63,19 +68,54 @@ def test_token_signed_by_other_key_is_rejected(keys: KeySet) -> None:
     assert exc.value.code == "auth.invalid_token"
 
 
-@pytest.mark.parametrize(
-    "token",
-    [
-        "not-a-jwt",
-        # alg=none — классическая атака: токен без подписи
-        jwt.encode({"sub": str(USER_ID)}, key="", algorithm="none"),
-        # HS256 с публичным ключом вместо секрета — подмена алгоритма
-        jwt.encode({"sub": str(USER_ID)}, "x" * 32, algorithm="HS256"),
-    ],
-)
-def test_garbage_and_forged_tokens_are_rejected(keys: KeySet, token: str) -> None:
+def forged(header: dict[str, str], signature: bytes) -> str:
+    """JWT, собранный руками: PyJWT сам не подпишет HS256 публичным ключом."""
+
+    def b64(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    claims = {
+        "iss": "https://saleshub.local",
+        "aud": "saleshub-api",
+        "typ": "access",
+        "sub": str(USER_ID),
+        "sid": str(SESSION_ID),
+        "ver": 0,
+        "jti": "x",
+        "iat": 1,
+        "exp": 9999999999,
+    }
+    signing_input = f"{b64(json.dumps(header).encode())}.{b64(json.dumps(claims).encode())}"
+    return f"{signing_input}.{b64(signature)}" if signature else f"{signing_input}."
+
+
+def test_garbage_token_is_rejected(keys: KeySet) -> None:
     with pytest.raises(Unauthorized):
+        keys.decode_access_token("not-a-jwt")
+
+
+def test_alg_none_is_rejected(keys: KeySet) -> None:
+    # Классическая атака: токен без подписи, но с правильным kid.
+    token = forged({"alg": "none", "kid": keys.signing_kid}, b"")
+
+    with pytest.raises(Unauthorized) as exc:
         keys.decode_access_token(token)
+    assert exc.value.code == "auth.invalid_token"
+
+
+def test_hs256_signed_with_public_key_is_rejected(keys: KeySet) -> None:
+    # Подмена алгоритма: публичный ключ известен всем (JWKS). Если сервер принял бы HS256,
+    # любой подписал бы токен этим ключом как секретом.
+    public_pem = PRIVATE_KEY.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    header = {"alg": "HS256", "kid": keys.signing_kid}
+    unsigned = forged(header, b"")[:-1]
+    signature = hmac.new(public_pem, unsigned.encode(), hashlib.sha256).digest()
+
+    with pytest.raises(Unauthorized) as exc:
+        keys.decode_access_token(forged(header, signature))
+    assert exc.value.code == "auth.invalid_token"
 
 
 def test_wrong_audience_is_rejected(keys: KeySet) -> None:

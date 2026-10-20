@@ -5,6 +5,7 @@ from typing import Any
 
 from httpx import AsyncClient, Response
 
+from app.uow import UnitOfWork
 from tests.integration.conftest import (
     PASSWORD,
     Mailpit,
@@ -103,9 +104,10 @@ async def test_invite_token_cannot_reset_password(
 async def test_change_password_keeps_current_session_only(
     client: AsyncClient, make_user: MakeUser
 ) -> None:
-    user = await make_user()
-    laptop = await login(client, user.email)
-    phone = await login(client, user.email)
+    email = unique_email()  # в переменной: ответы 401 откатывают сессию теста
+    await make_user(email)
+    laptop = await login(client, email)
+    phone = await login(client, email)
 
     resp = await client.post(
         "/api/v1/auth/password/change",
@@ -124,6 +126,12 @@ async def test_change_password_keeps_current_session_only(
     sessions = (await client.get("/api/v1/auth/sessions", headers=bearer(fresh))).json()
     assert [s["current"] for s in sessions] == [True]
     assert await refresh_status(client, fresh) == 200
+    # Пароль действительно сменился.
+    old_login = await client.post(
+        "/api/v1/auth/login", data={"username": email, "password": PASSWORD}
+    )
+    assert old_login.status_code == 401
+    await login(client, email, NEW_PASSWORD)
 
 
 async def test_change_password_requires_old_password(
@@ -142,3 +150,61 @@ async def test_change_password_requires_old_password(
     assert resp.json()["code"] == "auth.wrong_password"
     # Ничего не поменялось: токены живы.
     assert (await client.get("/api/v1/auth/me", headers=bearer(tokens))).status_code == 200
+
+
+async def test_change_password_is_rate_limited(client: AsyncClient, make_user: MakeUser) -> None:
+    user = await make_user(unique_email())
+    tokens = await login(client, user.email)
+
+    statuses = [
+        (
+            await client.post(
+                "/api/v1/auth/password/change",
+                json={"old_password": "wrong password", "new_password": NEW_PASSWORD},
+                headers=bearer(tokens),
+            )
+        ).status_code
+        for _ in range(6)
+    ]
+
+    assert statuses == [422] * 5 + [429]
+
+
+async def test_forgot_for_blocked_user_sends_nothing(
+    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+) -> None:
+    email = unique_email()
+    await make_user(email, is_active=False)
+
+    assert (await forgot(client, email)).status_code == 202
+    assert await read_emails(mailpit, email) == []
+
+
+async def test_reset_is_refused_if_user_was_blocked_after_forgot(
+    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit, uow: UnitOfWork
+) -> None:
+    email = unique_email()
+    user = await make_user(email)
+    await forgot(client, email)
+    user.is_active = False
+    await uow.commit()
+
+    resp = await reset(client, token_from_email((await read_emails(mailpit, email))[0]))
+
+    assert resp.status_code == 403
+    assert resp.json()["code"] == "auth.user_inactive"
+
+
+async def test_weak_reset_password_does_not_burn_token(
+    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+) -> None:
+    email = unique_email()
+    await make_user(email)
+    await forgot(client, email)
+    token = token_from_email((await read_emails(mailpit, email))[0])
+
+    weak = await reset(client, token, email)  # пароль = email
+
+    assert weak.status_code == 422
+    assert weak.json()["code"] == "password.same_as_email"
+    assert (await reset(client, token)).status_code == 204

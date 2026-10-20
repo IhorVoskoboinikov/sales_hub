@@ -154,3 +154,17 @@ async def test_invalid_email_is_rejected(client: AsyncClient, make_user: MakeUse
     resp = await invite(client, admin, "not-an-email")
 
     assert resp.status_code == 422
+
+
+async def test_accept_fails_if_email_registered_meanwhile(
+    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+) -> None:
+    admin = await admin_login(client, make_user)
+    email = new_email()
+    await invite(client, admin, email)
+    await make_user(email)  # например, приняли другое приглашение
+
+    resp = await accept(client, token_from_email((await read_emails(mailpit, email))[0]))
+
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "invite.email_taken"

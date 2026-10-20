@@ -21,7 +21,8 @@ class Limit:
 
 
 # Значения — из раздела 4.
-LOGIN = Limit("login", 5, 15 * 60)  # неудачных попыток на email + IP
+LOGIN = Limit("login", 5, 15 * 60)  # неудачных попыток на email + IP; успешный вход обнуляет
+PASSWORD_CHANGE = Limit("password_change", 5, 15 * 60)  # неверных старых паролей на пользователя
 PASSWORD_FORGOT = Limit("password_forgot", 3, 60 * 60)  # писем на email
 INVITE = Limit(
     "invite", 50, 60 * 60
@@ -35,22 +36,21 @@ class RateLimiter:
         self.redis = redis
 
     async def hit(self, limit: Limit, subject: str) -> None:
-        """Засчитать попытку; если лимит уже исчерпан — 429."""
+        """Засчитать попытку; если лимит уже исчерпан — 429.
+
+        Попытка засчитывается до проверки (пароля, email), а не после: INCR атомарен, поэтому
+        сто одновременных запросов получат номера 1…100, и пройдут только первые. Проверка
+        «сначала GET, потом INCR» пропустила бы их все — каждый увидел бы старый счётчик."""
         count = await self._increment(limit, subject)
         if count > limit.max_attempts:
             raise await self._limited(limit, subject)
 
-    async def ensure_not_exceeded(self, limit: Limit, subject: str) -> None:
-        """Проверить без учёта попытки (для логина: считаем только неудачные)."""
+    async def reset(self, limit: Limit, subject: str) -> None:
+        """Обнулить счётчик — после успеха, если считать нужно только неудачи (вход)."""
         try:
-            count = await self.redis.get(self._key(limit, subject))
+            await self.redis.delete(self._key(limit, subject))
         except RedisError as exc:
             raise ServiceUnavailable(failed=["redis"]) from exc
-        if count is not None and int(count) >= limit.max_attempts:
-            raise await self._limited(limit, subject)
-
-    async def add_attempt(self, limit: Limit, subject: str) -> None:
-        await self._increment(limit, subject)
 
     @staticmethod
     def _key(limit: Limit, subject: str) -> str:

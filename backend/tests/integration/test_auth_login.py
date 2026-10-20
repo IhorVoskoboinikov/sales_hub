@@ -69,12 +69,18 @@ async def test_inactive_user_gets_reason_only_with_right_password(
 ) -> None:
     await make_user("ivan@example.com", is_active=False)
 
-    resp = await client.post(
+    wrong = await client.post(
+        "/api/v1/auth/login", data={"username": "ivan@example.com", "password": "wrong pass 1"}
+    )
+    right = await client.post(
         "/api/v1/auth/login", data={"username": "ivan@example.com", "password": PASSWORD}
     )
 
-    assert resp.status_code == 403
-    assert resp.json()["code"] == "auth.user_inactive"
+    # С неверным паролем — как у всех: не выдаём, что такой пользователь есть и заблокирован.
+    assert wrong.status_code == 401
+    assert wrong.json()["code"] == "auth.invalid_credentials"
+    assert right.status_code == 403
+    assert right.json()["code"] == "auth.user_inactive"
 
 
 async def test_unverified_email_cannot_log_in(client: AsyncClient, make_user: MakeUser) -> None:

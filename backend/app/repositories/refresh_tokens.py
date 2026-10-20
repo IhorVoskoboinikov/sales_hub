@@ -15,12 +15,13 @@ class RefreshTokenRepository:
     def add(self, token: RefreshToken) -> None:
         self.session.add(token)
 
-    async def get_by_hash_for_update(self, token_hash: str) -> RefreshToken | None:
-        """FOR UPDATE: два одновременных refresh с одним токеном выполнятся по очереди,
-        и второй увидит, что токен уже отозван."""
-        return await self.session.scalar(
-            select(RefreshToken).where(RefreshToken.token_hash == token_hash).with_for_update()
-        )
+    async def get_by_hash(
+        self, token_hash: str, *, for_update: bool = False
+    ) -> RefreshToken | None:
+        query = select(RefreshToken).where(RefreshToken.token_hash == token_hash)
+        if for_update:
+            query = query.with_for_update().execution_options(populate_existing=True)
+        return await self.session.scalar(query)
 
     async def revoke_family(self, family_id: uuid.UUID, now: datetime) -> None:
         """Закрыть сессию: отозвать все ещё живые токены семьи."""

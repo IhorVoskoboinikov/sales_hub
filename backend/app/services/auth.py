@@ -79,18 +79,18 @@ class AuthService:
         self.refresh_ttl = refresh_ttl
 
     async def login(self, email: str, password: str, client: ClientInfo) -> TokenPair:
-        # Считаем только неудачные попытки: 5 за 15 минут на пару email + IP.
+        # 5 неудачных попыток за 15 минут на пару email + IP; успешный вход обнуляет счётчик.
         attempt = f"{email.casefold()}:{client.ip}"
-        await self.limiter.ensure_not_exceeded(rate_limiter.LOGIN, attempt)
-        user = await self.uow.users.get_by_email(email)
-        if user is None:
+        await self.limiter.hit(rate_limiter.LOGIN, attempt)
+        found = await self.uow.users.get_by_email(email)
+        if found is None:
             await verify_dummy_password(password)  # то же время ответа, что и с настоящим email
-            await self.limiter.add_attempt(rate_limiter.LOGIN, attempt)
             raise Unauthorized("auth.invalid_credentials")
-        ok, new_hash = await verify_password(password, user.password_hash)
+        ok, new_hash = await verify_password(password, found.password_hash)
         if not ok:
-            await self.limiter.add_attempt(rate_limiter.LOGIN, attempt)
             raise Unauthorized("auth.invalid_credentials")
+        await self.limiter.reset(rate_limiter.LOGIN, attempt)
+        user = await self._lock_user(found.id)
         # Причину отказа говорим только тому, кто знает пароль.
         ensure_can_sign_in(cached_user(user))
         if new_hash is not None:
@@ -103,7 +103,13 @@ class AuthService:
     async def refresh(self, raw_token: str, client: ClientInfo) -> TokenPair:
         """Ротация: старый refresh-токен отзывается, выдаётся новая пара в той же сессии."""
         now = datetime.now(UTC)
-        token = await self.uow.refresh_tokens.get_by_hash_for_update(hash_token(raw_token))
+        token_hash = hash_token(raw_token)
+        found = await self.uow.refresh_tokens.get_by_hash(token_hash)
+        if found is None:
+            raise Unauthorized()
+        # Порядок блокировок везде один: сначала пользователь, потом его токены.
+        user = await self._lock_user(found.user_id)
+        token = await self.uow.refresh_tokens.get_by_hash(token_hash, for_update=True)
         if token is None:
             raise Unauthorized()
         if token.revoked_at is not None:
@@ -116,9 +122,6 @@ class AuthService:
             )
             raise Unauthorized()
         if token.expires_at <= now:
-            raise Unauthorized()
-        user = await self.uow.users.get(token.user_id)
-        if user is None:
             raise Unauthorized()
         ensure_can_sign_in(cached_user(user))
 
@@ -134,13 +137,15 @@ class AuthService:
 
     async def logout(self, user: CurrentUser) -> None:
         """Закрыть текущую сессию. Access-токен доживёт свой час: он stateless."""
+        await self._lock_user(user.id)
         await self.uow.refresh_tokens.revoke_family(user.session_id, datetime.now(UTC))
         await self.uow.commit()
 
     async def logout_all(self, user: CurrentUser) -> None:
         """Закрыть все сессии и убить все живые access-токены (token_version + 1)."""
+        row = await self._lock_user(user.id)
         await self.uow.refresh_tokens.revoke_all_for_user(user.id, datetime.now(UTC))
-        await self._bump_token_version(user.id)
+        row.token_version += 1
         await self.uow.commit()
         await self.cache.invalidate(user.id)
 
@@ -161,6 +166,7 @@ class AuthService:
 
     async def revoke_session(self, user: CurrentUser, sid: uuid.UUID) -> None:
         """Выйти на конкретном устройстве."""
+        await self._lock_user(user.id)
         if not await self.uow.refresh_tokens.revoke_user_session(user.id, sid, datetime.now(UTC)):
             raise NotFound(entity="session", id=str(sid))
         await self.uow.commit()
@@ -170,12 +176,14 @@ class AuthService:
     ) -> TokenPair:
         """Сменить пароль: все остальные сессии закрываются, их access-токены умирают сразу
         (token_version + 1). Текущая сессия продолжается — с новой парой токенов."""
-        user = await self.uow.users.get(current.id)
-        if user is None:
-            raise Unauthorized()
+        # Иначе с украденным access-токеном старый пароль можно было бы перебирать без конца.
+        attempt = str(current.id)
+        await self.limiter.hit(rate_limiter.PASSWORD_CHANGE, attempt)
+        user = await self._lock_user(current.id)
         ok, _ = await verify_password(old_password, user.password_hash)
         if not ok:
             raise ValidationFailed("auth.wrong_password")
+        await self.limiter.reset(rate_limiter.PASSWORD_CHANGE, attempt)
         check_password_rules(new_password, user.email)
         user.password_hash = await hash_password(new_password)
         user.token_version += 1
@@ -194,11 +202,10 @@ class AuthService:
         await self.cache.invalidate(user.id)
         return pair
 
-    async def _bump_token_version(self, user_id: uuid.UUID) -> User:
-        user = await self.uow.users.get(user_id)
+    async def _lock_user(self, user_id: uuid.UUID) -> User:
+        user = await self.uow.users.get(user_id, for_update=True)
         if user is None:
             raise Unauthorized()
-        user.token_version += 1
         return user
 
     async def authenticate(self, access_token: str) -> CurrentUser:

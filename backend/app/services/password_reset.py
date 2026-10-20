@@ -57,7 +57,8 @@ class PasswordResetService:
     async def reset(self, raw_token: str, new_password: str) -> None:
         """Новый пароль по токену из письма. Все сессии закрываются, все access-токены умирают."""
         token = await use_email_token(self.uow, EmailTokenPurpose.RESET_PASSWORD, raw_token)
-        user = await self.uow.users.get(token.user_id) if token.user_id else None
+        # Блокировка — как в AuthService: параллельный refresh не выдаст токен мимо отзыва.
+        user = await self.uow.users.get(token.user_id, for_update=True) if token.user_id else None
         if user is None:
             raise ValidationFailed("email_token.invalid")
         ensure_can_sign_in(cached_user(user))

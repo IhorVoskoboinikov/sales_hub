@@ -11,6 +11,8 @@ from redis.exceptions import RedisError
 logger = structlog.get_logger("user_cache")
 
 TTL_SECONDS = 60
+# Сколько живёт «надгробие» после invalidate (см. ниже).
+TOMBSTONE_SECONDS = 5
 
 
 class CachedUser(BaseModel):
@@ -43,15 +45,23 @@ class UserCache:
         return CachedUser.model_validate_json(raw) if raw else None
 
     async def set(self, user: CachedUser) -> None:
+        # NX — только если ключа нет. Ключ есть, если запись уже свежая или стоит «надгробие».
         try:
-            await self.redis.set(self._key(user.id), user.model_dump_json(), ex=TTL_SECONDS)
+            await self.redis.set(
+                self._key(user.id), user.model_dump_json(), ex=TTL_SECONDS, nx=True
+            )
         except RedisError as exc:
             logger.warning("user_cache_unavailable", error=repr(exc))
 
     async def invalidate(self, user_id: uuid.UUID) -> None:
         """Вызывать после коммита любого изменения, которое влияет на проверку токена
-        (token_version, is_active), — иначе старое значение проживёт ещё до 60 секунд."""
+        (token_version, is_active), — иначе старое значение проживёт ещё до 60 секунд.
+
+        Ключ не удаляется, а заменяется пустым «надгробием» на 5 секунд. Зачем: запрос,
+        который прочитал пользователя из базы до коммита, может положить в кэш старую версию
+        уже после удаления ключа — и она прожила бы 60 секунд. С «надгробием» его SET NX
+        не сработает, а get() считает пустое значение промахом и читает базу."""
         try:
-            await self.redis.delete(self._key(user_id))
+            await self.redis.set(self._key(user_id), "", ex=TOMBSTONE_SECONDS)
         except RedisError as exc:
             logger.warning("user_cache_unavailable", error=repr(exc))

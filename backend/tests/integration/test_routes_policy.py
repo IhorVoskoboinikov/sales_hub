@@ -9,6 +9,7 @@ from typing import Any
 import httpx
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
+from httpx import AsyncClient
 
 from app.api.v1 import admin_router, protected_router
 from app.authz.deps import opa_decision
@@ -42,3 +43,11 @@ async def test_routes_match_policy(opa_url: str) -> None:
 
     assert in_app - in_policy == set(), "эндпоинты без строки в policies/saleshub/routes.rego"
     assert in_policy - in_app == set(), "строки routes.rego без эндпоинта (устарели?)"
+
+
+async def test_swagger_shows_required_action(client: AsyncClient) -> None:
+    schema = (await client.get("/openapi.json")).json()
+
+    operation = schema["paths"]["/api/v1/users/{user_id}"]["patch"]
+    assert operation["x-required-action"] == "member:manage"
+    assert operation["description"].startswith("**Требуется:** `member:manage` (org_admin — org)")

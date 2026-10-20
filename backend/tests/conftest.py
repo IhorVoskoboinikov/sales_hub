@@ -37,6 +37,7 @@ def settings(jwt_key_file: Path) -> Settings:
         database_url=f"postgresql+asyncpg://test:test@127.0.0.1:{CLOSED_PORT}/test",
         redis_url=f"redis://127.0.0.1:{CLOSED_PORT}/0",
         opa_url=f"http://127.0.0.1:{CLOSED_PORT}",
+        opa_startup_attempts=1,  # OPA в unit-тестах нет — не ждём его при старте
         policies_dir=POLICIES_DIR,
         jwt_private_key_file=jwt_key_file,
     )

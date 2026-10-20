@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     # --- Права (раздел 5): OPA и файл ролей policies/saleshub/data.yaml, который читают оба.
     opa_url: str = "http://localhost:8181"
     policies_dir: Path = Path("../policies")  # относительно backend/; в контейнере — /policies
+    # Сколько раз при старте спросить у OPA маршруты для Swagger (раз в секунду).
+    opa_startup_attempts: int = 5
 
     # Первый пользователь — для команды create-superadmin (в Kubernetes — из Secret).
     superadmin_email: str | None = None

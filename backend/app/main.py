@@ -18,6 +18,7 @@ from app.api.v1 import (  # noqa: F401 — модули с эндпоинтам�
     users,
 )
 from app.authz.opa import OpaClient
+from app.authz.openapi import fetch_route_actions, install_openapi
 from app.authz.roles import RoleCatalog
 from app.core.config import Settings, get_settings
 from app.core.jwt import KeySet
@@ -47,6 +48,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         http = httpx.AsyncClient()  # один пул соединений к OPA на процесс
         app.state.opa = OpaClient(http, settings.opa_url)
+        if settings.show_docs:
+            app.state.route_actions = await fetch_route_actions(
+                app.state.opa, settings.opa_startup_attempts
+            )
         try:
             yield
         finally:
@@ -75,6 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     register_error_handlers(app)
+    install_openapi(app, app.state.roles)
 
     # add_middleware добавляет слой снаружи предыдущих, поэтому порядок здесь — изнутри наружу.
     # Запрос проходит: RequestId → AccessLog → UnhandledError → маршрут.

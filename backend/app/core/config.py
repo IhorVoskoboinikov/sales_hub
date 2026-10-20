@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     smtp_start_tls: bool = False
     email_from: str = "SalesHub <noreply@saleshub.local>"
 
+    # --- Права (раздел 5): OPA и файл ролей policies/saleshub/data.yaml, который читают оба.
+    opa_url: str = "http://localhost:8181"
+    policies_dir: Path = Path("../policies")  # относительно backend/; в контейнере — /policies
+
     # Первый пользователь — для команды create-superadmin (в Kubernetes — из Secret).
     superadmin_email: str | None = None
     superadmin_password: SecretStr | None = None

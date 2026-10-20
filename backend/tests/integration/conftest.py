@@ -27,6 +27,7 @@ from app.core.config import Settings
 from app.core.security import hash_password
 from app.models import User
 from app.uow import UnitOfWork
+from tests.conftest import POLICIES_DIR
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
@@ -34,6 +35,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 POSTGRES_IMAGE = "postgres:18.6"
 REDIS_IMAGE = "redis:8.10"
 MAILPIT_IMAGE = "axllent/mailpit:v1.31.6"
+OPA_IMAGE = "openpolicyagent/opa:1.21.3"
 
 
 def alembic_config(database_url: str) -> Config:
@@ -80,8 +82,24 @@ def mailpit() -> Iterator[Mailpit]:
         )
 
 
+@pytest.fixture(scope="session")
+def opa_url() -> Iterator[str]:
+    """Настоящий OPA с политиками из policies/ — как сервис opa в compose."""
+    container = (
+        DockerContainer(OPA_IMAGE)
+        .with_volume_mapping(str(POLICIES_DIR), "/policies", "ro")
+        .with_command("run --server --addr=0.0.0.0:8181 --ignore=*_test.rego /policies")
+        .with_exposed_ports(8181)
+        .waiting_for(HttpWaitStrategy(8181, "/health"))
+    )
+    with container:
+        yield f"http://{container.get_container_host_ip()}:{container.get_exposed_port(8181)}"
+
+
 @pytest.fixture
-def settings(settings: Settings, postgres_url: str, redis_url: str, mailpit: Mailpit) -> Settings:
+def settings(
+    settings: Settings, postgres_url: str, redis_url: str, mailpit: Mailpit, opa_url: str
+) -> Settings:
     # Те же настройки, что у unit-тестов, но с адресами настоящих контейнеров.
     return settings.model_copy(
         update={
@@ -89,6 +107,7 @@ def settings(settings: Settings, postgres_url: str, redis_url: str, mailpit: Mai
             "redis_url": redis_url,
             "smtp_host": mailpit.smtp_host,
             "smtp_port": mailpit.smtp_port,
+            "opa_url": opa_url,
         }
     )
 

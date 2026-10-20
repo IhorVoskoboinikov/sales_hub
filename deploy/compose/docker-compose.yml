@@ -9,6 +9,8 @@ x-app-env: &app-env
   DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@postgres:5432/saleshub
   REDIS_URL: redis://redis:6379/0
   SMTP_HOST: mailpit  # письма видно на localhost:8025
+  OPA_URL: http://opa:8181
+  POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA
   LOG_LEVEL: INFO
 
 services:
@@ -64,16 +66,20 @@ services:
     build: ../../backend
     image: saleshub-api:dev
     # dev: код смонтирован с хоста, --reload перезапускает сервер при сохранении файла.
+    # --reload-dir /policies: uvicorn перечитывает и data.yaml (по умолчанию следит только за .py).
     command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",
-              "--no-access-log", "--reload"]
+              "--no-access-log", "--reload", "--reload-dir", "/app/app",
+              "--reload-dir", "/policies", "--reload-include", "data.yaml"]
     volumes:
       - ../../backend/app:/app/app:ro
       - ../../backend/secrets:/app/secrets:ro  # ключ JWT: make keys (make up вызывает его сам)
+      - ../../policies:/policies:ro
     environment: *app-env
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
       seed: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
+      opa: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]

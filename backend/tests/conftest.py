@@ -18,6 +18,7 @@ from app.emails.sender import Email
 from app.main import create_app
 
 CLOSED_PORT = 9  # на этом порту никто не слушает — соединение сразу отклоняется
+POLICIES_DIR = Path(__file__).resolve().parents[2] / "policies"
 
 
 @pytest.fixture(scope="session")
@@ -35,6 +36,8 @@ def settings(jwt_key_file: Path) -> Settings:
         app_env="test",
         database_url=f"postgresql+asyncpg://test:test@127.0.0.1:{CLOSED_PORT}/test",
         redis_url=f"redis://127.0.0.1:{CLOSED_PORT}/0",
+        opa_url=f"http://127.0.0.1:{CLOSED_PORT}",
+        policies_dir=POLICIES_DIR,
         jwt_private_key_file=jwt_key_file,
     )
 

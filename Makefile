@@ -14,8 +14,8 @@ up: keys  ## поднять стенд: API, Postgres, Redis и все UI (жд�
 	$(COMPOSE) up -d --build --wait
 	@$(MAKE) --no-print-directory urls
 
-infra:  ## только Postgres, Redis и Mailpit — для make run (API запускается без Docker)
-	$(COMPOSE) up -d --wait postgres redis mailpit
+infra:  ## только Postgres, Redis, Mailpit и OPA — для make run (API запускается без Docker)
+	$(COMPOSE) up -d --wait postgres redis mailpit opa
 
 down:  ## остановить стенд (данные сохраняются)
 	$(COMPOSE) down
@@ -34,6 +34,7 @@ urls:  ## адреса веб-интерфейсов
 	@echo "pgAdmin      http://localhost:5050"
 	@echo "RedisInsight http://localhost:5540"
 	@echo "Mailpit      http://localhost:8025"
+	@echo "OPA          http://localhost:8181/v1/data/saleshub/roles"
 	@echo "RustFS (S3)  http://localhost:9001/rustfs/console/   логин saleshub / saleshub-secret"
 
 keys:  ## создать приватный ключ JWT в backend/secrets/ (если его ещё нет)

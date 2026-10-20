@@ -3,12 +3,15 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
 from app.api import health, well_known
 from app.api import v1 as api_v1
 from app.api.v1 import admin, auth
+from app.authz.opa import OpaClient
+from app.authz.roles import RoleCatalog
 from app.core.config import Settings, get_settings
 from app.core.jwt import KeySet
 from app.core.logging import configure_logging
@@ -35,9 +38,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.redis = Redis.from_url(
             settings.redis_url, socket_connect_timeout=2, socket_timeout=2
         )
+        http = httpx.AsyncClient()  # один пул соединений к OPA на процесс
+        app.state.opa = OpaClient(http, settings.opa_url)
         try:
             yield
         finally:
+            await http.aclose()
             await app.state.redis.aclose()
             await engine.dispose()
 
@@ -50,6 +56,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json" if settings.show_docs else None,
     )
     app.state.settings = settings
+    # Тот же data.yaml, что читает OPA. Нет файла — приложение не создаётся.
+    app.state.roles = RoleCatalog.load(settings.policies_dir)
     app.state.email_sender = SmtpEmailSender(
         host=settings.smtp_host,
         port=settings.smtp_port,

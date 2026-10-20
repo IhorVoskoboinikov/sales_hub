@@ -27,12 +27,16 @@ logger = structlog.get_logger("auth")
 
 @dataclass(frozen=True)
 class CurrentUser:
-    """Кто делает запрос. Организация, отдел и роль добавятся на этапе 3."""
+    """Кто делает запрос. Роль, организация и отдел — из users (кэш 60 с), не из токена:
+    они могут поменяться, а токен живёт час."""
 
     id: uuid.UUID
     email: str
     is_superadmin: bool
     session_id: uuid.UUID  # sid из access-токена: по нему logout знает, какую сессию закрыть
+    org_id: uuid.UUID | None = None
+    team_id: uuid.UUID | None = None
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -227,6 +231,9 @@ class AuthService:
             email=user.email,
             is_superadmin=user.is_superadmin,
             session_id=claims.session_id,
+            org_id=user.org_id,
+            team_id=user.team_id,
+            role=user.role,
         )
 
     def _start_session(self, user: User, client: ClientInfo) -> TokenPair:
@@ -277,6 +284,9 @@ def cached_user(user: User) -> CachedUser:
         is_superadmin=user.is_superadmin,
         email_verified=user.email_verified_at is not None,
         token_version=user.token_version,
+        org_id=user.org_id,
+        team_id=user.team_id,
+        role=user.role,
     )
 
 

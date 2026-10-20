@@ -11,6 +11,8 @@ from fastapi.security import OAuth2PasswordBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.authz.opa import OpaClient
+from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.core.jwt import KeySet
 from app.emails.mailer import BackgroundMailer
@@ -42,6 +44,14 @@ def get_redis(request: Request) -> Redis:
 
 def get_key_set(request: Request) -> KeySet:
     return cast(KeySet, request.app.state.keys)
+
+
+def get_opa(request: Request) -> OpaClient:
+    return cast(OpaClient, request.app.state.opa)
+
+
+def get_roles(request: Request) -> RoleCatalog:
+    return cast(RoleCatalog, request.app.state.roles)
 
 
 def get_email_sender(request: Request) -> EmailSender:

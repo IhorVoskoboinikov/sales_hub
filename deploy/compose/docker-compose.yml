@@ -47,6 +47,18 @@ services:
       postgres: {condition: service_healthy}
     restart: "no"
 
+  # Одноразовый: создаёт супер-админа (идемпотентно — повторный запуск ничего не меняет).
+  seed:
+    image: saleshub-api:dev
+    command: ["python", "-m", "app.cli", "create-superadmin"]
+    environment:
+      <<: *app-env
+      SUPERADMIN_EMAIL: admin@example.com
+      SUPERADMIN_PASSWORD: admin-password
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: "no"
+
   api:
     build: ../../backend
     image: saleshub-api:dev
@@ -59,7 +71,7 @@ services:
     environment: *app-env
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
-      migrate: {condition: service_completed_successfully}
+      seed: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "python", "-c",

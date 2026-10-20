@@ -4,6 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +27,10 @@ class Settings(BaseSettings):
     jwt_audience: str = "saleshub-api"
     jwt_access_ttl: int = 3600  # секунды
     refresh_ttl_days: int = 30  # абсолютный предел сессии: от входа, ротация его не продлевает
+
+    # Первый пользователь — для команды create-superadmin (в Kubernetes — из Secret).
+    superadmin_email: str | None = None
+    superadmin_password: SecretStr | None = None
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     # None — решает профиль: Swagger есть везде, кроме prod.

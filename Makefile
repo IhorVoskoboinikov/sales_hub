@@ -28,7 +28,7 @@ logs:  ## логи API в реальном времени
 	$(COMPOSE) logs -f api
 
 urls:  ## адреса веб-интерфейсов
-	@echo "Swagger      http://localhost:8000/docs"
+	@echo "Swagger      http://localhost:8000/docs   супер-админ admin@example.com / admin-password"
 	@echo "pgAdmin      http://localhost:5050"
 	@echo "RedisInsight http://localhost:5540"
 	@echo "Mailpit      http://localhost:8025"

@@ -23,6 +23,8 @@ ERRORS: dict[str, str] = {
     "invite.email_taken": "Користувач з таким email уже існує",
     "email_token.invalid": "Токен недійсний або вже використаний",
     "email_token.expired": "Термін дії токена минув",
+    # Права
+    "authz.policy_out_of_sync": "Правила доступу не узгоджені, зверніться до адміністратора",
     # Пароль
     "password.too_short": "Пароль закороткий",
     "password.too_long": "Пароль задовгий",

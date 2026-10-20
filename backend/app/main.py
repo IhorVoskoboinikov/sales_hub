@@ -8,8 +8,7 @@ from fastapi import FastAPI
 from redis.asyncio import Redis
 
 from app.api import health, well_known
-from app.api import v1 as api_v1
-from app.api.v1 import admin, auth
+from app.api.v1 import admin, admin_router, auth, protected_router
 from app.authz.opa import OpaClient
 from app.authz.roles import RoleCatalog
 from app.core.config import Settings, get_settings
@@ -77,7 +76,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(well_known.router)
-    app.include_router(api_v1.router)
     app.include_router(auth.router)
-    app.include_router(admin.router)
+    app.include_router(admin.router)  # этап 2: /admin/invites, удаляется в шаге 3.6
+    # Модули с эндпоинтами импортированы выше: include_router копирует уже объявленные маршруты.
+    app.include_router(protected_router)
+    app.include_router(admin_router)
     return app

@@ -1,0 +1,60 @@
+"""Сборка приложения. Запуск: uvicorn app.main:create_app --factory"""
+
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from redis.asyncio import Redis
+
+from app.api import health
+from app.api import v1 as api_v1
+from app.core.config import Settings, get_settings
+from app.core.logging import configure_logging
+from app.db.session import create_engine, create_session_factory
+from app.errors.handlers import register_error_handlers
+from app.middleware.access_log import AccessLogMiddleware
+from app.middleware.request_id import RequestIdMiddleware
+from app.middleware.unhandled_errors import UnhandledErrorMiddleware
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or get_settings()
+    configure_logging(settings.log_level, json=settings.log_json)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # Создаётся один раз при старте и закрывается при остановке процесса.
+        # Соединения открываются лениво — при первом запросе, а не здесь.
+        engine = create_engine(settings.database_url)
+        app.state.engine = engine
+        app.state.session_factory = create_session_factory(engine)
+        app.state.redis = Redis.from_url(
+            settings.redis_url, socket_connect_timeout=2, socket_timeout=2
+        )
+        try:
+            yield
+        finally:
+            await app.state.redis.aclose()
+            await engine.dispose()
+
+    app = FastAPI(
+        title="SalesHub API",
+        version="0.1.0",
+        lifespan=lifespan,
+        docs_url="/docs" if settings.show_docs else None,
+        redoc_url="/redoc" if settings.show_docs else None,
+        openapi_url="/openapi.json" if settings.show_docs else None,
+    )
+    app.state.settings = settings
+
+    register_error_handlers(app)
+
+    # add_middleware добавляет слой снаружи предыдущих, поэтому порядок здесь — изнутри наружу.
+    # Запрос проходит: RequestId → AccessLog → UnhandledError → маршрут.
+    app.add_middleware(UnhandledErrorMiddleware)
+    app.add_middleware(AccessLogMiddleware)
+    app.add_middleware(RequestIdMiddleware)
+
+    app.include_router(health.router)
+    app.include_router(api_v1.router)
+    return app

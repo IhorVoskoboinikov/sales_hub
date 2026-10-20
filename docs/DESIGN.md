@@ -121,7 +121,7 @@ class DealService:
 ### Структура репозитория
 
 ```text
-saleshub/
+sales_hub/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # create_app(): роутеры, middleware, handlers
@@ -160,7 +160,7 @@ saleshub/
 │   └── k3d-config.yaml
 ├── Tiltfile
 ├── .github/workflows/{ci.yml,cd.yml}
-└── docs/DESIGN.md               # этот документ, экспорт
+└── docs/DESIGN.md               # этот документ — единственная копия
 ```
 
 ## 3. Модель данных
@@ -1461,10 +1461,10 @@ deploy/
 
 ### Этап 0 — Подготовка
 
-- [ ] 0.1 Установить: Docker, uv, Python 3.13, k3d, kubectl, helm, tilt, opa, kubeseal, gh CLI.
-- [ ] 0.2 Создать публичный репозиторий `saleshub` на GitHub: README, лицензия, `.gitignore`, `.editorconfig`.
-- [ ] 0.3 Экспортировать этот документ в `docs/DESIGN.md`.
-- [ ] 0.4 pre-commit: ruff, ruff-format, mypy, gitleaks (поиск секретов).
+- [ ] 0.1 Установить: Docker, uv, Python 3.13, k3d, kubectl, helm, tilt, opa, kubeseal, gh CLI. Уже есть: Docker, uv, Python 3.13, pre-commit (`uv tool install pre-commit`); остальное понадобится не раньше этапа 3 (opa) и этапа 6 (Kubernetes).
+- [x] 0.2 Создать публичный репозиторий на GitHub (`IhorVoskoboinikov/sales_hub`): README, лицензия MIT, `.gitignore`, `.editorconfig`.
+- [x] 0.3 Перенести этот документ в `docs/DESIGN.md` — дальше правим только его, копий нет.
+- [x] 0.4 pre-commit: ruff, ruff-format, mypy, gitleaks (поиск секретов). Ruff ограничен файлами `.py`: новые версии форматируют и Python-фрагменты в Markdown, а эскизы в этом документе специально написаны компактно.
 - [ ] 0.5 В настройках GitHub включить secret scanning, push protection, Dependabot, защиту ветки `main`.
 
 **Готово, когда:** `pre-commit run --all-files` проходит, первый коммит в `main`.
@@ -1628,6 +1628,8 @@ CI растёт с этапа 1; здесь он доводится до пол�
 
 | Вопрос | Принято |
 | --- | --- |
+| Документ дизайна | один файл `docs/DESIGN.md`; все договорённости вносятся в него |
+| Коммиты | `тип(модуль) сообщение`, например `docs(design) …`; типы: feat, fix, refactor, docs, config, deploy (test, chore — если не подходит другое) |
 | Домен | мульти-тенантная CRM: организации → отделы → компании, контакты, сделки, активности |
 | Кто создаёт организации | только супер-админ; дальше всё через приглашения |
 | Удаление | мягкое (корзина 30 дней) для компаний, контактов, сделок; жёсткое для остального |

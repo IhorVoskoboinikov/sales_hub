@@ -1,0 +1,14 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "saleshub (compose)",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "saleshub",
+      "Username": "saleshub",
+      "PassFile": "/tmp/pgpass",
+      "SSLMode": "prefer"
+    }
+  }
+}

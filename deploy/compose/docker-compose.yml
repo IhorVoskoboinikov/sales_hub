@@ -1,0 +1,135 @@
+# Локальный стенд: make up (из корня репозитория). Адреса всех UI — make urls.
+# Пароли здесь — только для локальной разработки.
+# Порты открыты только на 127.0.0.1: у pgAdmin нет входа, у Redis нет пароля — из сети стенд не виден.
+# Если порт на хосте занят другим проектом: cp .env.example .env рядом с этим файлом и поменяй порт.
+name: saleshub
+
+x-app-env: &app-env
+  APP_ENV: dev
+  DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@postgres:5432/saleshub
+  REDIS_URL: redis://redis:6379/0
+  LOG_LEVEL: INFO
+
+services:
+  postgres:
+    image: postgres:18.6
+    environment:
+      POSTGRES_USER: saleshub
+      POSTGRES_PASSWORD: saleshub
+      POSTGRES_DB: saleshub
+    ports: ["127.0.0.1:${POSTGRES_PORT:-5432}:5432"]
+    volumes:
+      # У образа PostgreSQL 18 данные лежат в /var/lib/postgresql/18/docker — монтируем родителя.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U saleshub -d saleshub"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8.10
+    ports: ["127.0.0.1:${REDIS_PORT:-6379}:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Одноразовый: применяет миграции и завершается. api стартует только после него.
+  migrate:
+    build: ../../backend
+    image: saleshub-api:dev
+    command: ["alembic", "upgrade", "head"]
+    environment: *app-env
+    depends_on:
+      postgres: {condition: service_healthy}
+    restart: "no"
+
+  api:
+    build: ../../backend
+    image: saleshub-api:dev
+    # dev: код смонтирован с хоста, --reload перезапускает сервер при сохранении файла.
+    command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",
+              "--no-access-log", "--reload"]
+    volumes: [../../backend/app:/app/app:ro]
+    environment: *app-env
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  # --- Веб-интерфейсы (раздел 11)
+
+  pgadmin:
+    image: dpage/pgadmin4:9.18
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      # Режим «одного пользователя»: без экрана входа и мастер-пароля.
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    # libpq читает pgpass, только если права 600, а git их не хранит — копируем и ставим права при старте.
+    entrypoint: ["/bin/sh", "-c", "cp /pgadmin-config/pgpass /tmp/pgpass && chmod 600 /tmp/pgpass && exec /entrypoint.sh"]
+    volumes:
+      - ./pgadmin/servers.json:/pgadmin4/servers.json:ro
+      - ./pgadmin/pgpass:/pgadmin-config/pgpass:ro
+      - pgadmin-data:/var/lib/pgadmin
+    ports: ["127.0.0.1:5050:80"]
+    depends_on: [postgres]
+    # Свой healthcheck: веб-интерфейс стартует ~20 секунд, make up ждёт его.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/misc/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
+  redisinsight:
+    image: redis/redisinsight:3.8.0
+    environment:
+      # Подключение к Redis стенда создаётся само при старте.
+      RI_REDIS_HOST: redis
+      RI_REDIS_PORT: "6379"
+      RI_REDIS_ALIAS: saleshub
+      RI_ACCEPT_TERMS_AND_CONDITIONS: "true"
+    volumes: [redisinsight-data:/data]
+    ports: ["127.0.0.1:5540:5540"]
+    depends_on: [redis]
+
+  mailpit:
+    image: axllent/mailpit:v1.31.6
+    ports:
+      - "127.0.0.1:1025:1025"  # SMTP — сюда приложение отправляет письма
+      - "127.0.0.1:8025:8025"  # веб-интерфейс
+    volumes: [mailpit-data:/data]
+    environment:
+      MP_DATABASE: /data/mailpit.db
+
+  # S3-совместимое хранилище файлов импорта и экспорта (вместо MinIO — раздел 11).
+  rustfs:
+    image: rustfs/rustfs:1.0.3
+    environment:
+      RUSTFS_ACCESS_KEY: saleshub
+      RUSTFS_SECRET_KEY: saleshub-secret
+      RUSTFS_CONSOLE_ENABLE: "true"
+    volumes: [rustfs-data:/data]
+    ports:
+      - "127.0.0.1:9000:9000"  # S3 API
+      - "127.0.0.1:9001:9001"  # веб-консоль
+
+volumes:
+  postgres-data:
+  redis-data:
+  pgadmin-data:
+  redisinsight-data:
+  mailpit-data:
+  rustfs-data:

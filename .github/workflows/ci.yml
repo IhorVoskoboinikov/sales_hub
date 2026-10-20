@@ -1,0 +1,51 @@
+# CI на каждый pull request и push в main: lint, unit, integration (раздел 12).
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Новый пуш в ту же ветку отменяет ещё идущий прогон.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: backend
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # у setup-uv нет тега v10, только точные версии
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy app
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # у setup-uv нет тега v10, только точные версии
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest tests/unit --cov=app --cov-report=term-missing
+
+  integration:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # у setup-uv нет тега v10, только точные версии
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      # Postgres и Redis поднимает сам pytest через testcontainers (Docker на раннере есть).
+      - run: uv run pytest tests/integration

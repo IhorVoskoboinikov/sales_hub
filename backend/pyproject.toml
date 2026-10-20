@@ -1,0 +1,57 @@
+[project]
+name = "saleshub"
+version = "0.1.0"
+description = "SalesHub CRM — учебный бэкенд"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "alembic>=1.20.0",
+    "asyncpg>=0.32.0",
+    "fastapi>=0.151.0",
+    "pydantic-settings>=2.16.0",
+    "redis>=8.1.0",
+    "sqlalchemy[asyncio]>=2.1.5",
+    "structlog>=26.1.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "mypy>=2.4.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+    "ruff==0.17.1",
+    "testcontainers[postgres,redis]>=4.15.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "ASYNC", "RUF"]
+ignore = [
+    "B008",    # Depends(...) в аргументах по умолчанию — обычный стиль FastAPI
+    "RUF001",  # кириллица в строках и комментариях — не опечатка
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"migrations/versions/*" = ["F401"]  # шаблон всегда импортирует sa и op, даже в пустой миграции
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["testcontainers.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

@@ -1,0 +1,28 @@
+# Запуск: pre-commit install (один раз), дальше хуки работают на каждом коммите.
+# Проверить всё вручную: pre-commit run --all-files
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1
+    hooks:
+      # только .py: иначе ruff переформатирует эскизы кода внутри docs/DESIGN.md
+      - id: ruff-check
+        args: [--fix]
+        types_or: [python, pyi]
+      - id: ruff-format
+        types_or: [python, pyi]
+
+  # mypy запускается из окружения проекта (uv): ему нужны установленные fastapi, sqlalchemy и др.,
+  # а изолированное окружение mirrors-mypy их не видит.
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run --directory backend mypy app
+        language: system
+        files: ^backend/app/
+        pass_filenames: false
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.0
+    hooks:
+      - id: gitleaks

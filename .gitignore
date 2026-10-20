@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+# в корне .venv — ссылка на backend/.venv (интерпретатор PyCharm)
+.venv
+*.egg-info/
+build/
+dist/
+
+# Инструменты
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Секреты и локальные настройки
+.env
+*.pem
+*.key
+
+# IDE и локальные индексы
+.idea/
+.vscode/
+.gitnexus/
+
+# Kubernetes / Tilt
+tilt_modules/

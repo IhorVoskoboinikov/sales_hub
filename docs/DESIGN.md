@@ -134,10 +134,11 @@ sales_hub/
 │   │   ├── uow.py
 │   │   ├── authz/               # OPA-клиент, authorize(), чтение data.yaml, Access (scope → SQL)
 │   │   ├── api/
-│   │   │   ├── deps.py
-│   │   │   └── v1/              # auth, users, orgs, teams, companies, contacts, deals, activities, bulk, reports, health
+│   │   │   ├── deps.py          # get_session, get_engine, get_redis, позже current_user
+│   │   │   ├── health.py        # /health/live, /health/ready — вне /api/v1, без авторизации
+│   │   │   └── v1/              # auth, users, orgs, teams, companies, contacts, deals, activities, bulk, reports
 │   │   ├── errors/              # AppError иерархия + exception handlers
-│   │   ├── middleware/          # request_id, access log, metrics
+│   │   ├── middleware/          # request_id, access log, unhandled errors (500), позже metrics
 │   │   ├── events/              # доменные события, outbox relay
 │   │   ├── workers/             # celery_app.py, runtime.py, schedule.py, tasks/ (раздел 15)
 │   │   ├── bot/                 # Telegram-бот на aiogram (раздел 16)
@@ -148,6 +149,7 @@ sales_hub/
 │   ├── tests/{unit,integration,e2e}/
 │   ├── scripts/seed_big.sql     # генерация миллионов строк
 │   ├── Dockerfile
+│   ├── .env.example             # переменные для запуска API без Docker (make run)
 │   └── pyproject.toml
 ├── policies/saleshub/            # OPA: routes.rego, authz.rego, data.yaml (роли), *_test.rego
 ├── frontend/                    # в самом конце
@@ -159,6 +161,7 @@ sales_hub/
 │   ├── monitoring/              # prometheus rules, grafana dashboards, alertmanager
 │   └── k3d-config.yaml
 ├── Tiltfile
+├── Makefile                     # make help — все команды: up, test, lint, migrate…
 ├── .github/workflows/{ci.yml,cd.yml}
 └── docs/DESIGN.md               # этот документ — единственная копия
 ```
@@ -844,8 +847,10 @@ async def authorize(user: CurrentUser = Depends(current_user),
                     d: dict = Depends(opa_decision)) -> Access:
     return Access.for_user(user, d["action"])       # уровень — из data.yaml
 
-# префикс задаём у роутера, а не в include_router: тогда шаблон пути в scope["route"].path
-# всегда полный, как ключи в routes.rego
+# Полный префикс — у роутера, эндпоинты объявляются прямо на нём (@protected.get(...)),
+# роутер подключается только в app: без include_router(prefix=...) и без вложения роутера
+# в роутер. Тогда scope["route"].path — полный шаблон, как ключи в routes.rego. У вложенного
+# роутера FastAPI 0.151 оставляет только его собственный префикс, и OPA ответила бы 403 всем.
 protected = APIRouter(prefix="/api/v1", dependencies=[Depends(authorize)])          # данные организации
 admin = APIRouter(prefix="/api/v1/admin", dependencies=[Depends(opa_decision)])     # супер-админ, без Access
 ```
@@ -942,11 +947,11 @@ class Access:
 
 | Сценарий | Объём | Техника |
 | --- | --- | --- |
-| Импорт контактов из CSV с дедупликацией по email | 500 тыс. строк | файл в MinIO → `COPY` в `contacts_staging` → валидация SQL-ом → `INSERT … ON CONFLICT (org_id, email) WHERE deleted_at IS NULL DO UPDATE SET … WHERE <фильтр Access из params>`: существующий контакт обновляется, только если он в уровне того, кто запустил импорт, остальные дубли → `import_errors` (`duplicate_outside_scope`). Новые строки: ответственный — из колонки `owner_email` (в уровне запустившего), иначе сам запустивший; `team_id` — отдел ответственного; битые строки → `import_errors` |
+| Импорт контактов из CSV с дедупликацией по email | 500 тыс. строк | файл в S3 (RustFS) → `COPY` в `contacts_staging` → валидация SQL-ом → `INSERT … ON CONFLICT (org_id, email) WHERE deleted_at IS NULL DO UPDATE SET … WHERE <фильтр Access из params>`: существующий контакт обновляется, только если он в уровне того, кто запустил импорт, остальные дубли → `import_errors` (`duplicate_outside_scope`). Новые строки: ответственный — из колонки `owner_email` (в уровне запустившего), иначе сам запустивший; `team_id` — отдел ответственного; битые строки → `import_errors` |
 | Менеджер уволился: передать всех его клиентов | до 100 тыс. контактов + сделки + открытые активности | чанки `UPDATE … SET owner_id = :new WHERE owner_id = :old AND id BETWEEN …` по трём таблицам |
 | Закрыть просроченные сделки как `lost` | десятки тысяч | частичный индекс `(org_id, expected_close_date) WHERE status = 'open'` + чанки |
 | Добавить тег сегменту | до 1 млн контактов | `UPDATE … SET tags = array_append(tags, :t) WHERE NOT tags @> ARRAY[:t]` — идемпотентно |
-| Экспорт сегмента в CSV | до 5 млн | серверный курсор + `StreamingResponse`; для больших — файл в MinIO и ссылка |
+| Экспорт сегмента в CSV | до 5 млн | серверный курсор + `StreamingResponse`; для больших — файл в S3 (RustFS) и ссылка |
 | Очистка корзины | всё, что удалено > 30 дней | задача beat, `DELETE` чанками |
 
 ### Способы обновить много строк
@@ -1016,13 +1021,16 @@ class Access:
 
 ### Middleware (порядок снаружи внутрь)
 
-1. `RequestIdMiddleware` — берёт `X-Request-ID` или генерирует, кладёт в `contextvars` и в ответ.
-2. `AccessLogMiddleware` — метод, путь-шаблон (`/deals/{deal_id}`, а не реальный id), статус, длительность, user\_id.
-3. `MetricsMiddleware` — гистограмма латентности и счётчик запросов по шаблону пути и статусу (раздел 8).
-4. `CORSMiddleware` — для фронта.
+1. `RequestIdMiddleware` — берёт `X-Request-ID` (если он не длиннее 64 символов и без спецсимволов, иначе через него можно подделать строки лога) или генерирует, кладёт в `contextvars` и в ответ.
+2. `AccessLogMiddleware` — метод, путь-шаблон (`/api/v1/deals/{deal_id}`, а не реальный id; query не пишем — в нём бывают токены; без маршрута — `<unmatched>`), статус, длительность, с этапа 2 — user\_id. `/health/*` пишется на уровне debug, чтобы пробы не засоряли лог.
+3. `MetricsMiddleware` — гистограмма латентности и счётчик запросов по шаблону пути и статусу (раздел 8, этап 8).
+4. `CORSMiddleware` — для фронта (добавляется вместе с фронтом, раздел 13).
 5. (опц.) `GZipMiddleware`, лимит размера тела.
+6. `UnhandledErrorMiddleware` — самый внутренний слой: любое неожиданное исключение превращает в 500 общего формата, traceback пишет только в лог.
 
-Механика лучше на чистом ASGI (а не `BaseHTTPMiddleware`) — заодно разобраться, почему `BaseHTTPMiddleware` плохо дружит со стримингом.
+Механика на чистом ASGI (а не `BaseHTTPMiddleware`) — заодно разобраться, почему `BaseHTTPMiddleware` плохо дружит со стримингом.
+
+**Почему 500 ловит middleware, а не `add_exception_handler(Exception)`.** Обработчик `Exception` Starlette вызывает в `ServerErrorMiddleware` — снаружи всех наших слоёв. Тогда ответ 500 ушёл бы без `X-Request-ID`, в логе ошибки не было бы `request_id`, а uvicorn напечатал бы traceback второй раз. `UnhandledErrorMiddleware` стоит внутри `RequestIdMiddleware` и `AccessLogMiddleware`, поэтому оба видят ошибку как обычный ответ 500.
 
 ### Ошибки
 
@@ -1030,7 +1038,9 @@ class Access:
 class AppError(Exception):
     status = 500
     code = "internal"
-    def __init__(self, message: str = "", **details): ...
+    def __init__(self, code: str | None = None, **details): ...   # code уточняет класс, details → в ответ
+    @property
+    def title(self) -> str: ...   # текст из app/texts/uk.py по code, иначе — текст класса
 
 class NotFound(AppError):        status, code = 404, "not_found"
 class Forbidden(AppError):       status, code = 403, "forbidden"
@@ -1038,17 +1048,21 @@ class Unauthorized(AppError):    status, code = 401, "auth.invalid_token"
 class Conflict(AppError):        status, code = 409, "conflict"          # version mismatch, дубль
 class ValidationFailed(AppError): status, code = 422, "validation"
 class RateLimited(AppError):     status, code = 429, "rate_limited"
-class ServiceUnavailable(AppError): status, code = 503, "unavailable"   # OPA, SMTP
+class ServiceUnavailable(AppError): status, code = 503, "unavailable"   # Postgres, Redis, OPA, SMTP
+
+raise NotFound(entity="deal", id=123)      # → 404, code=not_found, details={"entity": "deal", "id": 123}
+raise Conflict("member.last_admin")        # → 409, code=member.last_admin, title «Конфлікт даних»
 ```
 
-Сервисы и репозитории бросают только `AppError`-наследников, ничего не знают про HTTP-коды фреймворка. Обработчики:
+Сервисы и репозитории бросают только `AppError`-наследников, ничего не знают про HTTP-коды фреймворка. Человеческий текст (`title`) в коде не пишется — он берётся из `app/texts/uk.py` по `code`. Обработчики:
 
 | Исключение | Ответ | Лог |
 | --- | --- | --- |
-| `AppError` | его status + тело ниже | warning (4xx) |
-| `RequestValidationError` | 422, `code=validation`, поля в `details` | info |
-| `IntegrityError` (unique) | 409 `conflict` | warning |
-| любое другое | 500 `internal`, без стектрейса наружу | error + traceback |
+| `AppError` | его status + тело ниже | warning (4xx), error (5xx) |
+| `RequestValidationError` | 422, `code=validation`, в `details.errors` — `loc`, `type` и украинское `message`; введённое значение (`input`) не возвращается — там может быть пароль | info |
+| `HTTPException` Starlette (нет маршрута, не тот метод) | 404 `not_found`, 405 `method_not_allowed` с заголовком `Allow` | — |
+| `IntegrityError` (unique, SQLSTATE 23505) | 409 `conflict`; остальные нарушения (FK, CHECK) — ошибка в коде → 500 | warning |
+| любое другое | 500 `internal`, без стектрейса наружу (`UnhandledErrorMiddleware`) | error + traceback |
 
 Формат тела (по мотивам RFC 9457 problem+json):
 
@@ -1056,7 +1070,7 @@ class ServiceUnavailable(AppError): status, code = 503, "unavailable"   # OPA, S
 {
   "type": "https://saleshub.local/errors/not_found",
   "code": "not_found",
-  "title": "Deal not found",
+  "title": "Не знайдено",
   "status": 404,
   "request_id": "7b0c…",
   "details": {"entity": "deal", "id": 123}
@@ -1084,7 +1098,7 @@ class ServiceUnavailable(AppError): status, code = 503, "unavailable"   # OPA, S
 
 ### Health-эндпоинты
 
-`/health/live` — процесс жив (для liveness). `/health/ready` — есть соединение с Postgres и Redis (для readiness, без него pod не получает трафик).
+`/health/live` — процесс жив (для liveness); внешнее не проверяет, иначе при падении БД Kubernetes перезапускал бы все поды. `/health/ready` — отвечают Postgres (`SELECT 1`) и Redis (`PING`), на каждую проверку 2 секунды (для readiness, без него pod не получает трафик); иначе 503 `unavailable` и `details.failed: ["postgres", "redis"]`.
 
 ## 8. Метрики, дашборды и алерты
 
@@ -1139,7 +1153,7 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 
 ### Правила
 
-- `env.py` асинхронный (`async_engine_from_config` + `run_sync`), URL из той же `Settings`, что и приложение.
+- `env.py` асинхронный (`create_async_engine(url, poolclass=NullPool)` + `run_sync`), URL из той же `Settings`, что и приложение; тесты передают свой через `config.attributes["database_url"]`.
 - `MetaData(naming_convention=…)` — у всех индексов и constraint-ов предсказуемые имена, иначе `downgrade` и autogenerate ломаются.
 - Autogenerate — черновик, миграция всегда читается и правится руками.
 - Схема и данные — разные ревизии. Данные (backfill) на больших таблицах — не в миграции, а bulk job-ом из раздела 6.
@@ -1218,6 +1232,21 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 
 Плюс два сервиса для этого проекта: `opa` (политики из `./policies`, `--watch` — правка `.rego` применяется сразу) и `mailpit` (SMTP-ловушка: SMTP на 1025, веб на `localhost:8025`).
 
+Файл — `deploy/compose/docker-compose.yml`, команды — в `Makefile` (`make help`). Что есть после этапа 1:
+
+| Сервис | Порт на хосте | Заметки |
+| --- | --- | --- |
+| `api` | 8000 | код смонтирован с хоста, `--reload` подхватывает правки без пересборки образа |
+| `migrate` | — | одноразовый `alembic upgrade head`; `api` стартует только после его успешного завершения |
+| `postgres` 18 | `${POSTGRES_PORT:-5432}` | том монтируется в `/var/lib/postgresql` (у образа 18 данные в `/var/lib/postgresql/18/docker`) |
+| `redis` 8 | `${REDIS_PORT:-6379}` | если порт занят другим проектом — поменять в `deploy/compose/.env` (шаблон `.env.example` рядом) и в `backend/.env` |
+| `pgadmin` | 5050 | без экрана входа; сервер и пароль заданы заранее (`servers.json` + `pgpass`, права 600 ставятся при старте контейнера) |
+| `redisinsight` | 5540 | подключение к Redis стенда создаётся само (`RI_REDIS_HOST`) |
+| `mailpit` | 1025, 8025 | |
+| `rustfs` | 9000 (S3), 9001 (консоль `/rustfs/console/`) | S3-совместимое хранилище вместо MinIO: официальные образы MinIO больше не публикуются |
+
+Все порты открыты только на `127.0.0.1`: у pgAdmin нет входа, у Redis нет пароля, поэтому из сети стенд не виден. `make up` ждёт, пока все сервисы станут healthy (`--wait`), и печатает адреса UI. Для запуска API без Docker (`make run`, отладка в IDE) — `make infra`: только Postgres и Redis.
+
 ### Шаг 2 — Kubernetes локально
 
 Кластер: **kind** (Kubernetes in Docker) или **k3d** (k3s in Docker) — оба поднимаются одной командой и работают с Tilt. Выбран k3d — он легче по памяти; kind используется только в CI для e2e. Пакетирование — свой Helm-чарт `deploy/helm/saleshub`; Postgres и Redis — готовые Bitnami-чарты (в проде их обычно заменяет managed-сервис).
@@ -1244,7 +1273,7 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 
 ### Секреты: Sealed Secrets с первого дня
 
-Секреты проекта: пароль Postgres, приватный RS256-ключ для JWT, пароль супер-админа, SMTP, токен Telegram-бота для алертов, ключи MinIO.
+Секреты проекта: пароль Postgres, приватный RS256-ключ для JWT, пароль супер-админа, SMTP, токен Telegram-бота для алертов, ключи S3-хранилища (RustFS).
 
 | Где | Инструмент | Как работает |
 | --- | --- | --- |
@@ -1297,7 +1326,7 @@ local_resource('seed-5m', 'kubectl exec deploy/postgres -- psql -f /seed/seed_bi
 
 | Группа | Сервисы | Когда включать |
 | --- | --- | --- |
-| `core` | api + OPA, воркеры, beat, outbox-relay, telegram-bot, Postgres, Redis, MinIO, Mailpit, Sealed Secrets, pgAdmin, RedisInsight, Flower | всегда |
+| `core` | api + OPA, воркеры, beat, outbox-relay, telegram-bot, Postgres, Redis, RustFS (S3), Mailpit, Sealed Secrets, pgAdmin, RedisInsight, Flower | всегда |
 | `events` | Redpanda, Redpanda Console | этап 9 и всё, что про Kafka |
 | `search` | Elasticsearch, Kibana, search-indexer (требует `events`) | работа над поиском |
 | `monitoring` | Prometheus, Grafana, Alertmanager, Loki, exporters | метрики, дашборды, алерты |
@@ -1320,7 +1349,7 @@ local_resource('seed-5m', 'kubectl exec deploy/postgres -- psql -f /seed/seed_bi
 | Дашборды | Grafana | `grafana.saleshub.localhost` · 3000 | дашборды из раздела 8, логи (Loki) |
 | Алерты | Alertmanager UI | `alerts.saleshub.localhost` · 9093 | сработавшие алерты, тишина (silences) |
 | Почта | Mailpit | `mail.saleshub.localhost` · 8025 | письма приглашений и сброса пароля |
-| Файлы | MinIO Console | `minio.saleshub.localhost` · 9001 | файлы импорта и экспорта |
+| Файлы (S3) | консоль RustFS | `s3.saleshub.localhost` · 9001, путь `/rustfs/console/` | файлы импорта и экспорта |
 | Kubernetes | Tilt UI + Headlamp | `localhost:10350` · `k8s.saleshub.localhost` | логи и статус ресурсов, поды, Jobs, события кластера |
 | OPA | отдельного UI нет | — | решения видны в decision logs (Grafana → Loki); правила удобно отлаживать в Rego Playground |
 | CD | Argo CD UI | argocd.saleshub.localhost | синхронизация с git, история выкаток, откат |
@@ -1338,7 +1367,7 @@ CI проверяет каждый PR (качество, тесты, мигра�
 | --- | --- | --- |
 | `lint` | `ruff check`, `ruff format --check`, `mypy app` | — |
 | `unit` | `pytest tests/unit --cov` | — |
-| `integration` | services: postgres, redis; `alembic upgrade head`; `pytest tests/integration` | lint |
+| `integration` | `pytest tests/integration`: Postgres и Redis поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре; там же проверки миграций (одна голова, `alembic check`, downgrade → upgrade) | lint |
 | `migrations` | upgrade → `alembic check` → downgrade base → upgrade; одна голова | lint |
 | `openapi` | экспорт `openapi.json`, diff с main (ломающие изменения подсвечиваются) | lint |
 | `build` | `docker buildx` с кэшем GHA, без push | unit |
@@ -1405,7 +1434,7 @@ deploy/
 | PostgreSQL | Bitnami-чарт в кластере | RDS / Cloud SQL | `postgresql.enabled: false` + `externalDatabase.host` |
 | Redis | чарт в кластере | ElastiCache / Memorystore | `redis.enabled: false` + `externalRedis.host` |
 | Kafka | Redpanda в кластере | Redpanda Cloud / MSK | `kafka.bootstrapServers` |
-| Файлы | MinIO | S3 / GCS | только endpoint и ключи: клиент один (S3 API) |
+| Файлы | RustFS (S3 API) | S3 / GCS | только endpoint и ключи: клиент один (S3 API) |
 | Ingress и TLS | ingress-nginx, `*.saleshub.localhost`, без TLS | ingress-nginx или ALB, свой домен, cert-manager + Let's Encrypt | `ingress.className`, `ingress.host`, `tls.enabled` |
 | Диски | local-path | gp3 / pd-ssd | `storageClass` |
 | Образы | GHCR | GHCR (или ECR / Artifact Registry) | без изменений |
@@ -1419,7 +1448,7 @@ deploy/
 
 - Вся конфигурация — из переменных окружения (12-factor); в коде нет хостов, путей и названий бакетов.
 - Внешние зависимости в чарте — опциональные сабчарты с флагом `enabled`; приложение не знает, где запущена база.
-- Файлы — только через S3 API (`aioboto3`), а не через специфичный клиент MinIO.
+- Файлы — только через S3 API (`aioboto3`), а не через специфичный клиент хранилища: так RustFS локально и S3 в облаке взаимозаменяемы.
 - Пробы `live`/`ready`, graceful shutdown по SIGTERM, `requests`/`limits` у каждого пода — без этого в облаке поды убивают.
 - Миграции — отдельный Job и совместимы со старой версией кода (раздел 9).
 - Образ один на все окружения, тег = SHA коммита; продвижение в staging/prod — коммит тега в папку окружения.
@@ -1451,7 +1480,7 @@ deploy/
 
 **Как работать по плану:**
 
-- Один шаг — одна ветка и один PR в `main`; после каждого шага CI зелёный.
+- Один этап — одна ветка `stage-N` и один PR в `main`; шаги — отдельными коммитами; после этапа CI зелёный.
 - Отмечай шаг галочкой прямо здесь, когда он смержен.
 - Не переходи к следующему этапу, пока не выполнено «Готово, когда».
 - В скобках у шага — раздел документа, где описаны детали.
@@ -1471,16 +1500,16 @@ deploy/
 
 ### Этап 1 — Скелет приложения
 
-- [ ] 1.1 `pyproject.toml` через uv, структура папок (раздел 2).
-- [ ] 1.2 `Settings` на pydantic-settings, профили dev/test/prod, `.env.example`.
-- [ ] 1.3 `create_app()`, роутер `/api/v1`, `/health/live`.
-- [ ] 1.4 structlog (JSON), `RequestIdMiddleware`, access-лог (раздел 7).
-- [ ] 1.5 Иерархия `AppError`, обработчики, формат ошибки, тексты на украинском (раздел 7).
-- [ ] 1.6 Dockerfile (multi-stage) и docker compose: api, Postgres, Redis, pgAdmin, RedisInsight, Mailpit, MinIO.
-- [ ] 1.7 Async engine, сессия на запрос, `Base` с naming convention, `/health/ready`.
-- [ ] 1.8 Alembic с async `env.py`, первая пустая миграция, `make migrate`.
-- [ ] 1.9 pytest: `conftest`, testcontainers Postgres, первый тест health.
-- [ ] 1.10 Минимальный `ci.yml`: lint + unit + integration.
+- [x] 1.1 `pyproject.toml` через uv, структура папок (раздел 2).
+- [x] 1.2 `Settings` на pydantic-settings, профили dev/test/prod, `.env.example`.
+- [x] 1.3 `create_app()`, роутер `/api/v1`, `/health/live`.
+- [x] 1.4 structlog (JSON), `RequestIdMiddleware`, access-лог (раздел 7).
+- [x] 1.5 Иерархия `AppError`, обработчики, формат ошибки, тексты на украинском (раздел 7).
+- [x] 1.6 Dockerfile (multi-stage) и docker compose: api, Postgres, Redis, pgAdmin, RedisInsight, Mailpit, RustFS (S3; вместо MinIO — его образы больше не публикуются).
+- [x] 1.7 Async engine, сессия на запрос, `Base` с naming convention, `/health/ready`.
+- [x] 1.8 Alembic с async `env.py`, первая пустая миграция, `make migrate`.
+- [x] 1.9 pytest: `conftest`, testcontainers Postgres, первый тест health.
+- [ ] 1.10 Минимальный `ci.yml`: lint + unit + integration. Файл готов и проверен actionlint; галочка — после первого зелёного прогона на GitHub.
 
 **Готово, когда:** `make up` поднимает всё, все UI открываются (раздел 11), `/health/ready` отвечает 200, CI зелёный.
 
@@ -1538,7 +1567,7 @@ deploy/
 - [ ] 5.3 `outbox_events` и процесс relay (`LISTEN/NOTIFY` + опрос).
 - [ ] 5.4 `bulk_jobs`, `plan` / `chunk` / `finalize`, эндпоинт передачи клиентов, `move_team` при смене отдела, прогресс по SSE + строки в `routes.rego`.
 - [ ] 5.5 Отмена job, `reap_stuck`, `failed_tasks` и перезапуск + строки в `routes.rego`.
-- [ ] 5.6 Импорт CSV: загрузка в MinIO → `COPY` → merge → `import_errors`.
+- [ ] 5.6 Импорт CSV: загрузка в S3 (RustFS) → `COPY` → merge → `import_errors`.
 - [ ] 5.7 Закрытие просроченных сделок, теги, потоковый экспорт в CSV + строки в `routes.rego`.
 - [ ] 5.8 Расписание beat из раздела 15 (НБУ, корзина, партиции, отчёты, токены, heartbeat).
 - [ ] 5.9 Замеры способов UPDATE → `docs/experiments.md`.
@@ -1568,7 +1597,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 - [ ] 7.1 `make cluster`: k3d-кластер, ingress-nginx, домены `*.saleshub.localhost`.
 - [ ] 7.2 Helm-чарт: api с OPA-сайдкаром, пробы, ресурсы, Service, Ingress.
 - [ ] 7.3 Воркеры по очередям, beat (1 реплика, `Recreate`), relay, telegram-bot, Flower.
-- [ ] 7.4 Сабчарты Postgres, Redis, MinIO, Mailpit, pgAdmin, RedisInsight с флагами `enabled`.
+- [ ] 7.4 Сабчарты Postgres, Redis, RustFS, Mailpit, pgAdmin, RedisInsight с флагами `enabled`.
 - [ ] 7.5 Контроллер Sealed Secrets, бэкап ключа, `make seal`, все секреты как SealedSecret.
 - [ ] 7.6 Jobs `migrate` и `seed` как Helm hooks.
 - [ ] 7.7 Tiltfile: live\_update, группы сервисов, ссылки на все UI, ручные ресурсы (тесты, seed).
@@ -1630,6 +1659,9 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | --- | --- |
 | Документ дизайна | один файл `docs/DESIGN.md`; все договорённости вносятся в него |
 | Коммиты | `тип(модуль) сообщение`, например `docs(design) …`; типы: feat, fix, refactor, docs, config, deploy (test, chore — если не подходит другое) |
+| Хранилище файлов (S3) | RustFS вместо MinIO: официальные образы MinIO больше не публикуются; код работает только через S3 API, поэтому хранилище заменяемо |
+| Роутеры FastAPI | полный префикс у роутера (`/api/v1`, `/api/v1/admin`), эндпоинты прямо на нём, подключение только в `app`; вложенные роутеры не используем — у них `scope["route"].path` теряет внешний префикс (FastAPI 0.151) |
+| Неожиданные ошибки (500) | ловит `UnhandledErrorMiddleware` внутри `RequestId` и `AccessLog`, а не `exception_handler(Exception)` — так в ответе есть `X-Request-ID`, а в логе `request_id` |
 | Домен | мульти-тенантная CRM: организации → отделы → компании, контакты, сделки, активности |
 | Кто создаёт организации | только супер-админ; дальше всё через приглашения |
 | Удаление | мягкое (корзина 30 дней) для компаний, контактов, сделок; жёсткое для остального |

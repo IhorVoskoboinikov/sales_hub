@@ -42,11 +42,11 @@ SalesHub — мульти-тенантная CRM для отделов прод�
 
 ## 2. Архитектура слоёв
 
-Один запрос = одна `AsyncSession` = один Unit of Work; коммит делает только сервис через UoW, репозитории никогда не коммитят. Права проверяются в двух местах: на входе в эндпоинт (есть ли permission вообще) и в сервисе/репозитории (на какой объект/строки он распространяется).
+Один запрос = одна `AsyncSession` = один Unit of Work; коммит делает только сервис через UoW, репозитории никогда не коммитят.
 
 &#91;embedded content: архитектура SalesHub · API, OPA, очереди, события, мониторинг\]
 
-Права проверяются дважды; OPA спрашиваем один раз: `authorize()` на роутере (можно ли это действие вообще) и `Grant` в сервисе (можно ли с этим объектом; для списков — SQL-фильтр). Всё, что дольше секунды, уходит через Redis в воркеры, которые вызывают те же сервисы и UoW.
+Права проверяются в два шага. OPA вызывается один раз на запрос — в `authorize()` на роутере: можно ли этой роли вызвать эндпоинт. Дальше сервис и репозиторий работают с готовым `Access`: проверяют объект, а для списков добавляют SQL-фильтр. Уровень (`own` / `team` / `org`) `Access` берёт из того же файла ролей `data.yaml`, что и OPA (раздел 5). Всё, что дольше секунды, уходит через Redis в воркеры, которые вызывают те же сервисы и UoW.
 
 ### Ответственность слоёв
 
@@ -54,9 +54,9 @@ SalesHub — мульти-тенантная CRM для отделов прод�
 | --- | --- | --- | --- |
 | `api` (роутер) | HTTP, схемы Pydantic, Depends | SQL, сессии | валидация, `authorize() → OPA`, вызов сервиса, маппинг в response-схему |
 | `deps` | всё, что собирает граф зависимостей | бизнес-правила | `get_session`, `get_uow`, `current_user`, `get_deal_service` |
-| `service` | доменные правила, `Grant`, UoW | HTTP, FastAPI | сценарий: проверить объектный доступ, изменить, записать события, `uow.commit()` |
+| `service` | доменные правила, `Access`, UoW | HTTP, FastAPI | сценарий: проверить объектный доступ, изменить, записать события, `uow.commit()` |
 | `uow` | сессию и набор репозиториев | HTTP | транзакция, `commit/rollback`, сбор доменных событий в outbox |
-| `repository` | SQLAlchemy-модели, запросы | HTTP, права | CRUD, фильтры, keyset-пагинация, bulk SQL; принимает готовый scope-фильтр |
+| `repository` | SQLAlchemy-модели, запросы | HTTP, OPA, роли (права получает готовыми в виде `Access`) | CRUD, фильтры, keyset-пагинация, bulk SQL; чтение принимает `Access` и само добавляет его фильтр |
 | `db session` | engine, пул | — | `async_sessionmaker`, одна сессия на запрос |
 
 ### Как это выглядит в коде (эскиз)
@@ -98,18 +98,18 @@ class UnitOfWork:
 async def update_deal(
     deal_id: int,
     body: DealUpdate,
-    grant: Grant = Depends(authorize),          # спросили OPA: deal:update
+    access: Access = Depends(authorize),        # спросили OPA: deal:write; уровень — из data.yaml
     svc: DealService = Depends(get_deal_service),
 ):
-    return await svc.update(deal_id, body, grant)
+    return await svc.update(deal_id, body, access)
 
 # services/deals.py
 class DealService:
-    async def update(self, deal_id: int, body: DealUpdate, grant: Grant) -> Deal:
-        deal = await self.uow.deals.get_or_404(deal_id)          # deleted_at IS NULL внутри
-        grant.ensure_object(deal)             # own / team / org: то же условие, что в SQL-фильтре
+    async def update(self, deal_id: int, body: DealUpdate, access: Access) -> Deal:
+        deal = await self.uow.deals.get_visible_or_404(deal_id, access)  # deleted_at IS NULL + фильтр Access; чужая → 404
         old_stage = deal.stage_id
-        deal.apply(body)                                         # версия +1, проверка version
+        deal.apply(body)                      # версия +1; при смене owner_id team_id = отдел нового ответственного
+        access.ensure_allowed(deal)           # после изменения сделка тоже в моём уровне, иначе 403
         if deal.stage_id != old_stage:
             self.uow.add_event(DealStageChanged(deal.id, old_stage, deal.stage_id))
         await self.uow.commit()
@@ -132,7 +132,7 @@ saleshub/
 │   │   ├── repositories/
 │   │   ├── services/
 │   │   ├── uow.py
-│   │   ├── authz/               # OPA-клиент, authorize(), Grant, scope→SQL
+│   │   ├── authz/               # OPA-клиент, authorize(), чтение data.yaml, Access (scope → SQL)
 │   │   ├── api/
 │   │   │   ├── deps.py
 │   │   │   └── v1/              # auth, users, orgs, teams, companies, contacts, deals, activities, bulk, reports, health
@@ -149,7 +149,7 @@ saleshub/
 │   ├── scripts/seed_big.sql     # генерация миллионов строк
 │   ├── Dockerfile
 │   └── pyproject.toml
-├── policies/saleshub/            # OPA: routes.rego, authz.rego, data.json, *_test.rego
+├── policies/saleshub/            # OPA: routes.rego, authz.rego, data.yaml (роли), *_test.rego
 ├── frontend/                    # в самом конце
 ├── deploy/
 │   ├── compose/docker-compose.yml
@@ -165,19 +165,17 @@ saleshub/
 
 ## 3. Модель данных
 
-Тяжёлые таблицы — `contacts` (5 млн), `deals` (1 млн) и `activities` (20 млн, партиции по месяцам). На них отрабатываются bulk-операции, индексы и партиционирование. Остальные таблицы маленькие и нужны для прав и справочников. Каждая бизнес-строка несёт `org_id` (тенант), `team_id` (отдел) и `owner_id` (ответственный) — по ним OPA и SQL решают, кто что видит.
+Тяжёлые таблицы — `contacts` (5 млн), `deals` (1 млн) и `activities` (20 млн, партиции по месяцам). На них отрабатываются bulk-операции, индексы и партиционирование. Остальные таблицы маленькие и нужны для прав и справочников. Каждая бизнес-строка несёт `org_id` (тенант), `team_id` (отдел) и `owner_id` (ответственный) — по ним бэкенд (`Access`, раздел 5) решает, кто что видит. `team_id` записи — всегда отдел её ответственного: его ставит сервис, а не клиент.
 
 ### Пользователи, тенанты, права
 
 | Таблица | Ключевые поля | Заметки |
 | --- | --- | --- |
-| `users` | id (uuid), email (unique, citext), password\_hash, is\_active, is\_superadmin, email\_verified\_at, token\_version, timezone (null = как у организации), last\_login\_at, created\_at |  |
+| `users` | id (uuid), email (unique, citext), password\_hash, is\_active, is\_superadmin, **org\_id, team\_id, role**, email\_verified\_at, token\_version, timezone (null = как у организации), last\_login\_at, created\_at | один человек — одна организация и одна роль (раздел 5). `role` ∈ `org_admin` / `team_lead` / `sales_rep` / `viewer`. CHECK-и (в Postgres CHECK, который дал NULL, считается пройденным, поэтому условия написаны без сравнений с NULL): `role IN ('org_admin','team_lead','sales_rep','viewer')`; `(role IS NULL) = (org_id IS NULL)`; `NOT (is_superadmin AND org_id IS NOT NULL)`; `(team_id IS NOT NULL) = (role IS NOT NULL AND role IN ('team_lead','sales_rep'))`. FK `(team_id, org_id)` → `teams (id, org_id)` — отдел только из своей организации. Пользователь без организации и роли (не супер-админ) остаётся только с этапа 2 и ничего не может: OPA отвечает 403 |
 | `refresh_tokens` | id, user\_id, family\_id (= `sid`), token\_hash (unique), created\_at, expires\_at, revoked\_at, replaced\_by, user\_agent, ip | раздел 4 |
 | `email_tokens` | id, user\_id, email, purpose (`invite` / `reset_password`), token\_hash, payload jsonb (org\_id, team\_id, role для приглашения), expires\_at, used\_at | раздел 4 |
 | `organizations` | id, name, slug (unique), plan, display\_currency (по умолчанию UAH), timezone (по умолчанию Europe/Kyiv), created\_at | тенант: компания, которая пользуется CRM; создаёт только супер-админ |
-| `teams` | id, org\_id, name, created\_at | отдел продаж |
-| `org_memberships` | user\_id, org\_id, role (`org_admin` / `viewer` / `member`), granted\_by, created\_at | PK (user\_id, org\_id) |
-| `team_memberships` | user\_id, org\_id, team\_id, role (`team_lead` / `sales_rep`), granted\_by | PK (user\_id, team\_id) |
+| `teams` | id, org\_id, name, created\_at | отдел продаж; UNIQUE (id, org\_id) для составного FK из `users`; отдел с людьми удалить нельзя — 409 |
 
 ### CRM-сущности
 
@@ -194,7 +192,7 @@ saleshub/
 
 | Таблица | Назначение |
 | --- | --- |
-| `bulk_jobs` | id, kind (`import_contacts`, `reassign_owner`, `close_stale_deals`, `add_tags`, `export`), status, params jsonb (фильтр + scope-фильтр из Grant), total, processed, failed, error, created\_by, timestamps |
+| `bulk_jobs` | id, kind (`import_contacts`, `reassign_owner`, `move_team`, `close_stale_deals`, `add_tags`, `export`, `reindex`), status, stage (шаг импорта), params jsonb (фильтр + `Access` того, кто запустил), idempotency\_key, total, processed, failed, error, org\_id (NULL у задач супер-админа), team\_id, owner\_id (кто запустил — по этим полям работают `bulk_job:read` и `bulk_job:cancel`), timestamps |
 | `import_errors` | job\_id, row\_no, raw jsonb, error — строки CSV, которые не прошли валидацию |
 | `outbox_events` | transactional outbox: события и письма |
 | `audit_log` | кто что изменил, `PARTITION BY RANGE (occurred_at)` |
@@ -203,7 +201,7 @@ saleshub/
 | sent\_notifications | dedup\_key (unique), channel, user\_id, sent\_at — защита от повторной отправки писем и сообщений |
 | telegram\_links, notification\_settings | привязка chat\_id к пользователю; настройки «событие × канал» (раздел 16) |
 
-Таблиц `roles`, `permissions`, `role_permissions` нет: матрица ролей живёт в OPA (`policies/saleshub/data.json`), в базе только членства. `contacts.id` и `deals.id` — bigint: для чанков по диапазонам id и keyset-пагинации это проще и быстрее.
+Таблиц `roles`, `permissions`, `role_permissions` и членств нет: права ролей живут в файле `policies/saleshub/data.yaml` (его читают OPA и бэкенд), в базе только `users.role` и `users.team_id`. `contacts.id` и `deals.id` — bigint: для чанков по диапазонам id и keyset-пагинации это проще и быстрее.
 
 ### Удаление: в корзину, а не насовсем
 
@@ -289,7 +287,7 @@ saleshub/
 
 ### Токены
 
-|  | Access token | Refresh token |
+|  | Access-токен | Refresh-токен |
 | --- | --- | --- |
 | Формат | JWT RS256, проверяется по `/.well-known/jwks.json` | случайная строка 256 бит (не JWT) |
 | Срок | 1 час (`JWT_ACCESS_TTL=3600`) | 30 дней (`REFRESH_TTL_DAYS=30`) |
@@ -297,7 +295,7 @@ saleshub/
 | Как отозвать | `token_version` пользователя или дождаться истечения | `revoked_at` в БД — сразу |
 | Для чего | каждый запрос к API | только `POST /auth/refresh` |
 
-Refresh сделан непрозрачным и хранится в БД намеренно: его можно отозвать по одному устройству и видеть список сессий. Access остаётся JWT, чтобы API не ходило в БД на каждый запрос.
+Refresh сделан непрозрачным и хранится в БД намеренно: его можно отозвать по одному устройству и видеть список сессий. Access-токен остаётся JWT, чтобы API не ходило в БД на каждый запрос.
 
 Содержимое access-токена:
 
@@ -315,11 +313,11 @@ Refresh сделан непрозрачным и хранится в БД нам
 }
 ```
 
-Права в токен не кладём: они зависят от членств, которые меняются, а токен живёт час. Членства грузятся из БД (кэш Redis) и передаются в OPA (раздел 5).
+Права в токен не кладём: роль и отдел могут поменяться, а токен живёт час. Роль, организация и отдел лежат в `users` и грузятся вместе с пользователем (кэш Redis на 60 с); оттуда роль уходит в OPA (раздел 5).
 
 ### Ротация refresh и защита от кражи
 
-1. `POST /auth/refresh {refresh_token}` → найти по хэшу, проверить `expires_at` и `revoked_at`.
+1. `POST /auth/refresh {refresh_token}` → найти по хэшу, проверить `expires_at`, `revoked_at` и что пользователь `is_active`.
 2. Выдать новую пару access + refresh; старый refresh пометить `revoked_at`, `replaced_by = новый`.
 3. Все refresh одной сессии связаны `family_id`. Если пришёл **уже отозванный** refresh — его украли и использовали повторно: отзываем всю семью, пользователь выходит на этом устройстве.
 4. Срок семьи не продлевается бесконечно: абсолютный предел сессии — 30 дней с логина (настраивается).
@@ -337,12 +335,12 @@ Refresh сделан непрозрачным и хранится в БД нам
 | POST | `/api/v1/auth/password/forgot` | `{email}` → письмо со ссылкой; ответ **всегда 202**, чтобы нельзя было проверить, есть ли email в базе |
 | POST | `/api/v1/auth/password/reset` | `{token, new_password}` → новый пароль, отзыв всех сессий |
 | POST | `/api/v1/auth/password/change` | `{old_password, new_password}` для залогиненного, отзыв остальных сессий |
-| POST | `/api/v1/auth/invite/accept` | `{token, password}` — приглашённый задаёт пароль и сразу состоит в организации |
-| GET | `/api/v1/auth/me` | профиль, членства и роли (фронт по ним решает, что показывать) |
+| POST | `/api/v1/auth/invite/accept` | `{token, password}` — приглашённый задаёт пароль; в базе появляется пользователь с организацией, отделом и ролью из приглашения |
+| GET | `/api/v1/auth/me` | профиль, роль, отдел и `permissions` — действия роли с уровнями из `data.yaml` (фронт по ним решает, что показывать) |
 | GET | `/.well-known/jwks.json` | публичный ключ для проверки подписи |
-| POST | /api/v1/admin/invites | приглашение без организации, только супер-админ (этап 2); с этапа 3 основное — POST /api/v1/orgs/{org\_id}/invites с ролью |
+| POST | /api/v1/admin/invites | приглашение без организации, только супер-админ; живёт только на этапе 2, на этапе 3 удаляется — его заменяют `POST /api/v1/admin/orgs/{org_id}/invites` (первый админ организации) и `POST /api/v1/invites` (админ приглашает в свою организацию) |
 
-Приглашение создаёт админ организации: `POST /api/v1/orgs/{org_id}/invites {email, role}` (проверка прав — в OPA, включая «нельзя пригласить на роль выше своей»).
+Приглашение создаёт админ организации: `POST /api/v1/invites {email, role, team_id}` — всегда в свою организацию, `org_id` берётся из него самого. OPA проверяет, что вызывающий — `org_admin` (`member:manage`); правила «отдел обязателен для `team_lead` и `sales_rep`» и «email уже есть в базе → 409» проверяет сервис (раздел 5).
 
 ### Одноразовые токены из писем
 
@@ -354,7 +352,7 @@ Refresh сделан непрозрачным и хранится в БД нам
 
 1. Достать Bearer-токен, проверить подпись по JWKS, `iss`, `aud`, `exp`, `typ=access`.
 2. Найти пользователя по `sub` (кэш Redis на 60 с), проверить `is_active`, `email_verified_at` и `ver == token_version`.
-3. Вернуть `CurrentUser` (id, email, is\_superadmin). Членства грузятся отдельно, только для защищённых эндпоинтов (раздел 5).
+3. Вернуть `CurrentUser` (id, email, is\_superadmin, org\_id, team\_id, role) — роль и отдел приходят тем же запросом, отдельной загрузки прав нет (раздел 5).
 
 Ошибки: нет токена, битая подпись, истёк → 401 `auth.invalid_token` / `auth.token_expired` (клиент по второму коду понимает, что пора делать refresh); email не подтверждён → 403 `auth.email_not_verified`; заблокирован → 403 `auth.user_inactive`.
 
@@ -371,74 +369,92 @@ Refresh сделан непрозрачным и хранится в БД нам
 - Команда `python -m app.cli create-superadmin` читает `SUPERADMIN_EMAIL` и `SUPERADMIN_PASSWORD` из env/Secret, создаёт пользователя сразу с подтверждённым email; идемпотентна.
 - В Kubernetes это Job `seed` после Job `migrate`; в compose — одноразовый сервис.
 - Не в миграции: миграции описывают схему и не знают секретов окружения.
-- `is_superadmin = true` передаётся в OPA, и политика разрешает ему всё; все его действия пишутся в `audit_log`.
+- `is_superadmin = true` передаётся в OPA; политика разрешает ему только админские эндпоинты `/api/v1/admin/*` (действия `admin:*`): создать организацию, пригласить её первого администратора, перезапустить упавшие задачи. В данные клиентов он не заходит; все его действия пишутся в `audit_log`.
 
 ### Сценарий проверки через Swagger
 
 1. `create-superadmin` → **Authorize** под супер-админом.
-2. `POST /api/v1/admin/invites {email}` (с этапа 3 — `POST /api/v1/orgs/{org_id}/invites {email, role}`) → открыть Mailpit (`localhost:8025`), скопировать токен из письма.
-3. `invite/accept {token, password}` → **Authorize** под новым пользователем → вызвать любой защищённый эндпоинт.
+2. `POST /api/v1/admin/invites {email}` (с этапа 3 — `POST /api/v1/admin/orgs/{org_id}/invites {email}` для первого админа, а он уже `POST /api/v1/invites {email, role, team_id}`) → открыть Mailpit (`localhost:8025`), скопировать токен из письма.
+3. `invite/accept {token, password}` → **Authorize** под новым пользователем → `GET /auth/me`. На этапе 2 защищённых эндпоинтов ещё нет — проверяется только `GET /auth/me`; с этапа 3 пользователь работает в своей роли.
 4. `refresh` с refresh-токеном → новый access; повторить старый refresh → 401 и отзыв всей семьи.
 5. `password/forgot` → письмо → `password/reset` → старые токены больше не работают.
 
 ## 5. Авторизация через OPA (что тебе можно)
 
-Решения о доступе принимает OPA (Open Policy Agent) по правилам на Rego, которые лежат в git рядом с кодом. FastAPI на каждый защищённый запрос отправляет в OPA «вход» — метод, шаблон пути, пользователя с его ролями — и получает ответ: разрешено ли и на какие данные (`own` — свои клиенты, `team` — клиенты отдела, `org` — вся компания, `all` — всё, только супер-админ).
+Права проверяются в два шага, и у каждого шага один хозяин:
 
-### Где что хранится
+| Шаг | Вопрос | Кто отвечает | Пример | Если нельзя |
+| --- | --- | --- | --- | --- |
+| 1 | Можно ли этой роли вызвать этот эндпоинт? | **OPA** по правилам на Rego | `sales_rep` может `PATCH /deals/{id}`, но не `DELETE /contacts/{id}` | 403 |
+| 2 | Какие записи ему видны и какие он может менять? | **бэкенд** (Python, `Access`) | `sales_rep` видит только сделки, где он ответственный | список без чужих строк; чужой объект — 404; изменение, после которого объект выходит за его уровень, — 403 |
 
-| Что | Пример | Где лежит | Кто и как меняет |
-| --- | --- | --- | --- |
-| Какие действия есть у API | `PATCH /api/v1/deals/{deal_id}` → `deal:update` | `policies/saleshub/routes.rego` | разработчик, вместе с новым эндпоинтом, через PR |
-| Что разрешено каждой роли | `sales_rep`: `deal:update` со scope `own` | `policies/saleshub/data.json` (матрица ролей) | через PR → деплой → OPA перечитывает файлы |
-| Логика проверки | роль → области доступа; нельзя выдать роль выше своей | `policies/saleshub/authz.rego` | через PR, покрыто `opa test` |
-| Кто какую роль имеет и где | Ihor — `team_lead` в отделе «Корпоративные продажи» | Postgres: `org_memberships`, `team_memberships` | через API: org admin и team lead назначают роли, OPA проверяет, можно ли им |
-| Супер-админ | `users.is_superadmin` | Postgres | только командой `create-superadmin` при деплое |
-| Как область применяется к данным | own → owner\_id = я | app/authz/grant.py: matches, sql\_filter, es\_filter | разработчик; тест проверяет, что три формы отвечают одинаково |
+Оба шага читают **один файл** `policies/saleshub/data.yaml`, где для каждой роли записано, какие действия ей разрешены и на каком уровне. OPA смотрит только на сам факт «действие есть у роли», бэкенд — на уровень.
 
-Команды для синхронизации прав нет, таблиц прав тоже. Правила и матрица — это код (policy as code): их меняют PR-ом и проверяют тестами. В базе только факты «кто в какой компании и отделе с какой ролью» — их меняют через API.
+**Три слова, на которых держится раздел.**
+
+- **Действие** — имя операции вида `ресурс:глагол`: `deal:write` = создать или изменить сделку. Одно действие могут выполнять несколько эндпоинтов (`POST /deals` и `PATCH /deals/{deal_id}` — оба `deal:write`); какой эндпоинт какое действие выполняет, записано в `routes.rego`.
+- **Уровень** (в коде — `scope`) — какие записи затрагивает действие: `own` — свои (где я ответственный), `team` — своего отдела, `org` — всей организации.
+- **`Access`** — маленький объект «действие + уровень + кто я (`user_id`, `org_id`, `team_id`)». Бэкенд собирает его после ответа OPA; сервис и репозиторий спрашивают у него, видна ли запись, и берут из него SQL-фильтр.
+
+**Почему данные проверяет не OPA.** Спросить OPA про каждый из 5 млн контактов невозможно: список фильтрует SQL, и условие для `WHERE` всё равно пишется в коде. Кроме того, Telegram-бот и Celery-воркеры вызывают сервисы напрямую, без HTTP-маршрутов, — проверка данных в сервисах нужна им в любом случае. Поэтому OPA отвечает на простой вопрос «да/нет», а всё, что касается строк, живёт в одном месте — в `app/authz/access.py`.
 
 ### Роли
 
-| Роль | Уровень | Где | Кто это в жизни |
-| --- | --- | --- | --- |
-| `super_admin` | — | вся система | владелец SaaS: создаёт организации-тенанты |
-| `org_admin` | 40 | организация | администратор CRM в компании-клиенте: отделы, воронки, пользователи |
-| `team_lead` | 30 | отдел | руководитель отдела продаж: видит и перераспределяет клиентов отдела |
-| `sales_rep` | 20 | отдел | менеджер по продажам: работает со своими клиентами |
-| `viewer` | 10 | организация | аналитик, бухгалтер, директор: читает всё, ничего не меняет |
-| `member` | 0 | организация | участник без отдела: видит только карточку организации |
+Один человек состоит ровно в одной организации и имеет ровно одну роль (так устроены многие реальные CRM, например Pipedrive и amoCRM). Роль, организация и отдел хранятся прямо в `users` — отдельных таблиц членства нет.
 
-### Матрица ролей (содержимое `data.json`)
+| Роль | Кто в жизни | Отдел | Видит данные | Меняет |
+| --- | --- | --- | --- | --- |
+| `super_admin` | владелец SaaS | — | в данные организаций не ходит | только через `/api/v1/admin/*`: создаёт организации, приглашает первого `org_admin`, перезапускает упавшие задачи. Это флаг `users.is_superadmin`, а не роль в `data.yaml`; организации у него нет |
+| `org_admin` | администратор CRM в компании-клиенте | нет | всю организацию | всё: настройки, отделы, воронки, пользователи, данные |
+| `team_lead` | руководитель отдела продаж | обязателен | свой отдел | данные отдела, массовые операции в отделе |
+| `sales_rep` | менеджер по продажам | обязателен | только своё (компании — все) | только своё |
+| `viewer` | директор, аналитик, бухгалтер | нет | всю организацию | ничего, только читает и выгружает |
 
-| Действие | super\_admin | org\_admin | team\_lead | sales\_rep | viewer |
+### Матрица ролей (сводка `data.yaml`)
+
+| Действие | Эндпоинты (примеры) | org\_admin | team\_lead | sales\_rep | viewer |
 | --- | --- | --- | --- | --- | --- |
-| `org:update`, `team:manage`, `pipeline:manage` | all | org | — | — | — |
-| `member:invite` | all | org | — | — | — |
-| `member:assign` | all | org | team | — | — |
-| `contact:read`, `company:read`, `deal:read` | all | org | team | own | org |
-| `contact:create`, `deal:create` | all | org | team | team | — |
-| `contact:update`, `deal:update` | all | org | team | own | — |
-| `contact:delete`, `deal:delete`, `trash:restore` | all | org | team | — | — |
-| `activity:manage` | all | org | team | own | — |
-| `contact:import` | all | org | team | — | — |
-| `contact:export` | all | org | team | — | org |
-| `bulk:reassign_owner`, `bulk:update` | all | org | team | — | — |
-| `report:read` | all | org | team | own | org |
-| `bulk_job:read` | all | org | own | own | own |
-| `audit:read` | all | org | — | — | — |
+| `admin:orgs`, `admin:system` | `/api/v1/admin/*` | — | — | — | — |
+| `org:read` | `GET /org`, `GET /teams`, `GET /pipelines` | org | org | org | org |
+| `org:manage` | `PATCH /org`, `POST/PATCH/DELETE /teams`, `POST/PATCH /pipelines` | org | — | — | — |
+| `member:read` | `GET /users` | org | team | team | org |
+| `member:manage` | `POST /invites`, `PATCH /users/{id}` | org | — | — | — |
+| `company:read` | компании — общий справочник | org | org | org | org |
+| `contact:read`, `deal:read`, `activity:read` | списки, карточки, поиск, заметки | org | team | own | org |
+| `company:write`, `contact:write`, `deal:write`, `activity:write` | `POST`, `PATCH` (активности — и `DELETE`) | org | team | own | — |
+| `company:delete`, `contact:delete`, `deal:delete` | `DELETE`, `…/restore`, корзина | org | team | — | — |
+| `bulk:run` | импорт, передача клиентов, теги, закрытие просроченных | org | team | — | — |
+| `export:run` | выгрузка сегмента в CSV | org | team | — | org |
+| `bulk_job:read`, `bulk_job:cancel` | прогресс и отмена job | org | team | — | own |
+| `report:read` | отчёты по воронке и менеджерам | org | team | own | org |
+| `audit:read` | журнал изменений | org | — | — | — |
 
-`sales_rep` создаёт клиента в своём отделе (scope `team`), но потом видит и меняет только тех, где он ответственный (`own`). Руководитель отдела не видит соседний отдел — только администратор организации.
+`admin:*` нет ни у одной роли — эти эндпоинты проходит только супер-админ, и только их. Менеджер не удаляет даже свои записи — только руководитель: так клиенты не пропадают из отчётов отдела, а ошибку менеджер правит через `PATCH`.
+
+**Что значит уровень для изменения.** Изменение проверяется дважды. Старая версия должна быть видна (репозиторий ищет объект через `get_visible_or_404`, иначе 404 — не раскрываем, что объект существует). Новая версия должна попадать в уровень (`ensure_allowed`, иначе 403 — объект пользователь уже видел, скрывать нечего). При создании проверяется только новая версия. Поэтому `sales_rep` создаёт клиента только на себя и не может отдать свою сделку коллеге, а `team_lead` может переназначить сделку внутри отдела, но не отдать её в чужой отдел.
+
+**Откуда берутся `org_id`, `owner_id` и `team_id` записи.** Клиент их не выбирает свободно:
+
+- `org_id` — всегда из `Access` (организация того, кто делает запрос);
+- `owner_id` — по умолчанию текущий пользователь; руководитель и админ могут указать другого, но ответственным может быть только активный `team_lead` или `sales_rep` той же организации;
+- `team_id` — всегда отдел ответственного; его ставит сервис, из тела запроса он не берётся.
+
+Так `team_id` и `owner_id` никогда не расходятся, и проверка «новая версия в моём уровне» у `team_lead` автоматически означает «новый ответственный — из моего отдела».
+
+**Ссылки на другие записи.** Каждый id в теле запроса (`company_id`, `contact_id`, `deal_id`, `stage_id`) сервис загружает и проверяет через `Access` на чтение этой сущности; невидимая ссылка → 422 `validation` с полем в `details`. Компании видны всей организации, поэтому к любой компании привязать можно, а к чужому контакту — нельзя.
+
+**Дубль, которого не видно.** Email контакта уникален в организации (раздел 3), а видимость ограничена уровнем. Если менеджер создаёт контакт, меняет email или восстанавливает контакт из корзины, а такой email уже есть у записи вне его уровня, сервис возвращает 409 `contact.duplicate_email` и в `details` кладёт только имя ответственного: `{"owner": "Іван Петренко"}` — без id и данных контакта. Менеджер знает, к кому обратиться, а передать клиента может руководитель (так делают контроль дублей в Bitrix24 и amoCRM).
+
+**Активности и заметки видны по родителю.** Карточка (`GET /contacts/{id}/notes`, активности сделки) загружает родителя через `get_visible_or_404` и дальше по `Access` не фильтрует: кто видит сделку, видит всю её историю. Уровень `activity:read` применяется к спискам вне карточки — например, «мои задачи на сегодня» (`GET /activities?due=today`). Заметку добавляет тот, кто может менять родителя; править и удалять её может только автор.
 
 ### Как проходит запрос
 
-1. `current_user` проверяет access-токен (раздел 4).
-2. Глобальная зависимость `authorize` на защищённом роутере берёт **шаблон** пути (`request.scope["route"].path`), метод и членства пользователя (Redis-кэш, иначе БД).
-3. Один запрос `POST http://localhost:8181/v1/data/saleshub/authz/decision` в OPA-сайдкар.
-4. OPA: путь → действие (`routes.rego`) → роли пользователя → области (`data.json`) → ответ.
-5. `allow: false` → 403. Иначе в эндпоинт приходит `Grant` с областями доступа.
-6. Дальше области применяет сам Python, второго запроса к OPA нет: один объект — `grant.ensure_object(obj)`, список и bulk — `grant.sql_filter()` в `WHERE`, поиск — `grant.es_filter()`.
-7. Исключение — назначение ролей и приглашения: правило анти-эскалации есть только в Rego, поэтому сервис отдельно спрашивает `allow_assign`, передав организацию, отдел и роль из тела запроса.
+1. `current_user` проверяет access-токен и загружает пользователя вместе с `role`, `org_id`, `team_id` (кэш Redis на 60 с, раздел 4).
+2. Зависимость `authorize` на защищённом роутере берёт **шаблон** пути (`request.scope["route"].path`, например `/api/v1/deals/{deal_id}`, а не `/api/v1/deals/42`: в `routes.rego` записаны шаблоны, иначе пришлось бы перечислять каждый id), метод и роль.
+3. Один запрос `POST http://localhost:8181/v1/data/saleshub/authz/decision` в OPA-сайдкар. Путь URL повторяет пакет и правило: `saleshub/authz/decision` = `package saleshub.authz`, правило `decision`.
+4. OPA: путь → действие (`routes.rego`) → есть ли действие у роли (`data.yaml`) → `{allow, action}`.
+5. `allow: false` → 403. Иначе бэкенд по роли и действию берёт уровень из того же `data.yaml` и передаёт в эндпоинт `Access`.
+6. Сервис применяет `Access`, второго запроса к OPA нет: один объект — `get_visible_or_404(id, access)`, создание и изменение — `access.ensure_allowed(new_obj)`, список и bulk — `access.sql_filter()` в `WHERE`, поиск — `access.es_filter()`.
 
 Вход и ответ OPA для `PATCH /api/v1/deals/42` от менеджера по продажам:
 
@@ -447,185 +463,348 @@ Refresh сделан непрозрачным и хранится в БД нам
 {
   "method": "PATCH",
   "route": "/api/v1/deals/{deal_id}",
-  "user": {
-    "id": "u1",
-    "is_superadmin": false,
-    "org_memberships": [{"org_id": "o1", "role": "member"}],
-    "team_memberships": [{"org_id": "o1", "team_id": "t1", "role": "sales_rep"}]
-  }
+  "user": {"id": "u3", "is_superadmin": false, "role": "sales_rep"}
 }
 // result
-{"allow": true, "action": "deal:update", "all": false,
- "org_ids": [], "team_ids": [], "own_org_ids": ["o1"]}
+{"allow": true, "action": "deal:write"}
 ```
+
+Для решения OPA нужны только роль и флаг супер-админа: организация и отдел ему не нужны, потому что данные он не проверяет. `id` передаётся только для decision logs — чтобы в Grafana было видно, кому отказали.
 
 ### Разбор на примере: что увидит каждая роль
 
-Один и тот же запрос `GET /api/v1/deals` от разных людей организации `o1`. Эндпоинт и код одинаковые; разный только ответ OPA — и из него получается разный SQL.
+Один и тот же запрос `GET /api/v1/deals` от разных людей организации `o1`. Эндпоинт и код одинаковые; разный только уровень — и из него получается разный SQL.
 
-| Кто спрашивает | Ответ OPA | Что `sql_filter()` добавит в `WHERE` |
-| --- | --- | --- |
-| `sales_rep` u1 в отделе t1 | `own_org_ids: [o1]` | `org_id IN ('o1') AND owner_id = 'u1'` |
-| `team_lead` отдела t1 | `team_ids: [t1]` | `team_id IN ('t1')` |
-| `org_admin` или `viewer` организации o1 | `org_ids: [o1]` | `org_id IN ('o1')` |
-| `super_admin` | `all: true` | ничего |
-| `member` без отдела | `allow: false` | запрос не дойдёт до SQL — 403 |
+| Кто спрашивает | Ответ OPA | Уровень из `data.yaml` | Что `sql_filter()` добавит в `WHERE` |
+| --- | --- | --- | --- |
+| `sales_rep` u3 из отдела t1 | `allow: true` | `own` | `org_id = 'o1' AND owner_id = 'u3'` |
+| `team_lead` отдела t1 | `allow: true` | `team` | `org_id = 'o1' AND team_id = 't1'` |
+| `org_admin` или `viewer` | `allow: true` | `org` | `org_id = 'o1'` |
+| `super_admin` | `allow: false` | — | 403: в данные организаций он не ходит |
+| пользователь без роли (остался с этапа 2) | `allow: false` | — | 403 |
 
 Итоговый SQL для менеджера:
 
 ```sql
--- GET /api/v1/deals?limit=50 от sales_rep u1
+-- GET /api/v1/deals?limit=50 от sales_rep u3
 SELECT id, title, amount_usd, stage_id, owner_id
 FROM deals
 WHERE deleted_at IS NULL                        -- корзина: общий фильтр репозитория
-  AND (org_id IN ('o1') AND owner_id = 'u1')    -- Grant.sql_filter()
+  AND org_id = 'o1' AND owner_id = 'u3'         -- access.sql_filter()
 ORDER BY created_at DESC, id DESC               -- keyset-пагинация
 LIMIT 50;
 ```
 
-А `PATCH /api/v1/deals/42` от того же менеджера: сервис загружает сделку по id, и `grant.ensure_object(deal)` проверяет то же условие уже на объекте. Сделка чужая — 404, своя — изменяется.
+А `PATCH /api/v1/deals/42` от того же менеджера: репозиторий ищет сделку по id **с тем же фильтром** (`get_visible_or_404`). Сделка чужая — 404 (не раскрываем, что она существует), своя — изменяется.
 
-Если у человека несколько ролей (менеджер в отделе t1 и админ в организации o2), области складываются через `OR`: `org_id IN ('o2') OR (org_id IN ('o1') AND owner_id = 'u1')`.
+**Почему одно правило записано в трёх формах и как они не разойдутся.** `matches()` проверяет объект в памяти, `sql_filter()` — строки в Postgres, `es_filter()` — документы в Elasticsearch. Все три лежат рядом в `access.py`, и каждая — это три ветки `own / team / org`. Тест на hypothesis генерирует сотни случайных пользователей и объектов и проверяет, что все три формы отвечают одинаково. Это главная защита от ситуации «в списке не видно, а по прямой ссылке открывается».
 
-**Почему одно правило записано в трёх формах и как они не разойдутся.** `matches()` проверяет объект в памяти, `sql_filter()` — строки в Postgres, `es_filter()` — документы в Elasticsearch. Все три лежат рядом в `grant.py`. Тест на hypothesis генерирует сотни случайных пользователей и объектов и проверяет, что все три формы отвечают одинаково. Это главная защита от ситуации «в списке не видно, а по прямой ссылке открывается».
+### Где что хранится
 
-### Политики (эскиз)
+| Что | Пример | Где лежит | Кто и как меняет |
+| --- | --- | --- | --- |
+| Какое действие у эндпоинта | `PATCH /api/v1/deals/{deal_id}` → `deal:write` | `policies/saleshub/routes.rego` | разработчик, вместе с новым эндпоинтом, через PR |
+| Что может каждая роль и на каком уровне | `sales_rep`: `deal:write: own` | `policies/saleshub/data.yaml` | через PR → `opa test` в CI → деплой |
+| Логика проверки «роль → действие» | неописанный эндпоинт — 403; супер-админу — только `admin:*` | `policies/saleshub/authz.rego` | через PR, покрыто `opa test` |
+| Кто какую роль имеет | Ihor — `team_lead` в отделе «Корпоративные продажи» | Postgres: `users.org_id`, `users.team_id`, `users.role` | через API: `org_admin` (супер-админ — для первого админа) |
+| Как уровень применяется к данным | `own` → `owner_id = я` | `app/authz/access.py`: `matches`, `sql_filter`, `es_filter` | разработчик; тест проверяет, что три формы отвечают одинаково |
+
+Таблиц `roles` и `permissions` в базе нет: роли — это код (policy as code), их меняют PR-ом и проверяют тестами. В базе только факт «у этого человека такая роль в таком отделе».
+
+### Файл ролей `data.yaml`
+
+OPA загружает YAML-данные, только если файл называется ровно `data.yaml`. Где они окажутся, складывается из двух частей: путь папки относительно корня, который передан в `opa run` / `opa test` (корень — `policies/`, папка `saleshub/` → `data.saleshub`), плюс ключи внутри файла (верхний ключ `roles` → `data.saleshub.roles`). Бэкенд читает тот же файл при старте. Ниже — файл как есть; в нём ровно то, что в матрице выше.
+
+```yaml
+# policies/saleshub/data.yaml — кто что может.
+# Читают оба: OPA (есть ли у роли действие) и бэкенд (уровень видимости данных).
+# Уровень: own — только свои записи, team — записи своего отдела, org — вся организация.
+# super_admin здесь не описан: это флаг users.is_superadmin, ему разрешены только админские
+# эндпоинты /api/v1/admin/* (действия admin:*), в данные организаций он не ходит.
+roles:
+  org_admin:
+    title: Администратор организации
+    permissions:
+      org:read: org
+      org:manage: org          # настройки организации, отделы, воронки
+      member:read: org
+      member:manage: org       # пригласить, сменить роль или отдел, отключить
+      company:read: org
+      company:write: org       # создать и изменить
+      company:delete: org      # удалить в корзину и восстановить
+      contact:read: org
+      contact:write: org
+      contact:delete: org
+      deal:read: org
+      deal:write: org
+      deal:delete: org
+      activity:read: org
+      activity:write: org      # создать, изменить, удалить (активности удаляются насовсем)
+      bulk:run: org            # импорт, передача клиентов, теги, закрытие просроченных
+      bulk_job:read: org
+      bulk_job:cancel: org
+      export:run: org
+      report:read: org
+      audit:read: org
+
+  team_lead:
+    title: Руководитель отдела продаж
+    permissions:
+      org:read: org
+      member:read: team
+      company:read: org        # компании — общий справочник: видны всем, чтобы не плодить дубли
+      company:write: team
+      company:delete: team
+      contact:read: team
+      contact:write: team
+      contact:delete: team
+      deal:read: team
+      deal:write: team
+      deal:delete: team
+      activity:read: team
+      activity:write: team
+      bulk:run: team
+      bulk_job:read: team
+      bulk_job:cancel: team
+      export:run: team
+      report:read: team
+
+  sales_rep:
+    title: Менеджер по продажам
+    permissions:
+      org:read: org
+      member:read: team
+      company:read: org
+      company:write: own
+      contact:read: own
+      contact:write: own
+      deal:read: own
+      deal:write: own
+      activity:read: own
+      activity:write: own
+      report:read: own
+
+  viewer:
+    title: Наблюдатель (директор, аналитик)
+    permissions:
+      org:read: org
+      member:read: org
+      company:read: org
+      contact:read: org
+      deal:read: org
+      activity:read: org
+      bulk_job:read: own       # свои выгрузки
+      bulk_job:cancel: own
+      export:run: org
+      report:read: org
+```
+
+**Как поменять права.** Хотите, чтобы менеджер видел клиентов всего отдела, — меняете `contact:read: own` на `contact:read: team` у `sales_rep`. Хотите запретить действие — удаляете строку. Код при этом не меняется; тесты проверят, что опечаток нет, а массовые операции не стали шире прав на одну запись.
+
+### Политики
+
+Проверены `opa test` на OPA 1.4.2: 11 тестов проходят, `opa fmt` и `opa check` без замечаний; намеренная опечатка в имени действия, неверный уровень и слишком широкий `export:run` роняют тесты.
+
+**Как читать Rego.** Обращение к отсутствующему ключу в Rego даёт не ошибку, а «нет значения» (undefined). Правило, в котором встретилось такое значение, просто не срабатывает, и берётся значение `default`. Поэтому для неописанного эндпоинта: `action` нет → ни одно `allow` не сработало → `allow = false`, `decision = {allow: false}`. Строка `permissions[action]` проверяет только, что ключ есть: значение `own` / `team` / `org` в условии считается истиной.
+
+Ниже — `routes.rego` к концу этапа 9. Строки добавляются вместе с эндпоинтами: на этапе 3 в файле только первые два блока.
 
 ```rego
-# policies/saleshub/routes.rego — «файл с путями API и actions»
+# policies/saleshub/routes.rego — какой эндпоинт какое действие выполняет.
+# Новый эндпоинт без строки здесь получит 403 у всех, а pytest-тест test_routes_match_policy упадёт.
+# Строки добавляются вместе с эндпоинтами: на этапе 3 — первые два блока, остальные — на этапах 4–9.
 package saleshub.routes
 
 actions := {
-    "GET /api/v1/contacts": "contact:read",
-    "GET /api/v1/contacts/{contact_id}": "contact:read",
-    "POST /api/v1/contacts": "contact:create",
-    "PATCH /api/v1/contacts/{contact_id}": "contact:update",
-    "DELETE /api/v1/contacts/{contact_id}": "contact:delete",
-    "POST /api/v1/contacts/import": "contact:import",
-    "GET /api/v1/deals": "deal:read",
-    "PATCH /api/v1/deals/{deal_id}": "deal:update",
-    "POST /api/v1/bulk/reassign-owner": "bulk:reassign_owner",
-    "POST /api/v1/orgs/{org_id}/invites": "member:invite",
-    "PUT /api/v1/teams/{team_id}/members/{user_id}": "member:assign",
+	# --- этап 3: только супер-админ (действий admin:* нет ни у одной роли в data.yaml)
+	"GET /api/v1/admin/orgs": "admin:orgs",
+	"POST /api/v1/admin/orgs": "admin:orgs",
+	"POST /api/v1/admin/orgs/{org_id}/invites": "admin:orgs",
+	# --- этап 3: организация, отделы, люди
+	"GET /api/v1/org": "org:read",
+	"PATCH /api/v1/org": "org:manage",
+	"GET /api/v1/teams": "org:read",
+	"POST /api/v1/teams": "org:manage",
+	"PATCH /api/v1/teams/{team_id}": "org:manage",
+	"DELETE /api/v1/teams/{team_id}": "org:manage",
+	"GET /api/v1/users": "member:read",
+	"PATCH /api/v1/users/{user_id}": "member:manage",
+	"POST /api/v1/invites": "member:manage",
+	# --- этап 4: воронки, компании, контакты, сделки, активности, отчёты
+	"GET /api/v1/pipelines": "org:read",
+	"POST /api/v1/pipelines": "org:manage",
+	"PATCH /api/v1/pipelines/{pipeline_id}": "org:manage",
+	"GET /api/v1/companies": "company:read",
+	"GET /api/v1/companies/{company_id}": "company:read",
+	"POST /api/v1/companies": "company:write",
+	"PATCH /api/v1/companies/{company_id}": "company:write",
+	"DELETE /api/v1/companies/{company_id}": "company:delete",
+	"POST /api/v1/companies/{company_id}/restore": "company:delete",
+	"GET /api/v1/contacts": "contact:read",
+	"GET /api/v1/contacts/trash": "contact:delete",
+	"GET /api/v1/contacts/{contact_id}": "contact:read",
+	"POST /api/v1/contacts": "contact:write",
+	"PATCH /api/v1/contacts/{contact_id}": "contact:write",
+	"DELETE /api/v1/contacts/{contact_id}": "contact:delete",
+	"POST /api/v1/contacts/{contact_id}/restore": "contact:delete",
+	"GET /api/v1/contacts/{contact_id}/notes": "contact:read",
+	"POST /api/v1/contacts/{contact_id}/notes": "contact:write",
+	"GET /api/v1/deals": "deal:read",
+	"GET /api/v1/deals/kanban": "deal:read",
+	"GET /api/v1/deals/{deal_id}": "deal:read",
+	"POST /api/v1/deals": "deal:write",
+	"PATCH /api/v1/deals/{deal_id}": "deal:write",
+	"DELETE /api/v1/deals/{deal_id}": "deal:delete",
+	"POST /api/v1/deals/{deal_id}/restore": "deal:delete",
+	"GET /api/v1/activities": "activity:read",
+	"POST /api/v1/activities": "activity:write",
+	"PATCH /api/v1/activities/{activity_id}": "activity:write",
+	"DELETE /api/v1/activities/{activity_id}": "activity:write",
+	"GET /api/v1/reports/pipeline": "report:read",
+	"GET /api/v1/reports/managers": "report:read",
+	"GET /api/v1/audit": "audit:read",
+	# --- этап 5: массовые операции и выгрузка
+	"POST /api/v1/contacts/import": "bulk:run",
+	"POST /api/v1/bulk/reassign-owner": "bulk:run",
+	"POST /api/v1/bulk/close-stale-deals": "bulk:run",
+	"POST /api/v1/bulk/add-tags": "bulk:run",
+	"POST /api/v1/exports": "export:run",
+	"GET /api/v1/bulk-jobs/{job_id}": "bulk_job:read",
+	"GET /api/v1/bulk-jobs/{job_id}/events": "bulk_job:read",
+	"POST /api/v1/bulk-jobs/{job_id}/cancel": "bulk_job:cancel",
+	"GET /api/v1/admin/failed-tasks": "admin:system",
+	"POST /api/v1/admin/failed-tasks/{task_id}/replay": "admin:system",
+	# --- этап 9: поиск
+	"GET /api/v1/search/contacts": "contact:read",
+	"GET /api/v1/search/suggest": "contact:read",
+	"POST /api/v1/admin/search/reindex": "admin:system",
 }
 ```
 
-```json
-// policies/saleshub/data.json — матрица ролей (фрагмент)
-{
-  "roles": {
-    "org_admin": {"level": 40, "permissions": {"deal:read": "org", "deal:update": "org", "member:assign": "org"}},
-    "team_lead": {"level": 30, "permissions": {"deal:read": "team", "deal:update": "team", "member:assign": "team"}},
-    "sales_rep": {"level": 20, "permissions": {"deal:read": "own", "deal:create": "team", "deal:update": "own"}},
-    "viewer":    {"level": 10, "permissions": {"deal:read": "org", "report:read": "org"}},
-    "member":    {"level": 0,  "permissions": {}}
-  }
-}
-```
+Пути организации не содержат `org_id`: организация у пользователя одна и берётся из него самого. `org_id` в пути есть только у эндпоинтов супер-админа. Не проходят через OPA: `/api/v1/auth/*`, `/api/v1/me/*` (личные настройки и привязка Telegram — только `current_user`, работают с записями самого пользователя), `/health/*`, `/metrics`, `/.well-known/jwks.json`, `/telegram/webhook` (своя проверка секретным заголовком).
 
 ```rego
-# policies/saleshub/authz.rego
+# policies/saleshub/authz.rego — можно ли этой роли вызвать этот эндпоинт.
+# Данные (свои / отдела / организации) здесь НЕ проверяются — это делает бэкенд.
 package saleshub.authz
 
-roles := data.saleshub.roles
+# 1. Какое действие выполняет эндпоинт: "PATCH /api/v1/deals/{deal_id}" → "deal:write"
 action := data.saleshub.routes.actions[concat(" ", [input.method, input.route])]
 
-# все «выдачи» на это действие: scope + где
-grants contains {"scope": s, "org_id": m.org_id} if {
-    some m in input.user.org_memberships
-    s := roles[m.role].permissions[action]
+# 2. Разрешено ли действие. По умолчанию — нет.
+default allow := false
+
+allow if {
+	data.saleshub.roles[input.user.role].permissions[action] # у роли есть это действие
 }
 
-grants contains {"scope": s, "org_id": m.org_id, "team_id": m.team_id} if {
-    some m in input.user.team_memberships
-    s := roles[m.role].permissions[action]
+allow if {
+	input.user.is_superadmin # супер-админ работает только через /api/v1/admin/*
+	startswith(action, "admin:")
 }
 
-# главный ответ: можно ли действие и в каких областях
+# 3. Ответ бэкенду: можно ли и какое это действие (по нему бэкенд найдёт уровень в data.yaml).
 default decision := {"allow": false}
 
-decision := {"allow": true, "action": action, "all": true} if input.user.is_superadmin
-
-decision := {
-    "allow": true,
-    "action": action,
-    "all": false,
-    "org_ids": {g.org_id | some g in grants; g.scope == "org"},
-    "team_ids": {g.team_id | some g in grants; g.scope == "team"},
-    "own_org_ids": {g.org_id | some g in grants; g.scope == "own"},
-} if {
-    not input.user.is_superadmin
-    count(grants) > 0
-}
-
-# Объекты здесь НЕ проверяются: области применяет Python (Grant),
-# чтобы правило «своё / отдел / компания» жило в одном месте.
-
-# анти-эскалация: отдельный вопрос только при назначении ролей
-# input.target = {org_id, team_id}, input.payload = {role, user_id}
-default my_level := 0   # нет роли в этой организации → уровень 0, назначать нельзя
-
-my_level := max({roles[m.role].level |
-    some m in array.concat(input.user.org_memberships, input.user.team_memberships)
-    m.org_id == input.target.org_id
-})
-
-deny_reasons contains "role_above_own" if {
-    not input.user.is_superadmin
-    roles[input.payload.role].level >= my_level
-}
-
-deny_reasons contains "own_role" if {
-    input.payload.user_id == input.user.id
-}
-
-default allow_assign := false
-
-allow_assign if {
-    action in {"member:assign", "member:invite"}
-    decision.allow
-    count(deny_reasons) == 0
-}
+decision := {"allow": allow, "action": action} if action
 ```
 
 ```rego
-# policies/saleshub/authz_test.rego — `opa test policies -v`
+# policies/saleshub/authz_test.rego — запуск: opa test -b policies -v
 package saleshub.authz_test
 
 import data.saleshub.authz
 
-rep := {"id": "u1", "is_superadmin": false, "org_memberships": [],
-    "team_memberships": [{"org_id": "o1", "team_id": "t1", "role": "sales_rep"}]}
+super_admin := {"id": "u0", "is_superadmin": true, "role": null}
 
-lead := {"id": "u2", "is_superadmin": false, "org_memberships": [],
-    "team_memberships": [{"org_id": "o1", "team_id": "t1", "role": "team_lead"}]}
+org_admin := {"id": "u1", "is_superadmin": false, "role": "org_admin"}
 
-assign := {"method": "PUT", "route": "/api/v1/teams/{team_id}/members/{user_id}",
-    "target": {"org_id": "o1", "team_id": "t1"}}
+team_lead := {"id": "u2", "is_superadmin": false, "role": "team_lead"}
 
-test_rep_cannot_delete_contact if {
-    not authz.decision.allow with input as {"method": "DELETE",
-        "route": "/api/v1/contacts/{contact_id}", "user": rep}
+sales_rep := {"id": "u3", "is_superadmin": false, "role": "sales_rep"}
+
+viewer := {"id": "u4", "is_superadmin": false, "role": "viewer"}
+
+req(user, method, route) := {"user": user, "method": method, "route": route}
+
+test_sales_rep_can_edit_deal if {
+	d := authz.decision with input as req(sales_rep, "PATCH", "/api/v1/deals/{deal_id}")
+	d.allow
+	d.action == "deal:write"
 }
 
-test_rep_gets_only_own_scope if {
-    d := authz.decision with input as {"method": "PATCH",
-        "route": "/api/v1/deals/{deal_id}", "user": rep}
-    d.allow
-    d.own_org_ids == {"o1"}
-    count(d.team_ids) == 0
+test_sales_rep_cannot_delete_contact if {
+	not authz.allow with input as req(sales_rep, "DELETE", "/api/v1/contacts/{contact_id}")
 }
 
-test_lead_can_assign_rep if {
-    authz.allow_assign with input as object.union(assign,
-        {"user": lead, "payload": {"role": "sales_rep", "user_id": "u5"}})
+test_viewer_reads_but_cannot_write if {
+	authz.allow with input as req(viewer, "GET", "/api/v1/deals")
+	not authz.allow with input as req(viewer, "PATCH", "/api/v1/deals/{deal_id}")
 }
 
-test_lead_cannot_assign_lead if {
-    not authz.allow_assign with input as object.union(assign,
-        {"user": lead, "payload": {"role": "team_lead", "user_id": "u5"}})
+test_only_org_admin_manages_members if {
+	authz.allow with input as req(org_admin, "POST", "/api/v1/invites")
+	not authz.allow with input as req(team_lead, "POST", "/api/v1/invites")
+	not authz.allow with input as req(sales_rep, "POST", "/api/v1/invites")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/invites")
+}
+
+test_only_super_admin_creates_orgs if {
+	authz.allow with input as req(super_admin, "POST", "/api/v1/admin/orgs")
+	not authz.allow with input as req(org_admin, "POST", "/api/v1/admin/orgs")
+}
+
+# У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
+test_super_admin_only_admin_routes if {
+	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/failed-tasks")
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/deals")
+	not authz.allow with input as req(super_admin, "POST", "/api/v1/invites")
+}
+
+test_unknown_route_denied_even_for_super_admin if {
+	d := authz.decision with input as req(super_admin, "GET", "/api/v1/secret")
+	not d.allow
+}
+
+test_user_without_role_denied if {
+	not authz.allow with input as req({"id": "u9", "is_superadmin": false, "role": null}, "GET", "/api/v1/org")
+}
+
+# Каждое действие из routes.rego должно быть хотя бы у одной роли в data.yaml,
+# либо быть админским (admin:*). Ловит опечатку в имени действия.
+test_every_action_is_known if {
+	known := {a | some r in data.saleshub.roles; some a, _ in r.permissions}
+	unknown := {a | some a in data.saleshub.routes.actions; not a in known; not startswith(a, "admin:")}
+	count(unknown) == 0
+}
+
+# Значения в data.yaml — только own / team / org.
+test_scopes_are_valid if {
+	bad := {[name, a, s] |
+		some name, r in data.saleshub.roles
+		some a, s in r.permissions
+		not s in {"own", "team", "org"}
+	}
+	count(bad) == 0
+}
+
+rank := {"own": 1, "team": 2, "org": 3}
+
+# Массовые операции и выгрузка не шире, чем права на одну запись:
+# иначе через bulk можно было бы обойти ограничения роли.
+test_bulk_and_export_not_wider_than_single_record if {
+	pairs := {"bulk:run": "contact:write", "export:run": "contact:read"}
+	bad := {[name, a] |
+		some name, r in data.saleshub.roles
+		some a, base in pairs
+		r.permissions[a]
+		not rank[r.permissions[a]] <= rank[r.permissions[base]]
+	}
+	count(bad) == 0
 }
 ```
+
+Полную матрицу «каждая роль × каждый эндпоинт» в Rego руками не пишем: pytest берёт список маршрутов у живого OPA (`GET /v1/data/saleshub/routes/actions`), роли и уровни — из `data.yaml`, и прогоняет запросы (раздел 10).
 
 ### Сторона FastAPI
 
@@ -637,89 +816,121 @@ class OpaClient:
         r.raise_for_status()
         return r.json().get("result")
 
+# authz/roles.py — тот же data.yaml, что читает OPA (папка смонтирована и в api, и в opa)
+ROLES: dict = yaml.safe_load(Path(settings.policies_dir, "saleshub/data.yaml").read_text())["roles"]
+
+def scope_for(user: CurrentUser, action: str) -> Scope:
+    level = ROLES.get(user.role, {}).get("permissions", {}).get(action)
+    if level is None:            # OPA разрешил, а у бэкенда в data.yaml такого действия нет — файлы разошлись
+        raise ServiceUnavailable("authz.policy_out_of_sync")
+    return level
+
 # authz/deps.py
-async def authorize(request: Request,
-                    user: CurrentUser = Depends(current_user),
-                    ctx: AuthContext = Depends(get_auth_context),   # членства из кэша
-                    opa: OpaClient = Depends(get_opa)) -> Grant:
+async def opa_decision(request: Request,
+                       user: CurrentUser = Depends(current_user),
+                       opa: OpaClient = Depends(get_opa)) -> dict:
     inp = {"method": request.method,
-           "route": request.scope["route"].path,     # /api/v1/deals/{deal_id}
-           "user": ctx.to_opa()}
+           "route": request.scope["route"].path,      # шаблон: /api/v1/deals/{deal_id}
+           "user": {"id": str(user.id), "role": user.role, "is_superadmin": user.is_superadmin}}
     try:
         d = await opa.query("saleshub/authz/decision", inp)
     except httpx.HTTPError:
-        raise ServiceUnavailable("authz")           # OPA недоступен → никого не пускаем
+        raise ServiceUnavailable("authz")             # OPA недоступен → никого не пускаем
     if not d or not d["allow"]:
         raise Forbidden(action=(d or {}).get("action"))
-    return Grant.from_decision(d, inp, opa)
+    return d
 
-protected = APIRouter(dependencies=[Depends(authorize)])   # всё, кроме /auth и /health
+async def authorize(user: CurrentUser = Depends(current_user),
+                    d: dict = Depends(opa_decision)) -> Access:
+    return Access.for_user(user, d["action"])       # уровень — из data.yaml
+
+# префикс задаём у роутера, а не в include_router: тогда шаблон пути в scope["route"].path
+# всегда полный, как ключи в routes.rego
+protected = APIRouter(prefix="/api/v1", dependencies=[Depends(authorize)])          # данные организации
+admin = APIRouter(prefix="/api/v1/admin", dependencies=[Depends(opa_decision)])     # супер-админ, без Access
 ```
+
+`authorize` стоит и на роутере, и в параметрах эндпоинта (`access: Access = Depends(authorize)`), но FastAPI кэширует зависимость в пределах запроса — OPA спрашивается один раз.
 
 ```python
-# authz/grant.py — одно правило «своё / отдел / компания» в трёх формах
+# authz/access.py — одно правило «своё / отдел / организация» в трёх формах
+Scope = Literal["own", "team", "org"]
+
 @dataclass(frozen=True)
-class Grant:
+class Access:
     action: str
+    scope: Scope
     user_id: UUID
-    is_all: bool
-    org_ids: frozenset[UUID]
-    team_ids: frozenset[UUID]
-    own_org_ids: frozenset[UUID]
+    org_id: UUID
+    team_id: UUID | None         # у org_admin и viewer отдела нет — уровень team им и не выдаётся
 
-    def matches(self, obj) -> bool:                      # 1) объект в памяти
-        if self.is_all:
-            return True
-        return (obj.org_id in self.org_ids
-                or obj.team_id in self.team_ids
-                or (obj.org_id in self.own_org_ids and obj.owner_id == self.user_id))
+    @classmethod
+    def for_user(cls, user: CurrentUser, action: str) -> "Access":
+        return cls(action, scope_for(user, action), user.id, user.org_id, user.team_id)
 
-    def ensure_object(self, obj) -> None:
-        if not self.matches(obj):
-            raise NotFound()          # 404, а не 403: не раскрываем, что объект существует
+    def matches(self, obj) -> bool:                       # 1) объект в памяти
+        match self.scope:
+            case "org":
+                return obj.org_id == self.org_id
+            case "team":
+                return obj.org_id == self.org_id and obj.team_id == self.team_id
+            case "own":
+                return obj.org_id == self.org_id and obj.owner_id == self.user_id
+        raise ValueError(f"неизвестный уровень: {self.scope}")
 
-    def sql_filter(self, m):                             # 2) список и bulk → WHERE
-        if self.is_all:
-            return true()
-        conds = []
-        if self.org_ids:
-            conds.append(m.org_id.in_(self.org_ids))
-        if self.team_ids:
-            conds.append(m.team_id.in_(self.team_ids))
-        if self.own_org_ids:
-            conds.append(and_(m.org_id.in_(self.own_org_ids), m.owner_id == self.user_id))
-        return or_(*conds) if conds else false()
+    def sql_filter(self, m) -> ColumnElement[bool]:       # 2) список и bulk → WHERE
+        match self.scope:
+            case "org":
+                return m.org_id == self.org_id
+            case "team":
+                return and_(m.org_id == self.org_id, m.team_id == self.team_id)
+            case "own":
+                return and_(m.org_id == self.org_id, m.owner_id == self.user_id)
+        raise ValueError(f"неизвестный уровень: {self.scope}")
 
-    def es_filter(self) -> dict: ...                     # 3) поиск → фильтр Elasticsearch (раздел 17)
+    def es_filter(self) -> dict: ...                      # 3) поиск → фильтр Elasticsearch (раздел 17)
+
+    def ensure_allowed(self, new_obj) -> None:            # создать или изменить за пределами своего уровня → 403
+        if not self.matches(new_obj):
+            raise Forbidden(reason="out_of_scope")
 ```
 
-**Почему списки фильтрует SQL, а не OPA.** Спросить OPA про каждый из 5 млн контактов невозможно. OPA отдаёт области доступа, бэкенд превращает их в `WHERE`, а индексы `(org_id, owner_id)`, `(team_id, …)` делают запрос быстрым. Тот же фильтр обязательно применяется в bulk-операциях: job сохраняет его в `bulk_jobs.params`, воркер добавляет к каждому чанку — иначе руководитель отдела мог бы массово переназначить чужих клиентов. Продвинутый вариант — partial evaluation в OPA (`/v1/compile`), которая сама возвращает условия для SQL; это эксперимент этапа 10.
+**Где применять `Access`.** Репозиторий не отдаёт данные без `Access`: и список `uow.deals.list(access, filters, page)`, и один объект `uow.deals.get_visible_or_404(deal_id, access)` сами добавляют `access.sql_filter(Deal)` — так же, как общий фильтр `deleted_at IS NULL` (для корзины — `get_deleted_or_404`). Забыть проверку нельзя: без `Access` метод не вызвать. Вручную в сервисе остаётся только `ensure_allowed` для новой версии объекта. `Access` работает с таблицами, где есть `org_id`, `team_id`, `owner_id`; для `users` уровень `team` = «мой отдел», заметки проверяются через родителя.
 
-### Кто выдаёт роли
+### Кто управляет пользователями и ролями
 
-1. Супер-админ создаётся командой при деплое (раздел 4). Только он создаёт организации и приглашает в них первого `org_admin`. Самостоятельной регистрации нет: пользователь появляется в системе только через приглашение.
-2. `org_admin` создаёт отделы, приглашает людей (`member:invite`), назначает роли в организации и отделах.
-3. `team_lead` назначает `sales_rep` в своём отделе (`member:assign` со scope `team`).
-4. Анти-эскалация — в Rego (`deny_reasons`): нельзя выдать роль не ниже своей и нельзя менять роль себе. Причина отказа возвращается в теле 403.
-5. Изменение членства → сброс кэша членств пользователя в Redis + запись в `audit_log`. Токен перевыпускать не нужно: роли не лежат в JWT.
-6. Изменить матрицу (что может `sales_rep`) — PR в `data.json` + `opa test` в CI + деплой.
+1. Супер-админ создаётся командой при деплое (раздел 4). Только он создаёт организации (`POST /api/v1/admin/orgs`) и приглашает в них первого `org_admin` (`POST /api/v1/admin/orgs/{org_id}/invites`). Самостоятельной регистрации нет.
+2. `org_admin` приглашает людей в свою организацию: `POST /api/v1/invites {email, role, team_id}`. Пользователь появляется в базе, когда принимает приглашение.
+3. `org_admin` меняет роль, отдел или отключает пользователя: `PATCH /api/v1/users/{user_id} {role, team_id, is_active}`. Остальные роли пользователями не управляют.
+4. Правила проверяет сервис пользователей (это бизнес-логика, а не вопрос «можно ли вызвать эндпоинт»):
+   - нельзя менять роль, отдел или статус **самому себе**;
+   - в организации всегда остаётся хотя бы один активный `org_admin`: сервис в той же транзакции блокирует строку организации (`SELECT … FROM organizations WHERE id = :org FOR UPDATE`) и считает админов, иначе 409 `member.last_admin` — так два админа не смогут одновременно снять друг друга;
+   - у `team_lead` и `sales_rep` отдел обязателен, у `org_admin` и `viewer` его нет; отдел — из той же организации;
+   - `super_admin` нельзя назначить через API;
+   - приглашение на email, который уже есть в базе, не создаётся, но ответ тот же 202, а человеку уходит письмо «вы уже состоите в другой организации» — админ чужой организации не узнаёт, что email занят (как в `password/forgot`). При `invite/accept` сервис ещё раз проверяет, что email свободен и отдел существует (иначе 409 `invite.stale`).
+   Причина отказа возвращается в теле ответа (`code` = `member.cannot_change_self`, `member.team_required` и т. д.).
+5. Перевод менеджера в другой отдел запускает bulk job `move_team`: `team_id` всех его записей переносится теми же чанками, что и при передаче клиентов (раздел 6), — клиенты переходят в новый отдел вместе с ним.
+6. Любое изменение `role`, `team_id`, `is_active` → **после** `commit` удалить пользователя из кэша Redis + запись в `audit_log`. Токен перевыпускать не нужно: роли нет в JWT, новая роль действует со следующего запроса (60 с — лишь страховка, если удаление ключа не прошло). Отключение пользователя дополнительно делает `token_version += 1` и отзывает все его refresh-токены — доступ пропадает сразу.
+7. Изменить права роли (что может `sales_rep`) — PR в `data.yaml` + `opa test` в CI + деплой.
 
 ### Как OPA развёрнут
 
-- **Сайдкар** в поде `api`: `opa run --server --addr=127.0.0.1:8181 /policies`. Запрос по localhost — около миллисекунды.
-- Политики попадают в под через ConfigMap (Helm собирает `policies/**`). Позже (этап CD) — бандлом: CI делает `opa build` и публикует bundle в GHCR как OCI-артефакт, OPA сам его подтягивает.
-- В compose — сервис `opa` с примонтированной папкой и `--watch`: правка `.rego` применяется без перезапуска. В Tilt — то же через `sync`.
+- **Сайдкар** в поде `api`: `opa run --server --addr=127.0.0.1:8181 --watch --ignore='..*' /policies`. Запрос по localhost — около миллисекунды.
+- **Kubernetes.** Политики попадают в под через ConfigMap: Helm собирает `routes.rego`, `authz.rego` и `data.yaml` (без `*_test.rego`). ConfigMap не хранит подпапки, поэтому он монтируется в `mountPath: /policies/saleshub` — тогда `data.yaml` оказывается в `data.saleshub.roles`. `--ignore='..*'` нужен из-за служебных папок `..data` и `..<время>`, которые Kubernetes кладёт в каждый ConfigMap: без него OPA видит файлы трижды и не стартует, а с `--bundle` кладёт данные не туда, и все получают 403 (проверено на OPA 1.4.2). Тот же ConfigMap монтируется и в контейнер `api` (`POLICIES_DIR=/policies`), поэтому OPA и бэкенд читают один файл. В шаблоне пода — аннотация `checksum/policies`: при правке политик Helm перезапускает под, и обе стороны перечитывают правила. Позже (этап CD) — бандлом: CI делает `opa build` и публикует bundle в GHCR как OCI-артефакт.
+- **Compose.** Папка `./policies` монтируется и в `opa` (та же команда), и в `api`; uvicorn запускается с `--reload --reload-dir /policies --reload-include 'data.yaml'`, иначе он следит только за `.py`. Правка `.rego` и `data.yaml` применяется сразу в обоих. В Tilt — то же через `sync`.
+- **Проверка после деплоя:** `curl localhost:8181/v1/data/saleshub/roles` не должен быть пустым.
 - **Fail closed:** OPA недоступен → 503, алерт `OpaUnavailable` (раздел 8).
 - **Decision logs:** OPA пишет каждое решение (вход + результат) в stdout → Loki → Grafana: видно, кому и почему отказали.
 
 ### Права в Swagger и тест покрытия
 
-- При старте приложение читает `data.saleshub.routes.actions` из OPA и дописывает в описание каждой операции «Требуется: `deal:update`».
-- `test_routes_match_policy`: множество маршрутов защищённого роутера должно совпадать с ключами `actions` в `routes.rego`. Новый эндпоинт без правила или устаревшее правило без эндпоинта — CI падает.
+- При старте приложение читает `data.saleshub.routes.actions` из OPA и дописывает в описание каждой операции «Требуется: `deal:write`», а также роли и уровни из `data.yaml`: «org\_admin — org, team\_lead — team, sales\_rep — own».
+- `GET /api/v1/auth/me` возвращает роль и `permissions` — действия роли из `data.yaml` с уровнями; фронт по ним прячет кнопки. У супер-админа — `is_superadmin: true` и пустой `permissions`.
+- `test_routes_match_policy` (pytest): множество маршрутов роутеров `protected` и `admin` должно совпадать с ключами `actions` в `routes.rego`. Новый эндпоинт без правила или устаревшее правило без эндпоинта — CI падает. Второй тест перехватывает `input`, который `opa_decision` реально отправляет в OPA, и проверяет, что `METHOD route` есть среди ключей, — так ловится ошибка с префиксом пути.
 
 ### Нужен ли Auth0
 
-Нет. Auth0 — провайдер входа (пароли, MFA, SSO, соцсети); всё это делает свой модуль из раздела 4. Row-level доступ (own / team / org) Auth0 не решает в любом случае — это задача OPA и бэкенда. Попробовать Auth0 можно на этапе 10: проверка токена уже идёт через JWKS, меняются только `ISSUER`, `AUDIENCE` и `JWKS_URL`.
+Нет. Auth0 — провайдер входа (пароли, MFA, SSO, соцсети); всё это делает свой модуль из раздела 4. Row-level доступ (own / team / org) Auth0 не решает в любом случае — это задача бэкенда. Попробовать Auth0 можно на этапе 10: проверка токена уже идёт через JWKS, меняются только `ISSUER`, `AUDIENCE` и `JWKS_URL`.
 
 ## 6. Большие объёмы данных и фоновая обработка
 
@@ -731,7 +942,7 @@ class Grant:
 
 | Сценарий | Объём | Техника |
 | --- | --- | --- |
-| Импорт контактов из CSV с дедупликацией по email | 500 тыс. строк | файл в MinIO → `COPY` в `contacts_staging` → валидация SQL-ом → `INSERT … ON CONFLICT (org_id, email) WHERE deleted_at IS NULL DO UPDATE`; битые строки → `import_errors` |
+| Импорт контактов из CSV с дедупликацией по email | 500 тыс. строк | файл в MinIO → `COPY` в `contacts_staging` → валидация SQL-ом → `INSERT … ON CONFLICT (org_id, email) WHERE deleted_at IS NULL DO UPDATE SET … WHERE <фильтр Access из params>`: существующий контакт обновляется, только если он в уровне того, кто запустил импорт, остальные дубли → `import_errors` (`duplicate_outside_scope`). Новые строки: ответственный — из колонки `owner_email` (в уровне запустившего), иначе сам запустивший; `team_id` — отдел ответственного; битые строки → `import_errors` |
 | Менеджер уволился: передать всех его клиентов | до 100 тыс. контактов + сделки + открытые активности | чанки `UPDATE … SET owner_id = :new WHERE owner_id = :old AND id BETWEEN …` по трём таблицам |
 | Закрыть просроченные сделки как `lost` | десятки тысяч | частичный индекс `(org_id, expected_close_date) WHERE status = 'open'` + чанки |
 | Добавить тег сегменту | до 1 млн контактов | `UPDATE … SET tags = array_append(tags, :t) WHERE NOT tags @> ARRAY[:t]` — идемпотентно |
@@ -754,9 +965,9 @@ class Grant:
 ### Поток: «передать клиентов уволенного менеджера»
 
 1. `POST /api/v1/bulk/reassign-owner {from_user_id, to_user_id, include: [contacts, deals, open_activities]}` + заголовок `Idempotency-Key`.
-2. API: `authorize()` → OPA: `bulk:reassign_owner` → проверка, что новый ответственный состоит в том же отделе → фильтр `owner_id = :from` AND `grant.sql_filter()` → `count`, `min(id)`, `max(id)` по каждой таблице → `bulk_jobs(status=pending, total=…)` → `uow.commit()` → задача `bulk.plan` → `202 {job_id}`.
+2. API: `authorize()` → OPA: `bulk:run` → проверка, что новый ответственный — активный `team_lead` или `sales_rep` в уровне запустившего (для `team_lead` — из его отдела, для `org_admin` — любой в организации) → фильтр `owner_id = :from` AND `access.sql_filter()` → `count`, `min(id)`, `max(id)` по каждой таблице → `bulk_jobs(status=pending, total=…, params={…, access})` → `uow.commit()` → задача `bulk.plan` → `202 {job_id}`.
 3. `bulk.plan`: режет диапазоны id по 10 000 и запускает группу задач `bulk.chunk` с финальной `bulk.finalize`.
-4. `bulk.chunk(job_id, table, lo, hi)`: одна транзакция: `UPDATE … SET owner_id = :to, version = version + 1 WHERE id BETWEEN lo AND hi AND owner_id = :from AND <scope>`; `processed += rowcount`; событие в outbox.
+4. `bulk.chunk(job_id, table, lo, hi)`: одна транзакция: `UPDATE … SET owner_id = :to, team_id = :to_team, version = version + 1 WHERE id BETWEEN lo AND hi AND owner_id = :from AND <фильтр Access из params>`; воркер восстанавливает `Access` из `bulk_jobs.params`, иначе руководитель отдела мог бы массово переназначить чужих клиентов; перед работой чанк проверяет, что автор job всё ещё активен и его роль и отдел не менялись (иначе job → `failed`, `bulk.author_changed`); `processed += rowcount`; событие в outbox.
 5. `bulk.finalize`: статус `done` или `partial_failed`, событие `bulk_job.completed` → письмо новому ответственному «вам передано N клиентов».
 6. `GET /api/v1/bulk-jobs/{id}` отдаёт прогресс.
 
@@ -960,11 +1171,11 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 
 | Уровень | Что тестируем | Инструменты | Скорость |
 | --- | --- | --- | --- |
-| unit | `Grant.ensure_object`, `sql_filter` (компиляция SQL), сервисы с `FakeUnitOfWork`, анти-эскалация, нарезка чанков, маппинг ошибок | pytest, pytest-asyncio, polyfactory | секунды |
+| unit | `Access.matches` / `ensure_allowed`, `sql_filter` (компиляция SQL), сервисы с `FakeUnitOfWork`, правила управления пользователями (нельзя менять себе роль, отдел обязателен), нарезка чанков, маппинг ошибок | pytest, pytest-asyncio, polyfactory | секунды |
 | integration | репозитории на настоящем Postgres, API через `httpx.AsyncClient(transport=ASGITransport(app))`, миграции, Celery-задачи в eager-режиме и с реальным воркером | testcontainers (postgres, redis), factory-boy | десятки секунд |
 | e2e (smoke) | логин → создать контакт → передать клиентов (bulk) → дождаться job | pytest против `tilt`/kind-стенда | минуты, в CD |
 | нагрузка (опц.) | список контактов и bulk на 5 млн | locust / k6 | вручную |
-| policy (Rego) | каждая роль × действие × свой/чужой объект, анти-эскалация | opa test --coverage, Regal (линтер) | миллисекунды |
+| policy (Rego) | роль × эндпоинт (allow / 403), опечатки в действиях и уровнях `data.yaml` | opa test --coverage, Regal (линтер) | миллисекунды |
 | auth flow | приглашение → письмо → accept → login → refresh → повтор старого refresh (отзыв семьи) → reset | integration + Mailpit API (чтение писем из теста), freezegun для сроков | секунды |
 
 ### Изоляция БД в integration-тестах
@@ -977,7 +1188,7 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 ### Матрица прав (генерируется)
 
 ```python
-CASES = build_matrix(app.routes, ROLE_MATRIX)  # из routes.rego + data.json, против живого OPA
+CASES = build_matrix(app.routes)   # маршруты — из OPA (data.saleshub.routes.actions), уровни — из data.yaml
 
 @pytest.mark.parametrize("role,route,target,expected", CASES)
 async def test_access(role, route, target, expected, client_as):
@@ -985,6 +1196,8 @@ async def test_access(role, route, target, expected, client_as):
     resp = await client_as(role).request(route.method, route.url_for(target))
     assert resp.status_code == expected   # 2xx / 403 / 404
 ```
+
+Ожидаемый ответ считается из `data.yaml`: действия нет у роли → 403; чтение или изменение одного объекта: объект в уровне роли → 2xx, вне уровня → 404; создание или изменение, после которого объект выходит из уровня (чужой ответственный или отдел) → 403 `out_of_scope`; список → 200, но без строк вне уровня. Супер-админ на обычных эндпоинтах → 403.
 
 Плюс `test_routes_match_policy` и тест «список не возвращает чужого»: создать контакты в двух организациях, проверить, что `GET /contacts` от sales\_rep org A не содержит ничего из org B, а bulk-update не трогает чужие строки.
 
@@ -1025,7 +1238,7 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 | Сайдкар opa в поде api | решения о доступе по localhost:8181; политики из ConfigMap (позже — OCI-бандл) |
 | Deployment mailpit (только dev) | ловит письма приглашений и сброса пароля; mail.saleshub.localhost |
 | Deployment outbox-relay | публикация событий outbox в Celery, позже в Kafka (раздел 15) |
-| Deployment telegram-bot | 1 реплика, со своим OPA-сайдкаром (раздел 16) |
+| Deployment telegram-bot | 1 реплика; OPA не нужен — бот показывает только данные самого пользователя (раздел 16) |
 
 Полезно один раз пройти руками: `kubectl get pods -w` во время выкатки, `kubectl logs -f`, `kubectl describe pod` для упавшего пода, `kubectl port-forward`, `helm upgrade --atomic` и откат `helm rollback`.
 
@@ -1067,7 +1280,7 @@ k8s_resource('api', port_forwards=8000, resource_deps=['migrate'], labels=['back
 k8s_resource('worker-bulk', resource_deps=['api'], labels=['workers'])
 k8s_resource('flower', port_forwards=5555, labels=['workers'])
 k8s_resource('mailpit', port_forwards=8025, labels=['infra'])
-watch_file('./policies')                     # правка .rego → ConfigMap обновится
+watch_file('./policies')                     # правка .rego/data.yaml → новый ConfigMap → под api перезапустится (checksum)
 local_resource('opa-test', 'opa test policies -v', deps=['./policies'], labels=['tests'])
 
 local_resource('unit-tests', 'cd backend && uv run pytest tests/unit -q',
@@ -1100,7 +1313,7 @@ local_resource('seed-5m', 'kubectl exec deploy/postgres -- psql -f /seed/seed_bi
 | --- | --- | --- | --- |
 | API | Swagger UI, ReDoc | `api.saleshub.localhost/docs` · 8000 | все эндпоинты, Authorize, требуемые права |
 | PostgreSQL | pgAdmin 4 | `db.saleshub.localhost` · 5050 | таблицы, `EXPLAIN ANALYZE` с графическим планом, блокировки, pg\_stat\_statements |
-| Redis | RedisInsight | `redis.saleshub.localhost` · 5540 | ключи кэша (права, членства, rate limit), очереди Celery, память |
+| Redis | RedisInsight | `redis.saleshub.localhost` · 5540 | ключи кэша (пользователи с ролями, rate limit), очереди Celery, память |
 | Celery | Flower | `flower.saleshub.localhost` · 5555 | воркеры, задачи, ретраи, длина очередей |
 | Kafka (Redpanda) | Redpanda Console | `kafka.saleshub.localhost` · 8080 | топики, сообщения, consumer groups и их lag |
 | Prometheus | встроенный UI Prometheus | `prometheus.saleshub.localhost` · 9090 | метрики, PromQL, targets, активные правила |
@@ -1222,13 +1435,13 @@ deploy/
 | --- | --- |
 | Логин + переключатель «войти как» (dev) | разные роли за один клик |
 | Канбан воронки: сделки по этапам, drag-and-drop | смена этапа, событие `DealStageChanged`, права `own` / `team` |
-| Список контактов (TanStack Table, keyset-подгрузка, виртуальный скролл, поиск) | scope-фильтр, trigram-поиск на 5 млн строк |
+| Список контактов (TanStack Table, keyset-подгрузка, виртуальный скролл, поиск) | фильтр видимости `Access`, trigram-поиск на 5 млн строк |
 | Карточка контакта: сделки, активности, заметки | связи, оптимистическая блокировка (`version`) |
 | Импорт CSV: загрузка → прогресс → отчёт об ошибках | job, `import_errors`, дедупликация |
 | Массовые действия: выбрать сегмент → передать другому менеджеру / добавить тег | bulk job, предпросмотр количества, прогресс по SSE |
 | Корзина | мягкое удаление и восстановление |
 | Отчёты: воронка, сумма сделок по менеджерам | materialized view, права `report:read` |
-| Команда: отделы, участники, приглашения | назначение ролей, анти-эскалация (403 с причиной видна в UI) |
+| Команда: отделы, участники, приглашения | назначение ролей и отделов, правила вроде «нельзя менять роль себе» (причина отказа видна в UI) |
 
 Кнопки прячутся по `GET /auth/me → permissions`, но это только UX: решение всегда принимает бэкенд. В Kubernetes фронт — отдельный Deployment с nginx и статикой, в Tilt — `vite dev` как `local_resource` с проксированием `/api`.
 
@@ -1290,28 +1503,28 @@ deploy/
 
 ### Этап 3 — Организации и права на OPA (раздел 5)
 
-- [ ] 3.1 Модели `organizations` (валюта, часовой пояс), `teams`, `org_memberships`, `team_memberships` + миграция.
-- [ ] 3.2 OPA в compose; `routes.rego`, `data.json`, `authz.rego`; первые `opa test`.
-- [ ] 3.3 `OpaClient`, `AuthContext` (членства + кэш в Redis), `authorize()`, `Grant`.
+- [ ] 3.1 Модели `organizations` (валюта, часовой пояс), `teams`; в `users` — `org_id`, `team_id`, `role` с CHECK-ограничениями + миграция.
+- [ ] 3.2 OPA в compose; `routes.rego` — только маршруты этапа 3 (`/admin/orgs…`, `/org`, `/teams…`, `/users…`, `/invites`), `data.yaml`, `authz.rego`; первые `opa test`.
+- [ ] 3.3 `OpaClient`, `authorize()`, чтение `data.yaml`, `Access`.
 - [ ] 3.4 Защищённый роутер и тест `test_routes_match_policy`.
 - [ ] 3.5 Эндпоинты организаций (супер-админ) и отделов (org admin).
-- [ ] 3.6 Приглашения в организацию с ролью и отделом, проверка allow\_assign: создание, письмо, `invite/accept`.
-- [ ] 3.7 Назначение ролей, анти-эскалация в Rego, причина отказа в 403.
-- [ ] 3.8 `audit_log` (пока без партиций) и сброс кэша членств при изменениях.
+- [ ] 3.6 Приглашения: `POST /api/v1/admin/orgs/{org_id}/invites` (первый админ) и `POST /api/v1/invites` (с ролью и отделом), письмо, `invite/accept`; удалить `POST /api/v1/admin/invites` и тестовых пользователей этапа 2 без организации.
+- [ ] 3.7 Смена роли и отдела, отключение пользователя; правила в сервисе (нельзя себе, отдел обязателен), причина отказа в ответе.
+- [ ] 3.8 `audit_log` (пока без партиций) и сброс кэша пользователя при смене роли.
 - [ ] 3.9 «Требуется: …» в описании операций Swagger.
 - [ ] 3.10 Тест-матрица «роль × эндпоинт × свой/чужой» + `opa test --coverage` в CI.
 
-**Готово, когда:** супер-админ создаёт организацию → приглашает org admin → тот создаёт отдел и приглашает менеджера; каждый видит и меняет только то, что разрешено матрицей.
+**Готово, когда:** супер-админ создаёт организацию → приглашает org admin → тот создаёт отдел и приглашает менеджера; каждый видит и меняет только то, что разрешено матрицей: организация, отделы, пользователи (CRM-данные — на этапе 4).
 
 ### Этап 4 — CRM-домен и объём (раздел 3)
 
 - [ ] 4.1 `companies` и `contacts` с мягким удалением и `version`; общий фильтр `deleted_at IS NULL` в репозитории.
-- [ ] 4.2 CRUD компаний и контактов с `Grant.sql_filter` / `ensure_object`, keyset-пагинация.
-- [ ] 4.3 Воронки, этапы, `deals`, эндпоинт канбана.
+- [ ] 4.2 CRUD компаний и контактов с `Access` (`list`, `get_visible_or_404`, `ensure_allowed`), keyset-пагинация, ошибка `contact.duplicate_email` + строки в `routes.rego` и тест-матрица.
+- [ ] 4.3 Воронки, этапы, `deals`, эндпоинт канбана + строки в `routes.rego`.
 - [ ] 4.4 `fx_rates`, `FxService` (НБУ, кэш, резерв), суммы сделок в USD, параметр `?currency=`.
 - [ ] 4.5 `activities` с партициями по месяцам и `notes`.
-- [ ] 4.6 Корзина: удаление, восстановление, список удалённых.
-- [ ] 4.7 Отчёты: materialized view и эндпоинт.
+- [ ] 4.6 Корзина: удаление, восстановление, список удалённых + строки в `routes.rego`.
+- [ ] 4.7 Отчёты: materialized view и эндпоинт + строки в `routes.rego`.
 - [ ] 4.8 `seed_big.sql` (5 млн контактов, 1 млн сделок, 20 млн активностей), `make seed-big`.
 - [ ] 4.9 Индексы из раздела 3: замеры «без / с» → `docs/experiments.md`.
 - [ ] 4.10 Тесты: «список не возвращает чужого», конвертер валют, корзина.
@@ -1323,10 +1536,10 @@ deploy/
 - [ ] 5.1 `celery_app`, очереди, event loop на процесс, `BaseTask`, передача `request_id`; воркер, beat и Flower в compose.
 - [ ] 5.2 Письма через очередь `notifications` + `sent_notifications` (без дублей).
 - [ ] 5.3 `outbox_events` и процесс relay (`LISTEN/NOTIFY` + опрос).
-- [ ] 5.4 `bulk_jobs`, `plan` / `chunk` / `finalize`, эндпоинт передачи клиентов, прогресс по SSE.
-- [ ] 5.5 Отмена job, `reap_stuck`, `failed_tasks` и перезапуск.
+- [ ] 5.4 `bulk_jobs`, `plan` / `chunk` / `finalize`, эндпоинт передачи клиентов, `move_team` при смене отдела, прогресс по SSE + строки в `routes.rego`.
+- [ ] 5.5 Отмена job, `reap_stuck`, `failed_tasks` и перезапуск + строки в `routes.rego`.
 - [ ] 5.6 Импорт CSV: загрузка в MinIO → `COPY` → merge → `import_errors`.
-- [ ] 5.7 Закрытие просроченных сделок, теги, потоковый экспорт в CSV.
+- [ ] 5.7 Закрытие просроченных сделок, теги, потоковый экспорт в CSV + строки в `routes.rego`.
 - [ ] 5.8 Расписание beat из раздела 15 (НБУ, корзина, партиции, отчёты, токены, heartbeat).
 - [ ] 5.9 Замеры способов UPDATE → `docs/experiments.md`.
 - [ ] 5.10 Chaos-тест: убить воркер посреди job.
@@ -1385,7 +1598,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 - [ ] 9.2 Потребители `audit-writer` и `reports`.
 - [ ] 9.3 Elasticsearch и Kibana в группе `search`, mapping индекса `contacts`, украинская морфология.
 - [ ] 9.4 `search-indexer` и полная переиндексация через алиас.
-- [ ] 9.5 Search API, `Grant.es_filter()`, тест «менеджер не находит чужих клиентов».
+- [ ] 9.5 Search API, `Access.es_filter()`, тест «менеджер не находит чужих клиентов» + строки в `routes.rego`.
 - [ ] 9.6 `cd.yml`: сборка → GHCR → коммит нового тега в `deploy/envs/local`.
 - [ ] 9.7 Argo CD в группе `cd`, приложение на `envs/local`; проверить `git push` → выкатка → `git revert` → откат.
 - [ ] 9.8 (опционально) Self-hosted runner и push-деплой — для сравнения.
@@ -1394,7 +1607,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 
 ### Этап 10 — Эксперименты (по желанию, в любом порядке)
 
-- [ ] 10.1 OPA partial evaluation вместо ручного `sql_filter`.
+- [ ] 10.1 OPA partial evaluation: перенести видимость данных в OPA (`/v1/compile` сам возвращает условия для SQL) и сравнить с `Access` — как это делают в больших системах.
 - [ ] 10.2 Taskiq вместо Celery на одной очереди.
 - [ ] 10.3 KEDA для `worker-bulk`.
 - [ ] 10.4 Vault + External Secrets.
@@ -1421,7 +1634,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | 2FA | не делаем |
 | Версии | Python 3.13, PostgreSQL 18 |
 | Аутентификация | своя, по почте: access 1 ч, refresh 30 дней с ротацией |
-| Движок прав | OPA + Rego, матрица ролей в git |
+| Движок прав | OPA + Rego решает только доступ роли к эндпоинту; роли и уровни — `policies/saleshub/data.yaml` в git |
 | Объём данных | 5 млн контактов, 1 млн сделок, 20 млн активностей |
 | Репозиторий и CI/CD | твой GitHub, Actions, GHCR; деплой локально через Argo CD, структура готова к переходу в облако |
 | Логи | Loki — ставим, ресурсов хватает |
@@ -1440,7 +1653,10 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Локальные ресурсы | группы в Tilt: core всегда, events / search / monitoring / cd по необходимости |
 | Объём | ядро — этапы 0–8 (исходная задача), расширения — 9–11 по желанию |
 | Регистрация | нет, вход только по приглашению (оно же подтверждает email) |
-| Проверка прав | один запрос к OPA (действие + области); области применяет Grant в Python; анти-эскалация — в Rego |
+| Проверка прав | OPA отвечает только «может ли роль вызвать эндпоинт» (`allow` + `action`); видимость данных `own` / `team` / `org` применяет `Access` в Python; правила управления пользователями — в сервисе |
+| Роли | `super_admin` (флаг) + `org_admin`, `team_lead`, `sales_rep`, `viewer` — простые, но как в настоящих CRM |
+| Членство | один человек — одна организация и одна роль; `org_id`, `team_id`, `role` прямо в `users`, таблиц членства нет |
+| Файл прав | `policies/saleshub/data.yaml`: действия роли и уровень видимости; один файл читают OPA и бэкенд |
 
 ### Открытые вопросы
 
@@ -1540,8 +1756,8 @@ def chunk(self, job_id: str, table: str, lo: int, hi: int) -> int:
 - **Чанк bulk:** set-based `UPDATE` с условием, которое после первого прогона ничего не находит (`owner_id = :from`).
 - **Импорт:** шаги `parse → stage → merge` с отметкой в `bulk_jobs.stage`; повтор начинается с последнего незавершённого шага; `merge` через `ON CONFLICT`.
 - **Письма:** таблица `sent_notifications(dedup_key UNIQUE)`, ключ вида `deal_reassigned:{job_id}:{user_id}` — повтор не отправит письмо второй раз.
-- **Запуск job:** заголовок `Idempotency-Key` → уникальный индекс `bulk_jobs(created_by, idempotency_key)`.
-- **Одна тяжёлая job на организацию:** частичный уникальный индекс `bulk_jobs(org_id, kind) WHERE status IN ('pending', 'running')` — второй запуск получит 409.
+- **Запуск job:** заголовок `Idempotency-Key` → уникальный индекс `bulk_jobs(owner_id, idempotency_key)`.
+- **Одна тяжёлая job на организацию:** частичный уникальный индекс `bulk_jobs(org_id, kind) WHERE status IN ('pending', 'running')` — второй запуск получит 409. Для задач супер-админа (`org_id` NULL, а NULL-ы в уникальном индексе не совпадают) — отдельный `UNIQUE (kind) WHERE org_id IS NULL AND status IN ('pending', 'running')`.
 - **Курсы НБУ:** `INSERT … ON CONFLICT (rate_date, currency) DO UPDATE` — повторная загрузка безопасна.
 
 ### Жизненный цикл bulk job
@@ -1617,7 +1833,7 @@ Beat хранит своё состояние в файле на `emptyDir`; п�
 | Импорт или массовая операция завершены (с числом ошибок) | автору job | Telegram + email |
 | Приглашение, сброс пароля | пользователю | только email |
 
-Настройки: таблица `notification_settings(user_id, event_type, channel, enabled)` и эндпоинты `GET/PUT /api/v1/me/notifications`. «Тихие часы» (например, 22:00–08:00) — несрочное откладывается до утра.
+Настройки: таблица `notification_settings(user_id, event_type, channel, enabled)` и эндпоинты `GET/PUT /api/v1/me/notifications`. Эндпоинты `/api/v1/me/*` — личные настройки: они стоят на роутере только с `current_user`, без OPA, и работают с записями самого пользователя. «Тихие часы» (например, 22:00–08:00) — несрочное откладывается до утра.
 
 ### Привязка Telegram
 
@@ -1635,7 +1851,7 @@ Beat хранит своё состояние в файле на `emptyDir`; п�
 | `/deals` | мои открытые сделки с суммой (в валюте организации, через конвертер) |
 | `/stop` | отвязать и выключить уведомления |
 
-Бот вызывает те же сервисы, что и API, от имени привязанного пользователя: права проверяет OPA, видны только свои данные. Поэтому в поде бота тот же OPA-сайдкар, что и у api.
+Бот вызывает те же сервисы, что и API, от имени привязанного пользователя. Через HTTP-маршруты он не ходит, поэтому OPA ему не нужен. Перед каждой командой бот загружает пользователя (тот же кэш, что у `current_user`) и проверяет `is_active`; отключённому отвечает, что доступ закрыт, и удаляет `telegram_links`. Команды бота показывают только данные самого пользователя: бот строит `Access.for_user(user, "deal:read")` и сужает уровень до `own` («мои задачи», «мои сделки»); если у роли нет действия — отвечает «недоступно».
 
 ### Как сообщение доходит до пользователя
 
@@ -1715,25 +1931,22 @@ Postgres хранит строки и быстро находит их по то
 
 ### Права в поиске
 
-Поиск обязан видеть ровно то же, что и списки. `Grant` из раздела 5 получает метод `es_filter()` — тот же scope, только в виде фильтра Elasticsearch:
+Поиск обязан видеть ровно то же, что и списки. `Access` из раздела 5 получает метод `es_filter()` — тот же уровень, только в виде фильтра Elasticsearch:
 
 ```python
 def es_filter(self) -> dict:
-    if self.is_all:
-        return {"match_all": {}}
-    should = []
-    if self.org_ids:
-        should.append({"terms": {"org_id": list(self.org_ids)}})
-    if self.team_ids:
-        should.append({"terms": {"team_id": list(self.team_ids)}})
-    if self.own_org_ids:
-        should.append({"bool": {"filter": [
-            {"terms": {"org_id": list(self.own_org_ids)}},
-            {"term": {"owner_id": str(self.user_id)}}]}})
-    return {"bool": {"should": should, "minimum_should_match": 1}} if should else {"match_none": {}}
+    org = {"term": {"org_id": str(self.org_id)}}
+    match self.scope:
+        case "org":
+            return org
+        case "team":
+            return {"bool": {"filter": [org, {"term": {"team_id": str(self.team_id)}}]}}
+        case "own":
+            return {"bool": {"filter": [org, {"term": {"owner_id": str(self.user_id)}}]}}
+    raise ValueError(f"неизвестный уровень: {self.scope}")
 ```
 
-Фильтр `deleted: false` и scope добавляются в каждый запрос в одном месте — в `SearchRepository`, вручную в эндпоинтах их не пишут. Отдельный тест проверяет, что `sales_rep` не находит чужих клиентов ни в списке, ни в поиске.
+Фильтр `deleted: false` и фильтр `Access` добавляются в каждый запрос в одном месте — в `SearchRepository`, вручную в эндпоинтах их не пишут. Отдельный тест проверяет, что `sales_rep` не находит чужих клиентов ни в списке, ни в поиске.
 
 ### API
 
@@ -1741,7 +1954,7 @@ def es_filter(self) -> dict:
 | --- | --- | --- |
 | GET | `/api/v1/search/contacts?q=…&status=…&tags=…` | поиск с опечатками, фасеты по статусу, тегам, ответственному |
 | GET | `/api/v1/search/suggest?q=…` | подсказки при вводе: первые 10 имён и компаний |
-| POST | `/api/v1/admin/search/reindex` | полная переиндексация (только супер-админ), это bulk job |
+| POST | `/api/v1/admin/search/reindex` | полная переиндексация (только супер-админ, `admin:system`), это bulk job `reindex` без `Access` — она системная |
 
 ### Запуск и ресурсы
 

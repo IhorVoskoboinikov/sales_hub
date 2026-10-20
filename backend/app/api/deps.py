@@ -7,6 +7,8 @@ from fastapi import Request
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.core.jwt import KeySet
+
 
 def get_engine(request: Request) -> AsyncEngine:
     return cast(AsyncEngine, request.app.state.engine)
@@ -20,3 +22,7 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     factory = cast(async_sessionmaker[AsyncSession], request.app.state.session_factory)
     async with factory() as session:  # одна сессия на запрос
         yield session  # закроется после ответа
+
+
+def get_key_set(request: Request) -> KeySet:
+    return cast(KeySet, request.app.state.keys)

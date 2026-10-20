@@ -40,10 +40,6 @@ def redis_url() -> Iterator[str]:
 
 
 @pytest.fixture
-def settings(postgres_url: str, redis_url: str) -> Settings:
-    return Settings(
-        _env_file=None,
-        app_env="test",
-        database_url=postgres_url,
-        redis_url=redis_url,
-    )
+def settings(settings: Settings, postgres_url: str, redis_url: str) -> Settings:
+    # Те же настройки, что у unit-тестов, но с адресами настоящих контейнеров.
+    return settings.model_copy(update={"database_url": postgres_url, "redis_url": redis_url})

@@ -1,6 +1,7 @@
 """Настройки приложения: переменные окружения, а при локальном запуске ещё и файл .env."""
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,6 +16,16 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://saleshub:saleshub@localhost:5432/saleshub"
     redis_url: str = "redis://localhost:6379/0"
+
+    # --- Вход по почте (раздел 4)
+    # Путь относительно backend/ (в контейнере — /app). В dev файл создаёт make keys.
+    jwt_private_key_file: Path = Path("secrets/jwt_private.pem")
+    # Ротация: старые публичные ключи, по которым ещё проверяются выданные токены (JSON-список).
+    jwt_previous_public_key_files: list[Path] = []
+    jwt_issuer: str = "https://saleshub.local"
+    jwt_audience: str = "saleshub-api"
+    jwt_access_ttl: int = 3600  # секунды
+    refresh_ttl_days: int = 30  # абсолютный предел сессии: от входа, ротация его не продлевает
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     # None — решает профиль: Swagger есть везде, кроме prod.

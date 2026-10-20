@@ -6,24 +6,35 @@ Unit-тесты не ходят ни в Postgres, ни в Redis: адреса в
 """
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from app.core.config import Settings
+from app.core.jwt import generate_private_key, private_key_to_pem
 from app.main import create_app
 
 CLOSED_PORT = 9  # на этом порту никто не слушает — соединение сразу отклоняется
 
 
+@pytest.fixture(scope="session")
+def jwt_key_file(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    # Один ключ на весь запуск: RSA-ключ генерируется заметное время.
+    path = tmp_path_factory.mktemp("keys") / "jwt_private.pem"
+    path.write_bytes(private_key_to_pem(generate_private_key()))
+    return path
+
+
 @pytest.fixture
-def settings() -> Settings:
+def settings(jwt_key_file: Path) -> Settings:
     return Settings(
         _env_file=None,  # не читать локальный .env разработчика
         app_env="test",
         database_url=f"postgresql+asyncpg://test:test@127.0.0.1:{CLOSED_PORT}/test",
         redis_url=f"redis://127.0.0.1:{CLOSED_PORT}/0",
+        jwt_private_key_file=jwt_key_file,
     )
 
 

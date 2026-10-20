@@ -3,12 +3,12 @@ COMPOSE = docker compose -f deploy/compose/docker-compose.yml
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs urls migrate revision run test test-unit test-integration lint fmt
+.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
 
-up:  ## поднять стенд: API, Postgres, Redis и все UI (ждёт, пока всё станет healthy)
+up: keys  ## поднять стенд: API, Postgres, Redis и все UI (ждёт, пока всё станет healthy)
 	$(COMPOSE) up -d --build --wait
 	@$(MAKE) --no-print-directory urls
 
@@ -34,13 +34,16 @@ urls:  ## адреса веб-интерфейсов
 	@echo "Mailpit      http://localhost:8025"
 	@echo "RustFS (S3)  http://localhost:9001/rustfs/console/   логин saleshub / saleshub-secret"
 
+keys:  ## создать приватный ключ JWT в backend/secrets/ (если его ещё нет)
+	$(BACKEND) uv run python -m app.cli generate-jwt-key
+
 migrate:  ## применить миграции в compose
 	$(COMPOSE) run --rm --build migrate
 
 revision:  ## новая миграция по моделям: make revision m="add users"
 	$(BACKEND) uv run alembic revision --autogenerate -m "$(m)"
 
-run:  ## API без Docker с автоперезапуском (сначала make infra; с make up конфликт по порту 8000)
+run: keys  ## API без Docker с автоперезапуском (сначала make infra; с make up конфликт по порту 8000)
 	$(BACKEND) uv run uvicorn app.main:create_app --factory --reload --no-access-log
 
 test:  ## все тесты (интеграционным нужен Docker)

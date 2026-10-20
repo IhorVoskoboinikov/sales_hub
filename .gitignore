@@ -18,6 +18,7 @@ htmlcov/
 
 # Секреты и локальные настройки
 .env
+backend/secrets/
 *.pem
 *.key
 

@@ -9,6 +9,7 @@ ERRORS: dict[str, str] = {
     "method_not_allowed": "Метод не підтримується",
     "forbidden": "Недостатньо прав",
     "auth.invalid_token": "Недійсний токен",
+    "auth.token_expired": "Термін дії токена минув",
     "conflict": "Конфлікт даних",
     "validation": "Помилка валідації",
     "rate_limited": "Забагато запитів, спробуйте пізніше",

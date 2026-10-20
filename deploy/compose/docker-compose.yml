@@ -53,7 +53,9 @@ services:
     # dev: код смонтирован с хоста, --reload перезапускает сервер при сохранении файла.
     command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",
               "--no-access-log", "--reload"]
-    volumes: [../../backend/app:/app/app:ro]
+    volumes:
+      - ../../backend/app:/app/app:ro
+      - ../../backend/secrets:/app/secrets:ro  # ключ JWT: make keys (make up вызывает его сам)
     environment: *app-env
     ports: ["127.0.0.1:8000:8000"]
     depends_on:

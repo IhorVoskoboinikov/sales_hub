@@ -6,9 +6,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
-from app.api import health
+from app.api import health, well_known
 from app.api import v1 as api_v1
 from app.core.config import Settings, get_settings
+from app.core.jwt import KeySet
 from app.core.logging import configure_logging
 from app.db.session import create_engine, create_session_factory
 from app.errors.handlers import register_error_handlers
@@ -25,6 +26,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Создаётся один раз при старте и закрывается при остановке процесса.
         # Соединения открываются лениво — при первом запросе, а не здесь.
+        app.state.keys = KeySet.from_settings(settings)  # нет ключа — сервер не стартует
         engine = create_engine(settings.database_url)
         app.state.engine = engine
         app.state.session_factory = create_session_factory(engine)
@@ -56,5 +58,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health.router)
+    app.include_router(well_known.router)
     app.include_router(api_v1.router)
     return app

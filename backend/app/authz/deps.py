@@ -47,4 +47,5 @@ async def authorize(
         user_id=user.id,
         org_id=user.org_id,
         team_id=user.team_id,
+        role=user.role,
     )

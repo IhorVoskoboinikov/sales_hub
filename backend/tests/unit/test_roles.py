@@ -1,9 +1,11 @@
 """Каталог ролей из policies/saleshub/data.yaml — того же файла, что читает OPA."""
 
+import uuid
 from pathlib import Path
 
 import pytest
 
+from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.errors import ServiceUnavailable
 from tests.conftest import POLICIES_DIR
@@ -40,3 +42,18 @@ def test_bad_level_fails_at_startup(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="неизвестные уровни"):
         RoleCatalog.load(tmp_path)
+
+
+def test_access_for_another_action_keeps_the_person(roles: RoleCatalog) -> None:
+    access = Access("deal:write", "own", uuid.uuid4(), uuid.uuid4(), uuid.uuid4(), "sales_rep")
+
+    read = access.for_action("company:read", roles)
+
+    assert read is not None
+    assert (read.action, read.scope) == ("company:read", "org")  # компании видны всем
+    assert (read.user_id, read.org_id, read.team_id) == (
+        access.user_id,
+        access.org_id,
+        access.team_id,
+    )
+    assert access.for_action("member:manage", roles) is None  # у роли такого действия нет

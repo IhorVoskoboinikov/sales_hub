@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.context import get_request_id
@@ -30,6 +31,10 @@ HTTP_STATUS_CODES = {
 }
 
 UNIQUE_VIOLATION = "23505"  # SQLSTATE Postgres: нарушение UNIQUE
+
+# Уникальные ограничения, у которых есть свой код ошибки. Сервис проверяет их заранее, а база
+# ловит гонку двух одновременных запросов — ответ должен быть тем же.
+UNIQUE_CODES = {"uq_contacts_org_id_email": "contact.duplicate_email"}
 
 
 def problem(
@@ -91,8 +96,16 @@ async def integrity_error_handler(request: Request, exc: Exception) -> JSONRespo
         raise exc  # другие нарушения (FK, CHECK) — ошибка в коде: пусть станет 500
     # SQLAlchemy оборачивает исключение asyncpg; имя constraint есть только у исходного.
     driver_error = getattr(exc.orig, "orig", None) or exc.orig
-    logger.warning("unique_violation", constraint=getattr(driver_error, "constraint_name", None))
-    return problem(Conflict.status, Conflict.code)
+    constraint = getattr(driver_error, "constraint_name", None)
+    logger.warning("unique_violation", constraint=constraint)
+    return problem(Conflict.status, UNIQUE_CODES.get(constraint or "", Conflict.code))
+
+
+async def stale_data_handler(request: Request, exc: Exception) -> JSONResponse:
+    """UPDATE … WHERE id = :id AND version = :v не нашёл строку: между чтением и записью её
+    изменил другой запрос (оптимистическая блокировка, version_id_col у CRM-моделей)."""
+    logger.warning("version_conflict", error=str(exc))
+    return problem(Conflict.status, "version.conflict")
 
 
 def register_error_handlers(app: FastAPI) -> None:
@@ -100,3 +113,4 @@ def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_error_handler)
     app.add_exception_handler(IntegrityError, integrity_error_handler)
+    app.add_exception_handler(StaleDataError, stale_data_handler)

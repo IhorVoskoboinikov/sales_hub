@@ -2,6 +2,7 @@
 
 from app.db.base import Base
 from app.models.audit import AuditEntry
+from app.models.crm import Company, Contact, ContactStatus
 from app.models.email_token import EmailToken, EmailTokenPurpose
 from app.models.organization import Organization, Team
 from app.models.refresh_token import RefreshToken
@@ -11,6 +12,9 @@ __all__ = [
     "ROLES_WITH_TEAM",
     "AuditEntry",
     "Base",
+    "Company",
+    "Contact",
+    "ContactStatus",
     "EmailToken",
     "EmailTokenPurpose",
     "Organization",

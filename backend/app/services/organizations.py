@@ -93,6 +93,8 @@ class TeamService:
         team = await self._get_or_404(access, team_id, lock="update")
         if await self.uow.teams.count_members(team.id):
             raise Conflict("team.has_members")
+        if await self.uow.live_records.exist(team_id=team.id):
+            raise Conflict("team.has_records")
         await self.uow.teams.delete(team)
         self._audit(access, "team.deleted", team.id, {"name": team.name})
         await self.uow.commit()

@@ -2,7 +2,10 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models import Company, Contact
 from app.repositories.audit import AuditRepository
+from app.repositories.contacts import CompanyRepository, ContactRepository
+from app.repositories.crm import LiveRecords
 from app.repositories.email_tokens import EmailTokenRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
@@ -18,6 +21,9 @@ class UnitOfWork:
         self.organizations = OrganizationRepository(session)
         self.teams = TeamRepository(session)
         self.audit = AuditRepository(session)
+        self.companies = CompanyRepository(session)
+        self.contacts = ContactRepository(session)
+        self.live_records = LiveRecords(session, (Company, Contact))
 
     async def flush(self) -> None:
         """Отправить изменения в базу без коммита: проверить ограничения, получить значения

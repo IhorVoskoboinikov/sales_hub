@@ -26,7 +26,7 @@ from testcontainers.core.wait_strategies import HttpWaitStrategy
 from app.api.deps import get_session
 from app.core.config import Settings
 from app.core.security import hash_password
-from app.models import Organization, Team, User
+from app.models import Company, Contact, Organization, Team, User
 from app.uow import UnitOfWork
 from tests.conftest import POLICIES_DIR
 
@@ -253,3 +253,33 @@ async def member(
 
 async def tokens_for(client: AsyncClient, user: User) -> dict[str, str]:
     return bearer(await login(client, user.email))
+
+
+MakeRecord = Callable[..., Awaitable[Any]]
+
+
+@pytest.fixture
+def make_contact(uow: UnitOfWork) -> MakeRecord:
+    """Контакт, который ведёт owner (team_lead или sales_rep): org_id и team_id — его."""
+
+    async def make(owner: User, **fields: Any) -> Contact:
+        fields.setdefault("first_name", "Іван")
+        fields.setdefault("email", f"client-{uuid.uuid4().hex[:8]}@example.com")
+        contact = Contact(org_id=owner.org_id, team_id=owner.team_id, owner_id=owner.id, **fields)
+        uow.contacts.add(contact)
+        await uow.commit()
+        return contact
+
+    return make
+
+
+@pytest.fixture
+def make_company(uow: UnitOfWork) -> MakeRecord:
+    async def make(owner: User, **fields: Any) -> Company:
+        fields.setdefault("name", f"Acme {uuid.uuid4().hex[:6]}")
+        company = Company(org_id=owner.org_id, team_id=owner.team_id, owner_id=owner.id, **fields)
+        uow.companies.add(company)
+        await uow.commit()
+        return company
+
+    return make

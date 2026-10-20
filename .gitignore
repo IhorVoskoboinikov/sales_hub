@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .venv/
+# в корне .venv — ссылка на backend/.venv (интерпретатор PyCharm)
+.venv
 *.egg-info/
 build/
 dist/

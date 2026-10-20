@@ -5,6 +5,7 @@
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -18,6 +19,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.community.redis import RedisContainer
+from testcontainers.core.container import DockerContainer
+from testcontainers.core.wait_strategies import HttpWaitStrategy
 
 from app.api.deps import get_session
 from app.core.config import Settings
@@ -30,6 +33,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 # Те же версии, что в deploy/compose/docker-compose.yml.
 POSTGRES_IMAGE = "postgres:18.6"
 REDIS_IMAGE = "redis:8.10"
+MAILPIT_IMAGE = "axllent/mailpit:v1.31.6"
 
 
 def alembic_config(database_url: str) -> Config:
@@ -53,10 +57,40 @@ def redis_url() -> Iterator[str]:
         yield f"redis://{redis.get_container_host_ip()}:{redis.get_exposed_port(6379)}/0"
 
 
+@dataclass(frozen=True)
+class Mailpit:
+    smtp_host: str
+    smtp_port: int
+    api_url: str  # REST API Mailpit: тесты читают через него отправленные письма
+
+
+@pytest.fixture(scope="session")
+def mailpit() -> Iterator[Mailpit]:
+    container = (
+        DockerContainer(MAILPIT_IMAGE)
+        .with_exposed_ports(1025, 8025)
+        .waiting_for(HttpWaitStrategy(8025, "/livez"))
+    )
+    with container:
+        host = container.get_container_host_ip()
+        yield Mailpit(
+            smtp_host=host,
+            smtp_port=int(container.get_exposed_port(1025)),
+            api_url=f"http://{host}:{container.get_exposed_port(8025)}/api/v1",
+        )
+
+
 @pytest.fixture
-def settings(settings: Settings, postgres_url: str, redis_url: str) -> Settings:
+def settings(settings: Settings, postgres_url: str, redis_url: str, mailpit: Mailpit) -> Settings:
     # Те же настройки, что у unit-тестов, но с адресами настоящих контейнеров.
-    return settings.model_copy(update={"database_url": postgres_url, "redis_url": redis_url})
+    return settings.model_copy(
+        update={
+            "database_url": postgres_url,
+            "redis_url": redis_url,
+            "smtp_host": mailpit.smtp_host,
+            "smtp_port": mailpit.smtp_port,
+        }
+    )
 
 
 @pytest.fixture
@@ -119,3 +153,16 @@ async def login(client: AsyncClient, email: str, password: str = PASSWORD) -> di
 
 def bearer(tokens: dict[str, Any]) -> dict[str, str]:
     return {"Authorization": f"Bearer {tokens['access_token']}"}
+
+
+async def read_emails(mailpit: Mailpit, to: str) -> list[dict[str, Any]]:
+    """Письма, которые Mailpit получил для адреса to, от новых к старым — с текстом."""
+    async with AsyncClient(base_url=mailpit.api_url) as api:
+        found = (await api.get("/search", params={"query": f"to:{to}"})).json()["messages"]
+        return [(await api.get(f"/message/{m['ID']}")).json() for m in found]
+
+
+def token_from_email(email: dict[str, Any]) -> str:
+    """Токен в письме стоит отдельной строкой после строки «Токен…:»."""
+    lines = [line.strip() for line in email["Text"].splitlines()]
+    return next(lines[i + 1] for i, line in enumerate(lines) if line.startswith("Токен"))

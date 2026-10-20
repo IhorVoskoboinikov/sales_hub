@@ -6,13 +6,15 @@ from datetime import timedelta
 from typing import cast
 
 import structlog
-from fastapi import Depends, Request
+from fastapi import BackgroundTasks, Depends, Request
 from fastapi.security import OAuth2PasswordBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.core.jwt import KeySet
+from app.emails.mailer import BackgroundMailer
+from app.emails.sender import EmailSender, Mailer
 from app.errors import Unauthorized
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
@@ -37,6 +39,16 @@ def get_redis(request: Request) -> Redis:
 
 def get_key_set(request: Request) -> KeySet:
     return cast(KeySet, request.app.state.keys)
+
+
+def get_email_sender(request: Request) -> EmailSender:
+    return cast(EmailSender, request.app.state.email_sender)
+
+
+def get_mailer(
+    background: BackgroundTasks, sender: EmailSender = Depends(get_email_sender)
+) -> Mailer:
+    return BackgroundMailer(sender, background)
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:

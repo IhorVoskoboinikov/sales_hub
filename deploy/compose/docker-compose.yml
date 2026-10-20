@@ -8,6 +8,7 @@ x-app-env: &app-env
   APP_ENV: dev
   DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@postgres:5432/saleshub
   REDIS_URL: redis://redis:6379/0
+  SMTP_HOST: mailpit  # письма видно на localhost:8025
   LOG_LEVEL: INFO
 
 services:

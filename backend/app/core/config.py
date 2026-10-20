@@ -28,6 +28,19 @@ class Settings(BaseSettings):
     jwt_access_ttl: int = 3600  # секунды
     refresh_ttl_days: int = 30  # абсолютный предел сессии: от входа, ротация его не продлевает
 
+    # Публичный адрес API — для ссылок в письмах.
+    public_url: str = "http://localhost:8000"
+    invite_ttl_days: int = 7
+    reset_password_ttl_minutes: int = 60
+
+    # --- Письма. В dev — Mailpit: SMTP на 1025, веб-интерфейс на localhost:8025.
+    smtp_host: str = "localhost"
+    smtp_port: int = 1025
+    smtp_username: str | None = None
+    smtp_password: SecretStr | None = None
+    smtp_start_tls: bool = False
+    email_from: str = "SalesHub <noreply@saleshub.local>"
+
     # Первый пользователь — для команды create-superadmin (в Kubernetes — из Secret).
     superadmin_email: str | None = None
     superadmin_password: SecretStr | None = None

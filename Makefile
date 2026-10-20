@@ -12,8 +12,8 @@ up: keys  ## поднять стенд: API, Postgres, Redis и все UI (жд�
 	$(COMPOSE) up -d --build --wait
 	@$(MAKE) --no-print-directory urls
 
-infra:  ## только Postgres и Redis — для make run (API запускается без Docker)
-	$(COMPOSE) up -d --wait postgres redis
+infra:  ## только Postgres, Redis и Mailpit — для make run (API запускается без Docker)
+	$(COMPOSE) up -d --wait postgres redis mailpit
 
 down:  ## остановить стенд (данные сохраняются)
 	$(COMPOSE) down

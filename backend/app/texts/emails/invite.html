@@ -1,0 +1,9 @@
+{% extends "_layout.html" %}
+{% block content %}
+<p>Вітаємо!</p>
+<p>Вас запросили до SalesHub. Щоб прийняти запрошення, задайте пароль: надішліть токен
+і пароль на <code>POST /api/v1/auth/invite/accept</code> (у Swagger: <a href="{{ docs_url }}">{{ docs_url }}</a>).</p>
+<p>Токен запрошення:</p>
+<p style="font-family: monospace; font-size: 16px; background: #f3f4f6; padding: 8px;">{{ token }}</p>
+<p>Запрошення дійсне до {{ expires_at }}.</p>
+{% endblock %}

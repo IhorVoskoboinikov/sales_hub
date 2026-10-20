@@ -24,6 +24,12 @@ ERRORS: dict[str, str] = {
     "password.same_as_email": "Пароль не може збігатися з email",
 }
 
+# Темы писем по имени шаблона (app/texts/emails/<имя>.txt и .html).
+EMAIL_SUBJECTS: dict[str, str] = {
+    "invite": "Запрошення до SalesHub",
+    "reset_password": "Зміна пароля в SalesHub",
+}
+
 # Сообщения валидации по типу ошибки Pydantic. В фигурных скобках — поля из ctx ошибки.
 VALIDATION: dict[str, str] = {
     "missing": "Обов'язкове поле",

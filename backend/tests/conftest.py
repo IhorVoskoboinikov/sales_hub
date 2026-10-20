@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.core.config import Settings
 from app.core.jwt import generate_private_key, private_key_to_pem
+from app.emails.sender import Email
 from app.main import create_app
 
 CLOSED_PORT = 9  # на этом порту никто не слушает — соединение сразу отклоняется
@@ -50,3 +51,13 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             yield client
+
+
+class FakeEmailSender:
+    """Письма не уходят, а складываются в список — для unit-тестов."""
+
+    def __init__(self) -> None:
+        self.sent: list[Email] = []
+
+    async def send(self, email: Email) -> None:
+        self.sent.append(email)

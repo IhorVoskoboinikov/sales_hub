@@ -27,3 +27,15 @@ class MeOut(BaseModel):
 
 class RefreshIn(BaseModel):
     refresh_token: str = Field(max_length=256)
+
+
+class SessionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    sid: uuid.UUID = Field(description="Идентификатор сессии — для DELETE /auth/sessions/{sid}")
+    ip: str | None
+    user_agent: str | None
+    started_at: datetime = Field(description="Когда вошли")
+    last_refresh_at: datetime = Field(description="Когда последний раз обновляли токены")
+    expires_at: datetime = Field(description="Когда сессия закончится сама")
+    current: bool = Field(description="Это сессия, из которой сделан запрос")

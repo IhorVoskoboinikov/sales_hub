@@ -1,13 +1,14 @@
 """Вход по почте (раздел 4): токены, сессии, пароль, приглашения."""
 
+import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, status
 from fastapi.security import OAuth2PasswordRequestForm
 
 from app.api.deps import current_user, get_auth_service, get_client_info, get_uow
 from app.errors import NotFound
-from app.schemas.auth import MeOut, RefreshIn, TokenOut
+from app.schemas.auth import MeOut, RefreshIn, SessionOut, TokenOut
 from app.schemas.errors import ErrorOut
 from app.services.auth import AuthService, ClientInfo, CurrentUser, TokenPair
 from app.uow import UnitOfWork
@@ -61,3 +62,46 @@ async def me(
     if row is None:  # удалили между проверкой токена и этим запросом
         raise NotFound(entity="user")
     return MeOut.model_validate(row)
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT, responses=AUTH_ERRORS)
+async def logout(
+    user: CurrentUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+) -> None:
+    """Выйти на этом устройстве: refresh-токены текущей сессии больше не работают.
+    Access-токен доживёт до конца своего часа — он не хранится на сервере."""
+    await auth.logout(user)
+
+
+@router.post("/logout-all", status_code=status.HTTP_204_NO_CONTENT, responses=AUTH_ERRORS)
+async def logout_all(
+    user: CurrentUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+) -> None:
+    """Выйти везде: закрываются все сессии, и все выданные access-токены сразу перестают
+    работать (token_version + 1)."""
+    await auth.logout_all(user)
+
+
+@router.get("/sessions", responses=AUTH_ERRORS)
+async def sessions(
+    user: CurrentUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+) -> list[SessionOut]:
+    """Мои активные сессии: устройство, IP, когда вошёл и когда последний раз обновлял токены."""
+    return [SessionOut.model_validate(s) for s in await auth.sessions(user)]
+
+
+@router.delete(
+    "/sessions/{sid}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={**AUTH_ERRORS, 404: {"model": ErrorOut}},
+)
+async def revoke_session(
+    sid: uuid.UUID,
+    user: CurrentUser = Depends(current_user),
+    auth: AuthService = Depends(get_auth_service),
+) -> None:
+    """Выйти на конкретном устройстве (sid — из списка сессий)."""
+    await auth.revoke_session(user, sid)

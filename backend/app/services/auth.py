@@ -8,7 +8,7 @@ import structlog
 
 from app.core.jwt import KeySet
 from app.core.security import hash_token, new_token, verify_dummy_password, verify_password
-from app.errors import Forbidden, Unauthorized
+from app.errors import Forbidden, NotFound, Unauthorized
 from app.models import RefreshToken, User
 from app.repositories.user_cache import CachedUser, UserCache
 from app.uow import UnitOfWork
@@ -39,6 +39,19 @@ class TokenPair:
     access_token: str
     refresh_token: str
     expires_in: int  # секунды жизни access-токена
+
+
+@dataclass(frozen=True)
+class Session:
+    """Один вход на одном устройстве."""
+
+    sid: uuid.UUID
+    ip: str | None
+    user_agent: str | None
+    started_at: datetime
+    last_refresh_at: datetime
+    expires_at: datetime
+    current: bool
 
 
 class AuthService:
@@ -102,6 +115,46 @@ class AuthService:
         pair = self._token_pair(user, token.family_id, new)
         await self.uow.commit()
         return pair
+
+    async def logout(self, user: CurrentUser) -> None:
+        """Закрыть текущую сессию. Access-токен доживёт свой час: он stateless."""
+        await self.uow.refresh_tokens.revoke_family(user.session_id, datetime.now(UTC))
+        await self.uow.commit()
+
+    async def logout_all(self, user: CurrentUser) -> None:
+        """Закрыть все сессии и убить все живые access-токены (token_version + 1)."""
+        await self.uow.refresh_tokens.revoke_all_for_user(user.id, datetime.now(UTC))
+        await self._bump_token_version(user.id)
+        await self.uow.commit()
+        await self.cache.invalidate(user.id)
+
+    async def sessions(self, user: CurrentUser) -> list[Session]:
+        rows = await self.uow.refresh_tokens.list_active(user.id, datetime.now(UTC))
+        return [
+            Session(
+                sid=token.family_id,
+                ip=token.ip,
+                user_agent=token.user_agent,
+                started_at=started_at,
+                last_refresh_at=token.created_at,
+                expires_at=token.expires_at,
+                current=token.family_id == user.session_id,
+            )
+            for token, started_at in rows
+        ]
+
+    async def revoke_session(self, user: CurrentUser, sid: uuid.UUID) -> None:
+        """Выйти на конкретном устройстве."""
+        if not await self.uow.refresh_tokens.revoke_user_session(user.id, sid, datetime.now(UTC)):
+            raise NotFound(entity="session", id=str(sid))
+        await self.uow.commit()
+
+    async def _bump_token_version(self, user_id: uuid.UUID) -> User:
+        user = await self.uow.users.get(user_id)
+        if user is None:
+            raise Unauthorized()
+        user.token_version += 1
+        return user
 
     async def authenticate(self, access_token: str) -> CurrentUser:
         """Зависимость current_user: подпись и сроки токена, затем пользователь (кэш → БД)."""

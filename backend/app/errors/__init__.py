@@ -4,7 +4,7 @@
 NotFound(entity="deal", id=123).
 """
 
-from typing import Any
+from typing import Any, ClassVar
 
 from app.texts import uk
 
@@ -12,6 +12,7 @@ from app.texts import uk
 class AppError(Exception):
     status: int = 500
     code: str = "internal"
+    headers: ClassVar[dict[str, str] | None] = None  # заголовки ответа: WWW-Authenticate
 
     def __init__(self, code: str | None = None, **details: Any) -> None:
         if code is not None:
@@ -40,6 +41,8 @@ class Forbidden(AppError):
 class Unauthorized(AppError):
     status = 401
     code = "auth.invalid_token"
+    # RFC 6750: подсказка клиенту, как пройти аутентификацию.
+    headers: ClassVar[dict[str, str] | None] = {"WWW-Authenticate": "Bearer"}
 
 
 class Conflict(AppError):

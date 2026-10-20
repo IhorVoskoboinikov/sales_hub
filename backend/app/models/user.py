@@ -20,11 +20,13 @@ class User(Base):
     # citext: Ivan@Mail.com и ivan@mail.com — один и тот же пользователь.
     email: Mapped[str] = mapped_column(CITEXT, unique=True)
     password_hash: Mapped[str] = mapped_column(String(255))
-    is_active: Mapped[bool] = mapped_column(Boolean, server_default=text("true"))
-    is_superadmin: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+    is_superadmin: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false")
+    )
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Входит в access-токен (claim ver). +1 — и все выданные access-токены перестают работать.
-    token_version: Mapped[int] = mapped_column(Integer, server_default=text("0"))
+    token_version: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
     # None — часовой пояс организации (появится на этапе 3).
     timezone: Mapped[str | None] = mapped_column(String(64))
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

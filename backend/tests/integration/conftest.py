@@ -4,13 +4,16 @@
 него. Коммиты сервисов внутри теста становятся SAVEPOINT-ами — таблицы чистить не нужно.
 """
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
+from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 from testcontainers.community.postgres import PostgresContainer
@@ -18,6 +21,8 @@ from testcontainers.community.redis import RedisContainer
 
 from app.api.deps import get_session
 from app.core.config import Settings
+from app.core.security import hash_password
+from app.models import User
 from app.uow import UnitOfWork
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -85,3 +90,32 @@ def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
 
     app.dependency_overrides[get_session] = test_session
     return app
+
+
+PASSWORD = "correct horse battery"  # пароль всех пользователей из make_user
+
+MakeUser = Callable[..., Awaitable[User]]
+
+
+@pytest.fixture
+def make_user(uow: UnitOfWork) -> MakeUser:
+    """Создать пользователя с подтверждённым email и паролем PASSWORD."""
+
+    async def make(email: str = "ivan@example.com", **fields: object) -> User:
+        fields.setdefault("email_verified_at", datetime.now(UTC))
+        user = User(email=email, password_hash=await hash_password(PASSWORD), **fields)
+        uow.users.add(user)
+        await uow.commit()
+        return user
+
+    return make
+
+
+async def login(client: AsyncClient, email: str, password: str = PASSWORD) -> dict[str, Any]:
+    resp = await client.post("/api/v1/auth/login", data={"username": email, "password": password})
+    assert resp.status_code == 200, resp.text
+    return cast(dict[str, Any], resp.json())
+
+
+def bearer(tokens: dict[str, Any]) -> dict[str, str]:
+    return {"Authorization": f"Bearer {tokens['access_token']}"}

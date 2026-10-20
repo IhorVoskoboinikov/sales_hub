@@ -4,12 +4,16 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
+import structlog
+
 from app.core.jwt import KeySet
 from app.core.security import hash_token, new_token, verify_dummy_password, verify_password
 from app.errors import Forbidden, Unauthorized
 from app.models import RefreshToken, User
 from app.repositories.user_cache import CachedUser, UserCache
 from app.uow import UnitOfWork
+
+logger = structlog.get_logger("auth")
 
 
 @dataclass(frozen=True)
@@ -64,6 +68,38 @@ class AuthService:
             user.password_hash = new_hash  # параметры argon2 выросли — перехэшировали
         user.last_login_at = datetime.now(UTC)
         pair = self._start_session(user, client)
+        await self.uow.commit()
+        return pair
+
+    async def refresh(self, raw_token: str, client: ClientInfo) -> TokenPair:
+        """Ротация: старый refresh-токен отзывается, выдаётся новая пара в той же сессии."""
+        now = datetime.now(UTC)
+        token = await self.uow.refresh_tokens.get_by_hash_for_update(hash_token(raw_token))
+        if token is None:
+            raise Unauthorized()
+        if token.revoked_at is not None:
+            # Отозванный токен пришёл ещё раз — его украли: им уже воспользовался либо вор,
+            # либо хозяин. Кто из них сейчас, не понять, поэтому закрываем всю сессию.
+            await self.uow.refresh_tokens.revoke_family(token.family_id, now)
+            await self.uow.commit()
+            logger.warning(
+                "refresh_token_reused", user_id=str(token.user_id), sid=str(token.family_id)
+            )
+            raise Unauthorized()
+        if token.expires_at <= now:
+            raise Unauthorized()
+        user = await self.uow.users.get(token.user_id)
+        if user is None:
+            raise Unauthorized()
+        ensure_can_sign_in(cached_user(user))
+
+        # Срок не продлевается: сессия живёт не дольше refresh_ttl с момента входа.
+        new = self._new_refresh_token(user.id, token.family_id, token.expires_at, client)
+        # Сначала INSERT нового токена, потом ссылка на него: replaced_by — внешний ключ.
+        await self.uow.flush()
+        token.revoked_at = now
+        token.replaced_by = new[0].id
+        pair = self._token_pair(user, token.family_id, new)
         await self.uow.commit()
         return pair
 

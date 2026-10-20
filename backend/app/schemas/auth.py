@@ -23,3 +23,7 @@ class MeOut(BaseModel):
     email_verified_at: datetime | None
     last_login_at: datetime | None
     created_at: datetime
+
+
+class RefreshIn(BaseModel):
+    refresh_token: str = Field(max_length=256)

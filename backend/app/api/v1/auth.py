@@ -6,11 +6,18 @@ from typing import Any
 from fastapi import APIRouter, Depends, status
 from fastapi.security import OAuth2PasswordRequestForm
 
-from app.api.deps import current_user, get_auth_service, get_client_info, get_uow
+from app.api.deps import (
+    current_user,
+    get_auth_service,
+    get_client_info,
+    get_invite_service,
+    get_uow,
+)
 from app.errors import NotFound
-from app.schemas.auth import MeOut, RefreshIn, SessionOut, TokenOut
+from app.schemas.auth import InviteAcceptIn, MeOut, RefreshIn, SessionOut, TokenOut
 from app.schemas.errors import ErrorOut
 from app.services.auth import AuthService, ClientInfo, CurrentUser, TokenPair
+from app.services.invites import InviteService
 from app.uow import UnitOfWork
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
@@ -105,3 +112,16 @@ async def revoke_session(
 ) -> None:
     """Выйти на конкретном устройстве (sid — из списка сессий)."""
     await auth.revoke_session(user, sid)
+
+
+@router.post(
+    "/invite/accept",
+    status_code=status.HTTP_201_CREATED,
+    responses={409: {"model": ErrorOut}, 422: {"model": ErrorOut}},
+)
+async def accept_invite(
+    body: InviteAcceptIn, invites: InviteService = Depends(get_invite_service)
+) -> MeOut:
+    """Принять приглашение: токен из письма и пароль. Email считается подтверждённым.
+    Дальше — обычный вход через POST /auth/login (кнопка Authorize)."""
+    return MeOut.model_validate(await invites.accept(body.token, body.password))

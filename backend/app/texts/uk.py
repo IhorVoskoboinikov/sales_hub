@@ -18,6 +18,10 @@ ERRORS: dict[str, str] = {
     "rate_limited": "Забагато запитів, спробуйте пізніше",
     "unavailable": "Сервіс тимчасово недоступний",
     "http_error": "Помилка запиту",
+    # Приглашения и токены из писем
+    "invite.email_taken": "Користувач з таким email уже існує",
+    "email_token.invalid": "Токен недійсний або вже використаний",
+    "email_token.expired": "Термін дії токена минув",
     # Пароль
     "password.too_short": "Пароль закороткий",
     "password.too_long": "Пароль задовгий",

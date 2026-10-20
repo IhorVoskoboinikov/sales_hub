@@ -1,7 +1,10 @@
 import uuid
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+from app.core.security import MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH
 
 
 class TokenOut(BaseModel):
@@ -39,3 +42,23 @@ class SessionOut(BaseModel):
     last_refresh_at: datetime = Field(description="Когда последний раз обновляли токены")
     expires_at: datetime = Field(description="Когда сессия закончится сама")
     current: bool = Field(description="Это сессия, из которой сделан запрос")
+
+
+Password = Annotated[str, Field(min_length=MIN_PASSWORD_LENGTH, max_length=MAX_PASSWORD_LENGTH)]
+EmailTokenStr = Annotated[str, Field(max_length=256, description="Токен из письма")]
+
+
+class InviteIn(BaseModel):
+    email: EmailStr
+
+
+class InviteOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    email: str
+    expires_at: datetime = Field(description="До какого момента действует приглашение")
+
+
+class InviteAcceptIn(BaseModel):
+    token: EmailTokenStr
+    password: Password

@@ -15,9 +15,10 @@ from app.core.config import Settings
 from app.core.jwt import KeySet
 from app.emails.mailer import BackgroundMailer
 from app.emails.sender import EmailSender, Mailer
-from app.errors import Unauthorized
+from app.errors import Forbidden, Unauthorized
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
+from app.services.invites import InviteService
 from app.uow import UnitOfWork
 
 # Кнопка Authorize в Swagger: форма логина отправляется на tokenUrl.
@@ -74,6 +75,16 @@ def get_auth_service(
     return AuthService(uow, keys, cache, timedelta(days=settings.refresh_ttl_days))
 
 
+def get_invite_service(
+    uow: UnitOfWork = Depends(get_uow),
+    mailer: Mailer = Depends(get_mailer),
+    settings: Settings = Depends(get_app_settings),
+) -> InviteService:
+    return InviteService(
+        uow, mailer, timedelta(days=settings.invite_ttl_days), f"{settings.public_url}/docs"
+    )
+
+
 def get_client_info(request: Request) -> ClientInfo:
     user_agent = request.headers.get("user-agent")
     return ClientInfo(
@@ -93,4 +104,11 @@ async def current_user(
     user = await auth.authenticate(token)
     request.state.user_id = user.id  # для access-лога
     structlog.contextvars.bind_contextvars(user_id=str(user.id))  # для остальных строк лога
+    return user
+
+
+async def require_superadmin(user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    """Только супер-админ. Этап 2: OPA ещё нет, проверяем флаг; с этапа 3 это делает OPA."""
+    if not user.is_superadmin:
+        raise Forbidden()
     return user

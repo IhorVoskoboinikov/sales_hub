@@ -12,11 +12,13 @@ async def create_superadmin(uow: UnitOfWork, email: str, password: str) -> tuple
     if existing is not None:
         return existing, False
     check_password_rules(password, email)
+    now = datetime.now(UTC)
     user = User(
         email=email,
         password_hash=await hash_password(password),
         is_superadmin=True,
-        email_verified_at=datetime.now(UTC),
+        email_verified_at=now,
+        created_at=now,
     )
     uow.users.add(user)
     await uow.commit()

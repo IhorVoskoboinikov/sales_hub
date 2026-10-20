@@ -8,7 +8,7 @@ from redis.asyncio import Redis
 
 from app.api import health, well_known
 from app.api import v1 as api_v1
-from app.api.v1 import auth
+from app.api.v1 import admin, auth
 from app.core.config import Settings, get_settings
 from app.core.jwt import KeySet
 from app.core.logging import configure_logging
@@ -71,4 +71,5 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(well_known.router)
     app.include_router(api_v1.router)
     app.include_router(auth.router)
+    app.include_router(admin.router)
     return app

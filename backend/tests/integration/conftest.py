@@ -120,7 +120,13 @@ def uow(db_session: AsyncSession) -> UnitOfWork:
 def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
     # Запросы API идут в ту же транзакцию теста: после теста всё откатится.
     async def test_session() -> AsyncIterator[AsyncSession]:
-        yield db_session
+        try:
+            yield db_session
+        except Exception:
+            # Как в настоящем запросе: ошибка — изменения запроса не сохраняются.
+            # Откатывается только SAVEPOINT запроса, данные теста остаются.
+            await db_session.rollback()
+            raise
 
     app.dependency_overrides[get_session] = test_session
     return app

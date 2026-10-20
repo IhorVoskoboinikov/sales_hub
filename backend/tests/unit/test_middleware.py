@@ -1,6 +1,7 @@
 import re
 
 import pytest
+import structlog
 from fastapi import APIRouter, FastAPI
 from httpx import AsyncClient
 from structlog.testing import capture_logs
@@ -35,6 +36,13 @@ router = APIRouter(prefix="/api/v1/test")
 @router.get("/items/{item_id}")
 async def get_item(item_id: int) -> dict[str, int]:
     return {"item_id": item_id}
+
+
+@router.get("/as-user")
+async def as_user() -> dict[str, str]:
+    # Так делает current_user: привязывает user_id ко всем строкам лога запроса.
+    structlog.contextvars.bind_contextvars(user_id="u-1")
+    return {"ok": "yes"}
 
 
 @pytest.fixture
@@ -82,3 +90,14 @@ def test_docs_are_hidden_in_prod() -> None:
 def test_docs_flag_overrides_profile() -> None:
     assert Settings(_env_file=None, app_env="prod", docs_enabled=True).show_docs
     assert not Settings(_env_file=None, app_env="dev", docs_enabled=False).show_docs
+
+
+async def test_user_id_does_not_leak_into_next_request(client: AsyncClient) -> None:
+    await client.get("/api/v1/test/as-user")
+
+    with capture_logs() as logs:
+        await client.get("/api/v1/test/items/1")
+
+    entry = next(e for e in logs if e["event"] == "request")
+    assert structlog.contextvars.get_contextvars().get("user_id") is None
+    assert entry.get("user_id") is None

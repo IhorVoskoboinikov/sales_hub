@@ -22,6 +22,7 @@ from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.invites import InviteService
+from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
 from app.uow import UnitOfWork
 
@@ -122,6 +123,14 @@ def get_password_reset_service(
         timedelta(minutes=settings.reset_password_ttl_minutes),
         f"{settings.public_url}/docs",
     )
+
+
+def get_org_service(uow: UnitOfWork = Depends(get_uow)) -> OrganizationService:
+    return OrganizationService(uow)
+
+
+def get_team_service(uow: UnitOfWork = Depends(get_uow)) -> TeamService:
+    return TeamService(uow)
 
 
 def get_client_info(request: Request) -> ClientInfo:

@@ -4,6 +4,7 @@
 него. Коммиты сервисов внутри теста становятся SAVEPOINT-ами — таблицы чистить не нужно.
 """
 
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,7 +26,7 @@ from testcontainers.core.wait_strategies import HttpWaitStrategy
 from app.api.deps import get_session
 from app.core.config import Settings
 from app.core.security import hash_password
-from app.models import User
+from app.models import Organization, Team, User
 from app.uow import UnitOfWork
 from tests.conftest import POLICIES_DIR
 
@@ -153,6 +154,34 @@ def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
 
 PASSWORD = "correct horse battery"  # пароль всех пользователей из make_user
 
+
+@dataclass(frozen=True)
+class OrgFixture:
+    org: Organization
+    teams: list[Team]  # два отдела: «Продажі 1» и «Продажі 2»
+
+
+MakeOrg = Callable[..., Awaitable[OrgFixture]]
+
+
+@pytest.fixture
+def make_org(uow: UnitOfWork) -> MakeOrg:
+    """Организация с двумя отделами."""
+
+    async def make(slug: str | None = None) -> OrgFixture:
+        slug = slug or f"org-{uuid.uuid4().hex[:8]}"
+        org = Organization(id=uuid.uuid4(), name=slug.title(), slug=slug)
+        uow.organizations.add(org)
+        await uow.flush()
+        teams = [Team(id=uuid.uuid4(), org_id=org.id, name=f"Продажі {i}") for i in (1, 2)]
+        for team in teams:
+            uow.teams.add(team)
+        await uow.commit()
+        return OrgFixture(org, teams)
+
+    return make
+
+
 MakeUser = Callable[..., Awaitable[User]]
 
 
@@ -191,3 +220,23 @@ def token_from_email(email: dict[str, Any]) -> str:
     """Токен в письме стоит отдельной строкой после строки «Токен…:»."""
     lines: list[str] = [line.strip() for line in str(email["Text"]).splitlines()]
     return next(lines[i + 1] for i, line in enumerate(lines) if line.startswith("Токен"))
+
+
+async def member(
+    make_user: MakeUser, org: OrgFixture, role: str, team: int | None = 0, **fields: object
+) -> User:
+    """Пользователь организации с ролью. team — номер отдела (только для team_lead и sales_rep)."""
+    team_id = (
+        org.teams[team].id if team is not None and role in ("team_lead", "sales_rep") else None
+    )
+    return await make_user(
+        f"{role}-{uuid.uuid4().hex[:8]}@example.com",
+        org_id=org.org.id,
+        role=role,
+        team_id=team_id,
+        **fields,
+    )
+
+
+async def tokens_for(client: AsyncClient, user: User) -> dict[str, str]:
+    return bearer(await login(client, user.email))

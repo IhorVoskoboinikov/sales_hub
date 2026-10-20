@@ -1,0 +1,49 @@
+"""Организации: создают супер-админы (/api/v1/admin/orgs), свою смотрит и настраивает её
+админ (/api/v1/org). org_id в путях организации нет — она одна и берётся из пользователя."""
+
+from fastapi import Depends, status
+
+from app.api.deps import get_org_service
+from app.api.v1 import admin_router, protected_router
+from app.api.v1.errors import CONFLICT, PROTECTED
+from app.authz.access import Access
+from app.authz.deps import authorize
+from app.schemas.organizations import OrgCreate, OrgOut, OrgUpdate
+from app.services.organizations import OrganizationService
+
+
+@admin_router.get("/orgs", responses=PROTECTED)
+async def list_orgs(orgs: OrganizationService = Depends(get_org_service)) -> list[OrgOut]:
+    """Все организации."""
+    return [OrgOut.model_validate(org) for org in await orgs.list_all()]
+
+
+@admin_router.post(
+    "/orgs", status_code=status.HTTP_201_CREATED, responses={**PROTECTED, **CONFLICT}
+)
+async def create_org(
+    body: OrgCreate, orgs: OrganizationService = Depends(get_org_service)
+) -> OrgOut:
+    """Создать организацию. Дальше — пригласить её первого админа:
+    POST /api/v1/admin/orgs/{org_id}/invites."""
+    return OrgOut.model_validate(await orgs.create(body.model_dump()))
+
+
+@protected_router.get("/org", tags=["org"], responses=PROTECTED)
+async def get_org(
+    access: Access = Depends(authorize), orgs: OrganizationService = Depends(get_org_service)
+) -> OrgOut:
+    """Моя организация."""
+    return OrgOut.model_validate(await orgs.get_mine(access))
+
+
+@protected_router.patch("/org", tags=["org"], responses=PROTECTED)
+async def update_org(
+    body: OrgUpdate,
+    access: Access = Depends(authorize),
+    orgs: OrganizationService = Depends(get_org_service),
+) -> OrgOut:
+    """Настройки организации: название, валюта отображения, часовой пояс."""
+    return OrgOut.model_validate(
+        await orgs.update_mine(access, body.model_dump(exclude_unset=True))
+    )

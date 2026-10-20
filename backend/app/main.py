@@ -8,7 +8,14 @@ from fastapi import FastAPI
 from redis.asyncio import Redis
 
 from app.api import health, well_known
-from app.api.v1 import admin, admin_router, auth, protected_router
+from app.api.v1 import (  # noqa: F401 — модули с эндпоинтами регистрируют маршруты
+    admin,
+    admin_router,
+    auth,
+    organizations,
+    protected_router,
+    teams,
+)
 from app.authz.opa import OpaClient
 from app.authz.roles import RoleCatalog
 from app.core.config import Settings, get_settings

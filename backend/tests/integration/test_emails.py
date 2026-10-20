@@ -14,7 +14,15 @@ async def test_smtp_sender_delivers_text_and_html(mailpit: Mailpit) -> None:
     )
 
     await sender.send(
-        render_email("invite", to, token="tok-42", docs_url="http://x/docs", expires_at="завтра")
+        render_email(
+            "invite",
+            to,
+            token="tok-42",
+            org_name="Acme",
+            role_title="Спостерігач",
+            docs_url="http://x/docs",
+            expires_at="завтра",
+        )
     )
 
     [email] = await read_emails(mailpit, to)

@@ -7,7 +7,7 @@ from httpx import AsyncClient
 
 from app.repositories import rate_limiter
 from app.repositories.rate_limiter import Limit
-from tests.integration.conftest import PASSWORD, MakeUser, bearer, login
+from tests.integration.conftest import PASSWORD, MakeOrg, MakeUser, login, member, tokens_for
 
 
 def unique_email() -> str:
@@ -65,20 +65,26 @@ async def test_forgot_is_limited_even_for_unknown_email(client: AsyncClient) -> 
     assert statuses == [202, 202, 202, 429]
 
 
-async def test_invites_are_limited_per_inviter(
-    client: AsyncClient, make_user: MakeUser, monkeypatch: pytest.MonkeyPatch
+async def test_invites_are_limited_per_organization(
+    client: AsyncClient,
+    make_user: MakeUser,
+    make_org: MakeOrg,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(rate_limiter, "INVITE", Limit("invite", 2, 3600))
-    admin = await make_user(unique_email(), is_superadmin=True)
-    tokens = await login(client, admin.email)
+    org = await make_org()
+    first = await tokens_for(client, await member(make_user, org, "org_admin"))
+    second = await tokens_for(client, await member(make_user, org, "org_admin"))
 
     statuses = [
         (
             await client.post(
-                "/api/v1/admin/invites", json={"email": unique_email()}, headers=bearer(tokens)
+                "/api/v1/invites",
+                json={"email": unique_email(), "role": "viewer"},
+                headers=admin,
             )
         ).status_code
-        for _ in range(3)
+        for admin in (first, second, second)  # лимит общий на организацию, а не на админа
     ]
 
     assert statuses == [202, 202, 429]

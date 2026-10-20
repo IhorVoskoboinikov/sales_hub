@@ -12,8 +12,10 @@ from app.api.deps import (
     get_client_info,
     get_invite_service,
     get_password_reset_service,
+    get_roles,
     get_uow,
 )
+from app.authz.roles import RoleCatalog
 from app.errors import NotFound
 from app.schemas.auth import (
     InviteAcceptIn,
@@ -79,12 +81,15 @@ async def refresh(
 async def me(
     user: CurrentUser = Depends(current_user),
     uow: UnitOfWork = Depends(get_uow),
+    roles: RoleCatalog = Depends(get_roles),
 ) -> MeOut:
-    """Мой профиль. Роль, отдел и права появятся на этапе 3."""
+    """Мой профиль, роль, отдел и права (действия роли с уровнями из data.yaml)."""
     row = await uow.users.get(user.id)
     if row is None:  # удалили между проверкой токена и этим запросом
         raise NotFound(entity="user")
-    return MeOut.model_validate(row)
+    out = MeOut.model_validate(row)
+    out.permissions = dict(roles.permissions(row.role))
+    return out
 
 
 @router.post("/logout", status_code=status.HTTP_204_NO_CONTENT, responses=AUTH_ERRORS)

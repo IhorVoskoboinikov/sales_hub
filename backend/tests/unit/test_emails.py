@@ -32,6 +32,8 @@ def test_invite_email_has_token_in_text_and_html() -> None:
         "invite",
         "ivan@example.com",
         token="tok-123",
+        org_name="Acme",
+        role_title="Менеджер з продажів",
         docs_url="http://localhost:8000/docs",
         expires_at="27.10.2026 12:00 UTC",
     )

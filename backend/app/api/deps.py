@@ -17,7 +17,7 @@ from app.core.config import Settings
 from app.core.jwt import KeySet
 from app.emails.mailer import BackgroundMailer
 from app.emails.sender import EmailSender, Mailer
-from app.errors import Forbidden, Unauthorized
+from app.errors import Unauthorized
 from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
@@ -152,11 +152,4 @@ async def current_user(
     user = await auth.authenticate(token)
     request.state.user_id = user.id  # для access-лога
     structlog.contextvars.bind_contextvars(user_id=str(user.id))  # для остальных строк лога
-    return user
-
-
-async def require_superadmin(user: CurrentUser = Depends(current_user)) -> CurrentUser:
-    """Только супер-админ. Этап 2: OPA ещё нет, проверяем флаг; с этапа 3 это делает OPA."""
-    if not user.is_superadmin:
-        raise Forbidden()
     return user

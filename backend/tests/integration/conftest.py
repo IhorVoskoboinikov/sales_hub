@@ -157,8 +157,12 @@ PASSWORD = "correct horse battery"  # пароль всех пользовате
 
 @dataclass(frozen=True)
 class OrgFixture:
-    org: Organization
-    teams: list[Team]  # два отдела: «Продажі 1» и «Продажі 2»
+    """Простые значения, а не ORM-объекты: ответ 4xx откатывает сессию теста, и объекты
+    «протухают» — обращение к ним после этого упало бы."""
+
+    id: uuid.UUID
+    name: str
+    team_ids: list[uuid.UUID]  # два отдела: «Продажі 1» и «Продажі 2»
 
 
 MakeOrg = Callable[..., Awaitable[OrgFixture]]
@@ -177,7 +181,7 @@ def make_org(uow: UnitOfWork) -> MakeOrg:
         for team in teams:
             uow.teams.add(team)
         await uow.commit()
-        return OrgFixture(org, teams)
+        return OrgFixture(org.id, org.name, [team.id for team in teams])
 
     return make
 
@@ -226,12 +230,11 @@ async def member(
     make_user: MakeUser, org: OrgFixture, role: str, team: int | None = 0, **fields: object
 ) -> User:
     """Пользователь организации с ролью. team — номер отдела (только для team_lead и sales_rep)."""
-    team_id = (
-        org.teams[team].id if team is not None and role in ("team_lead", "sales_rep") else None
-    )
+    needs_team = team is not None and role in ("team_lead", "sales_rep")
+    team_id = org.team_ids[team] if team is not None and needs_team else None
     return await make_user(
         f"{role}-{uuid.uuid4().hex[:8]}@example.com",
-        org_id=org.org.id,
+        org_id=org.id,
         role=role,
         team_id=team_id,
         **fields,

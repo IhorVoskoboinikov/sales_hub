@@ -73,7 +73,7 @@ async def test_everyone_reads_own_org_only_admin_changes_it(
     rep = await tokens_for(client, await member(make_user, org, "sales_rep"))
 
     seen = await client.get("/api/v1/org", headers=rep)
-    assert seen.json()["id"] == str(org.org.id)
+    assert seen.json()["id"] == str(org.id)
 
     forbidden = await client.patch("/api/v1/org", json={"name": "Hacked"}, headers=rep)
     assert forbidden.status_code == 403
@@ -81,7 +81,7 @@ async def test_everyone_reads_own_org_only_admin_changes_it(
     changed = await client.patch("/api/v1/org", json={"display_currency": "USD"}, headers=admin)
     assert changed.status_code == 200
     assert changed.json()["display_currency"] == "USD"
-    assert changed.json()["name"] == org.org.name  # не переданное поле не изменилось
+    assert changed.json()["name"] == org.name  # не переданное поле не изменилось
 
 
 async def test_teams_crud(client: AsyncClient, make_user: MakeUser, make_org: MakeOrg) -> None:
@@ -113,7 +113,7 @@ async def test_team_with_people_cannot_be_deleted(
     admin = await tokens_for(client, await member(make_user, org, "org_admin"))
     await member(make_user, org, "sales_rep", team=0)
 
-    resp = await client.delete(f"/api/v1/teams/{org.teams[0].id}", headers=admin)
+    resp = await client.delete(f"/api/v1/teams/{org.team_ids[0]}", headers=admin)
 
     assert resp.status_code == 409
     assert resp.json()["code"] == "team.has_members"
@@ -123,9 +123,8 @@ async def test_other_org_team_is_not_found(
     client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
 ) -> None:
     mine, other = await make_org(), await make_org()
-    # id — в переменных: ответ 404 откатывает сессию теста, и объекты «протухают».
-    mine_ids = {str(t.id) for t in mine.teams}
-    other_team = other.teams[0].id
+    mine_ids = {str(team_id) for team_id in mine.team_ids}
+    other_team = other.team_ids[0]
     admin = await tokens_for(client, await member(make_user, mine, "org_admin"))
 
     resp = await client.patch(f"/api/v1/teams/{other_team}", json={"name": "Моє"}, headers=admin)

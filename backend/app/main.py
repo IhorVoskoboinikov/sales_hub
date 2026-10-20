@@ -9,9 +9,9 @@ from redis.asyncio import Redis
 
 from app.api import health, well_known
 from app.api.v1 import (  # noqa: F401 — модули с эндпоинтами регистрируют маршруты
-    admin,
     admin_router,
     auth,
+    invites,
     organizations,
     protected_router,
     teams,
@@ -84,7 +84,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(well_known.router)
     app.include_router(auth.router)
-    app.include_router(admin.router)  # этап 2: /admin/invites, удаляется в шаге 3.6
     # Модули с эндпоинтами импортированы выше: include_router копирует уже объявленные маршруты.
     app.include_router(protected_router)
     app.include_router(admin_router)

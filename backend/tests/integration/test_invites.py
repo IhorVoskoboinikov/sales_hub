@@ -1,4 +1,5 @@
-"""Приглашения этапа 2: супер-админ приглашает → письмо → invite/accept → вход."""
+"""Приглашения (разделы 4, 5): супер-админ → первый админ организации → админ приглашает
+людей с ролью и отделом → письмо → invite/accept → вход в своей роли."""
 
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -10,11 +11,15 @@ from app.models import EmailToken
 from app.uow import UnitOfWork
 from tests.integration.conftest import (
     Mailpit,
+    MakeOrg,
     MakeUser,
+    OrgFixture,
     bearer,
     login,
+    member,
     read_emails,
     token_from_email,
+    tokens_for,
 )
 
 NEW_PASSWORD = "brand new password"
@@ -25,9 +30,17 @@ def new_email() -> str:
     return f"new-{uuid.uuid4().hex[:8]}@example.com"
 
 
-async def invite(client: AsyncClient, admin_tokens: dict[str, str], email: str) -> Response:
+async def invite(
+    client: AsyncClient,
+    admin: dict[str, str],
+    email: str,
+    role: str = "sales_rep",
+    team_id: object = None,
+) -> Response:
     return await client.post(
-        "/api/v1/admin/invites", json={"email": email}, headers=bearer(admin_tokens)
+        "/api/v1/invites",
+        json={"email": email, "role": role, "team_id": str(team_id) if team_id else None},
+        headers=admin,
     )
 
 
@@ -37,59 +50,134 @@ async def accept(client: AsyncClient, token: str, password: str = NEW_PASSWORD) 
     )
 
 
-async def admin_login(client: AsyncClient, make_user: MakeUser) -> dict[str, str]:
-    admin = await make_user(f"root-{uuid.uuid4().hex[:8]}@example.com", is_superadmin=True)
-    return await login(client, admin.email)
+async def org_admin(client: AsyncClient, make_user: MakeUser, org: OrgFixture) -> dict[str, str]:
+    return await tokens_for(client, await member(make_user, org, "org_admin"))
 
 
-async def test_full_invite_flow(client: AsyncClient, make_user: MakeUser, mailpit: Mailpit) -> None:
-    admin = await admin_login(client, make_user)
+async def invite_token(mailpit: Mailpit, email: str) -> str:
+    return token_from_email((await read_emails(mailpit, email))[0])
+
+
+async def test_superadmin_invites_first_org_admin(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+) -> None:
+    org = await make_org()
+    org_id = org.id
+    root = await tokens_for(
+        client, await make_user(f"root-{uuid.uuid4().hex[:8]}@example.com", is_superadmin=True)
+    )
     email = new_email()
 
-    resp = await invite(client, admin, email)
+    resp = await client.post(
+        f"/api/v1/admin/orgs/{org_id}/invites", json={"email": email}, headers=root
+    )
 
     assert resp.status_code == 202
-    assert resp.json()["email"] == email
     [letter] = await read_emails(mailpit, email)
-    assert letter["Subject"] == "Запрошення до SalesHub"
-
+    assert "Адміністратор організації" in letter["Text"]
     accepted = await accept(client, token_from_email(letter))
     assert accepted.status_code == 201
-    assert accepted.json()["email"] == email
-    assert accepted.json()["is_superadmin"] is False
-    assert accepted.json()["email_verified_at"] is not None
+    me = await client.get(
+        "/api/v1/auth/me", headers=bearer(await login(client, email, NEW_PASSWORD))
+    )
+    assert me.json()["role"] == "org_admin"
+    assert me.json()["org_id"] == str(org_id)
+    assert me.json()["team_id"] is None
 
-    tokens = await login(client, email, NEW_PASSWORD)
-    me = await client.get("/api/v1/auth/me", headers=bearer(tokens))
-    assert me.json()["email"] == email
+
+async def test_invite_to_unknown_org_is_404(client: AsyncClient, make_user: MakeUser) -> None:
+    root = await tokens_for(
+        client, await make_user(f"root-{uuid.uuid4().hex[:8]}@example.com", is_superadmin=True)
+    )
+
+    resp = await client.post(
+        f"/api/v1/admin/orgs/{uuid.uuid4()}/invites", json={"email": new_email()}, headers=root
+    )
+
+    assert resp.status_code == 404
 
 
-async def test_only_superadmin_can_invite(client: AsyncClient, make_user: MakeUser) -> None:
-    user = await make_user("ivan@example.com")
-    tokens = await login(client, user.email)
+async def test_org_admin_invites_sales_rep_into_team(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+) -> None:
+    org = await make_org()
+    team_id = org.team_ids[1]
+    admin = await org_admin(client, make_user, org)
+    email = new_email()
 
-    resp = await invite(client, tokens, new_email())
+    resp = await invite(client, admin, email, "sales_rep", team_id)
+
+    assert resp.status_code == 202
+    assert (await accept(client, await invite_token(mailpit, email))).status_code == 201
+    me = await client.get(
+        "/api/v1/auth/me", headers=bearer(await login(client, email, NEW_PASSWORD))
+    )
+    assert (me.json()["role"], me.json()["team_id"]) == ("sales_rep", str(team_id))
+
+
+async def test_team_rules(client: AsyncClient, make_user: MakeUser, make_org: MakeOrg) -> None:
+    org, other = await make_org(), await make_org()
+    admin = await org_admin(client, make_user, org)
+
+    no_team = await invite(client, admin, new_email(), "team_lead")
+    extra_team = await invite(client, admin, new_email(), "viewer", org.team_ids[0])
+    foreign_team = await invite(client, admin, new_email(), "sales_rep", other.team_ids[0])
+
+    assert no_team.json()["code"] == "member.team_required"
+    assert extra_team.json()["code"] == "member.team_not_allowed"
+    assert foreign_team.json()["code"] == "member.team_not_found"
+    for resp in (no_team, extra_team, foreign_team):
+        assert resp.status_code == 422
+
+
+async def test_superadmin_role_cannot_be_invited(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
+) -> None:
+    admin = await org_admin(client, make_user, await make_org())
+
+    resp = await invite(client, admin, new_email(), "super_admin")
+
+    assert resp.status_code == 422
+
+
+async def test_only_org_admin_invites(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
+) -> None:
+    org = await make_org()
+    lead = await tokens_for(client, await member(make_user, org, "team_lead"))
+
+    resp = await invite(client, lead, new_email(), "sales_rep", org.team_ids[0])
 
     assert resp.status_code == 403
-    assert resp.json()["code"] == "forbidden"
-    assert (await client.post("/api/v1/admin/invites", json={"email": "a@b.cd"})).status_code == 401
+    assert resp.json()["details"] == {"action": "member:manage"}
 
 
-async def test_cannot_invite_existing_email(client: AsyncClient, make_user: MakeUser) -> None:
-    admin = await admin_login(client, make_user)
-    await make_user("ivan@example.com")
+async def test_taken_email_looks_like_success_and_warns_the_person(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+) -> None:
+    org = await make_org()
+    admin = await org_admin(client, make_user, org)
+    taken = new_email()
+    await make_user(taken)
+    fresh = new_email()
 
-    resp = await invite(client, admin, "IVAN@example.com")
+    for_taken = await invite(client, admin, taken, "viewer")
+    for_fresh = await invite(client, admin, fresh, "viewer")
 
-    assert resp.status_code == 409
-    assert resp.json()["code"] == "invite.email_taken"
+    assert for_taken.status_code == for_fresh.status_code == 202
+    assert for_taken.json().keys() == for_fresh.json().keys()
+    [letter] = await read_emails(mailpit, taken)
+    assert "уже є обліковий запис" in letter["Text"]
+    assert "Токен" not in letter["Text"]
 
 
-async def test_token_works_once(client: AsyncClient, make_user: MakeUser, mailpit: Mailpit) -> None:
-    admin = await admin_login(client, make_user)
+async def test_token_works_once(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+) -> None:
+    admin = await org_admin(client, make_user, await make_org())
     email = new_email()
-    await invite(client, admin, email)
-    token = token_from_email((await read_emails(mailpit, email))[0])
+    await invite(client, admin, email, "viewer")
+    token = await invite_token(mailpit, email)
 
     assert (await accept(client, token)).status_code == 201
     again = await accept(client, token)
@@ -99,12 +187,12 @@ async def test_token_works_once(client: AsyncClient, make_user: MakeUser, mailpi
 
 
 async def test_new_invite_cancels_previous(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
 ) -> None:
-    admin = await admin_login(client, make_user)
+    admin = await org_admin(client, make_user, await make_org())
     email = new_email()
-    await invite(client, admin, email)
-    await invite(client, admin, email)
+    await invite(client, admin, email, "viewer")
+    await invite(client, admin, email, "viewer")
     newest, oldest = await read_emails(mailpit, email)
 
     assert (await accept(client, token_from_email(oldest))).json()["code"] == "email_token.invalid"
@@ -112,30 +200,34 @@ async def test_new_invite_cancels_previous(
 
 
 async def test_expired_invite(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit, uow: UnitOfWork
+    client: AsyncClient,
+    make_user: MakeUser,
+    make_org: MakeOrg,
+    mailpit: Mailpit,
+    uow: UnitOfWork,
 ) -> None:
-    admin = await admin_login(client, make_user)
+    admin = await org_admin(client, make_user, await make_org())
     email = new_email()
-    await invite(client, admin, email)
+    await invite(client, admin, email, "viewer")
     await uow.session.execute(
         update(EmailToken)
         .where(EmailToken.email == email)
         .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
     )
 
-    resp = await accept(client, token_from_email((await read_emails(mailpit, email))[0]))
+    resp = await accept(client, await invite_token(mailpit, email))
 
     assert resp.status_code == 422
     assert resp.json()["code"] == "email_token.expired"
 
 
 async def test_accept_checks_password_rules(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
 ) -> None:
-    admin = await admin_login(client, make_user)
+    admin = await org_admin(client, make_user, await make_org())
     email = new_email()
-    await invite(client, admin, email)
-    token = token_from_email((await read_emails(mailpit, email))[0])
+    await invite(client, admin, email, "viewer")
+    token = await invite_token(mailpit, email)
 
     short = await accept(client, token, "s3cr-pw")
     same_as_email = await accept(client, token, email)
@@ -148,23 +240,41 @@ async def test_accept_checks_password_rules(
     assert (await accept(client, token)).status_code == 201
 
 
-async def test_invalid_email_is_rejected(client: AsyncClient, make_user: MakeUser) -> None:
-    admin = await admin_login(client, make_user)
-
-    resp = await invite(client, admin, "not-an-email")
-
-    assert resp.status_code == 422
-
-
 async def test_accept_fails_if_email_registered_meanwhile(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
 ) -> None:
-    admin = await admin_login(client, make_user)
+    admin = await org_admin(client, make_user, await make_org())
     email = new_email()
-    await invite(client, admin, email)
+    await invite(client, admin, email, "viewer")
     await make_user(email)  # например, приняли другое приглашение
 
-    resp = await accept(client, token_from_email((await read_emails(mailpit, email))[0]))
+    resp = await accept(client, await invite_token(mailpit, email))
 
     assert resp.status_code == 409
-    assert resp.json()["code"] == "invite.email_taken"
+    assert resp.json()["code"] == "invite.stale"
+
+
+async def test_accept_fails_if_team_was_deleted(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+) -> None:
+    org = await make_org()
+    team_id = org.team_ids[0]
+    admin = await org_admin(client, make_user, org)
+    email = new_email()
+    await invite(client, admin, email, "sales_rep", team_id)
+    assert (await client.delete(f"/api/v1/teams/{team_id}", headers=admin)).status_code == 204
+
+    resp = await accept(client, await invite_token(mailpit, email))
+
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "invite.stale"
+
+
+async def test_invalid_email_is_rejected(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
+) -> None:
+    admin = await org_admin(client, make_user, await make_org())
+
+    resp = await invite(client, admin, "not-an-email", "viewer")
+
+    assert resp.status_code == 422

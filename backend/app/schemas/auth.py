@@ -5,6 +5,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.core.security import MAX_PASSWORD_LENGTH, MIN_PASSWORD_LENGTH
+from app.models import Role
 
 
 class TokenOut(BaseModel):
@@ -22,6 +23,15 @@ class MeOut(BaseModel):
     id: uuid.UUID
     email: str
     is_superadmin: bool
+    org_id: uuid.UUID | None
+    team_id: uuid.UUID | None
+    role: str | None
+    permissions: dict[str, str] = Field(
+        default_factory=dict,
+        description="Действия роли с уровнями из data.yaml: фронт по ним прячет кнопки. "
+        "У супер-админа пусто — ему доступны только /api/v1/admin/*",
+        examples=[{"member:read": "team", "org:read": "org"}],
+    )
     timezone: str | None = Field(description="None — как у организации")
     email_verified_at: datetime | None
     last_login_at: datetime | None
@@ -49,7 +59,19 @@ EmailTokenStr = Annotated[str, Field(max_length=256, description="Токен и�
 
 
 class InviteIn(BaseModel):
+    """Первый админ организации (супер-админ): роль всегда org_admin."""
+
     email: EmailStr
+
+
+class MemberInviteIn(BaseModel):
+    """Приглашение в свою организацию (админ организации)."""
+
+    email: EmailStr
+    role: Role
+    team_id: uuid.UUID | None = Field(
+        default=None, description="Обязателен для team_lead и sales_rep, у остальных — пусто"
+    )
 
 
 class InviteOut(BaseModel):

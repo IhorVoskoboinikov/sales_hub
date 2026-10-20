@@ -20,7 +20,10 @@ ERRORS: dict[str, str] = {
     "unavailable": "Сервіс тимчасово недоступний",
     "http_error": "Помилка запиту",
     # Приглашения и токены из писем
-    "invite.email_taken": "Користувач з таким email уже існує",
+    "invite.stale": "Запрошення застаріло: email уже зайнятий або відділ видалено",
+    "member.team_required": "Для цієї ролі потрібен відділ",
+    "member.team_not_allowed": "Для цієї ролі відділ не вказується",
+    "member.team_not_found": "Такого відділу немає в організації",
     "email_token.invalid": "Токен недійсний або вже використаний",
     "email_token.expired": "Термін дії токена минув",
     # Организации и отделы
@@ -35,9 +38,18 @@ ERRORS: dict[str, str] = {
     "password.same_as_email": "Пароль не може збігатися з email",
 }
 
+# Названия ролей — в письмах и для людей. Коды ролей (org_admin…) не переводятся.
+ROLE_TITLES: dict[str, str] = {
+    "org_admin": "Адміністратор організації",
+    "team_lead": "Керівник відділу продажів",
+    "sales_rep": "Менеджер з продажів",
+    "viewer": "Спостерігач",
+}
+
 # Темы писем по имени шаблона (app/texts/emails/<имя>.txt и .html).
 EMAIL_SUBJECTS: dict[str, str] = {
     "invite": "Запрошення до SalesHub",
+    "already_member": "Запрошення до SalesHub",
     "reset_password": "Зміна пароля в SalesHub",
 }
 

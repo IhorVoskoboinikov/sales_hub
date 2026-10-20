@@ -1,7 +1,8 @@
 Вітаємо!
 
-Вас запросили до SalesHub. Щоб прийняти запрошення, задайте пароль: надішліть токен
-і пароль на POST /api/v1/auth/invite/accept (у Swagger: {{ docs_url }}).
+Вас запросили до організації «{{ org_name }}» у SalesHub з роллю «{{ role_title }}».
+Щоб прийняти запрошення, задайте пароль: надішліть токен і пароль на
+POST /api/v1/auth/invite/accept (у Swagger: {{ docs_url }}).
 
 Токен запрошення:
 {{ token }}

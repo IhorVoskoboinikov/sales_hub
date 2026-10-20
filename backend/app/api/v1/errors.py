@@ -13,3 +13,5 @@ PROTECTED: Responses = {
 }
 NOT_FOUND: Responses = {404: {"model": ErrorOut, "description": "Нет такой записи в организации"}}
 CONFLICT: Responses = {409: {"model": ErrorOut}}
+RATE_LIMITED: Responses = {429: {"model": ErrorOut, "description": "Слишком часто"}}
+VALIDATION: Responses = {422: {"model": ErrorOut}}

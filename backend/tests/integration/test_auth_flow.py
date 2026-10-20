@@ -1,6 +1,7 @@
 """Весь сценарий раздела 4 одним тестом — то же, что проходится руками в Swagger:
 
-супер-админ → приглашение → письмо → invite/accept → логин → /me → истёк access → refresh →
+супер-админ → организация → приглашение её админа → письмо → invite/accept → логин → /me →
+истёк access → refresh →
 повтор старого refresh (кража) → отзыв сессии → забыл пароль → письмо → сброс → старые
 токены мертвы, вход с новым паролем. Письма читаются через API Mailpit, сроки — freezegun.
 """
@@ -15,7 +16,17 @@ from httpx import AsyncClient
 
 from app.services.users import create_superadmin
 from app.uow import UnitOfWork
-from tests.integration.conftest import Mailpit, bearer, login, read_emails, token_from_email
+from tests.integration.conftest import (
+    Mailpit,
+    MakeOrg,
+    MakeUser,
+    bearer,
+    login,
+    member,
+    read_emails,
+    token_from_email,
+    tokens_for,
+)
 
 ADMIN_PASSWORD = "admin password 1"
 USER_PASSWORD = "first password 1"
@@ -33,10 +44,18 @@ async def test_whole_auth_scenario(client: AsyncClient, uow: UnitOfWork, mailpit
     await create_superadmin(uow, admin_email, ADMIN_PASSWORD)
     admin = await login(client, admin_email, ADMIN_PASSWORD)
 
-    # 2. Приглашение → письмо в Mailpit.
+    # 2. Организация → приглашение её первого админа → письмо в Mailpit.
+    org = await client.post(
+        "/api/v1/admin/orgs",
+        json={"name": "Acme", "slug": f"acme-{uuid.uuid4().hex[:6]}"},
+        headers=bearer(admin),
+    )
+    assert org.status_code == 201
     email = f"olena-{uuid.uuid4().hex[:8]}@example.com"
     invited = await client.post(
-        "/api/v1/admin/invites", json={"email": email}, headers=bearer(admin)
+        f"/api/v1/admin/orgs/{org.json()['id']}/invites",
+        json={"email": email},
+        headers=bearer(admin),
     )
     assert invited.status_code == 202
     [invite_letter] = await read_emails(mailpit, email)
@@ -50,6 +69,8 @@ async def test_whole_auth_scenario(client: AsyncClient, uow: UnitOfWork, mailpit
     first = await login(client, email, USER_PASSWORD)
     me = await client.get("/api/v1/auth/me", headers=bearer(first))
     assert me.json()["email"] == email
+    assert me.json()["role"] == "org_admin"
+    assert me.json()["permissions"]["member:manage"] == "org"
 
     # 4. Через час access истёк — клиент видит auth.token_expired и делает refresh.
     with later(hours=1, seconds=1):
@@ -113,13 +134,12 @@ async def test_session_cannot_outlive_30_days(client: AsyncClient, uow: UnitOfWo
 
 
 async def test_invite_expires_after_7_days(
-    client: AsyncClient, uow: UnitOfWork, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
 ) -> None:
-    admin_email = f"root-{uuid.uuid4().hex[:8]}@example.com"
-    await create_superadmin(uow, admin_email, ADMIN_PASSWORD)
-    admin = await login(client, admin_email, ADMIN_PASSWORD)
+    org = await make_org()
+    admin = await tokens_for(client, await member(make_user, org, "org_admin"))
     email = f"late-{uuid.uuid4().hex[:8]}@example.com"
-    await client.post("/api/v1/admin/invites", json={"email": email}, headers=bearer(admin))
+    await client.post("/api/v1/invites", json={"email": email, "role": "viewer"}, headers=admin)
     token = token_from_email((await read_emails(mailpit, email))[0])
 
     with later(days=7, seconds=1):

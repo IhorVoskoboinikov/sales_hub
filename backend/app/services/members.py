@@ -92,6 +92,6 @@ class MemberService:
         team_id = changes.team_id if changes.team_given else user.team_id
         if team_id is None:
             raise ValidationFailed("member.team_required", field="team_id")
-        if await self.uow.teams.get(team_id, access.org_id) is None:
+        if await self.uow.teams.get(team_id, access.org_id, lock="key_share") is None:
             raise ValidationFailed("member.team_not_found", field="team_id")
         return team_id

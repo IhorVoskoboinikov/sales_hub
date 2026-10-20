@@ -106,19 +106,24 @@ async def test_rules(client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
         assert (resp.status_code, resp.json()["code"]) == (status, code)
 
 
-async def test_cannot_remove_last_admin(
+async def test_demoted_admin_loses_member_management(
     client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
 ) -> None:
     org = await make_org()
     first = await member(make_user, org, "org_admin")
     second = await member(make_user, org, "org_admin")
+    first_id = first.id
     first_tokens = await tokens_for(client, first)
     second_tokens = await tokens_for(client, second)
 
     demoted = await patch(client, first_tokens, second.id, role="viewer")
     assert demoted.status_code == 200
-    # second теперь viewer и не может управлять людьми; first — единственный админ.
-    assert (await patch(client, second_tokens, first.id, role="viewer")).status_code == 403
+
+    # second теперь viewer: управлять людьми OPA ему уже не даёт — со следующего же запроса.
+    # (Правило «последний админ» через API недостижимо — его проверяет тест на гонку.)
+    resp = await patch(client, second_tokens, first_id, role="viewer")
+    assert resp.status_code == 403
+    assert resp.json()["details"] == {"action": "member:manage"}
 
 
 async def test_other_org_user_is_not_found(

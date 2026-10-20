@@ -132,3 +132,14 @@ async def test_other_org_team_is_not_found(
     assert resp.status_code == 404
     listed = {t["id"] for t in (await client.get("/api/v1/teams", headers=admin)).json()}
     assert listed == mine_ids
+
+
+async def test_explicit_null_in_org_settings_is_422(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
+) -> None:
+    admin = await tokens_for(client, await member(make_user, await make_org(), "org_admin"))
+
+    resp = await client.patch("/api/v1/org", json={"timezone": None}, headers=admin)
+
+    assert resp.status_code == 422
+    assert resp.json()["details"]["errors"][0]["loc"] == ["body", "timezone"]

@@ -37,8 +37,11 @@ def unique(prefix: str) -> str:
 
 @dataclass(frozen=True)
 class Case:
-    """Как вызвать эндпоинт. target — чей объект в пути: None — пути без id."""
+    """Как вызвать эндпоинт и какое действие он должен требовать. target — чей объект в пути:
+    None — пути без id. Действие записано здесь ещё раз намеренно: если в routes.rego его
+    поменяют (например, переименование отдела станет org:read), тест упадёт, а не подстроится."""
 
+    action: str
     body: Callable[[], dict[str, Any]] | None = None
     targets: tuple[str | None, ...] = (None,)
 
@@ -46,23 +49,27 @@ class Case:
 # Описание каждого маршрута routes.rego: тело запроса и какие объекты подставлять в путь.
 # same_org — объект моей организации, other_org — чужой.
 CASES: dict[str, Case] = {
-    "GET /api/v1/admin/orgs": Case(),
-    "POST /api/v1/admin/orgs": Case(lambda: {"name": "Acme", "slug": unique("acme")}),
+    "GET /api/v1/admin/orgs": Case("admin:orgs"),
+    "POST /api/v1/admin/orgs": Case("admin:orgs", lambda: {"name": "Acme", "slug": unique("acme")}),
     "POST /api/v1/admin/orgs/{org_id}/invites": Case(
-        lambda: {"email": f"{unique('boss')}@example.com"}, ("same_org", "other_org")
+        "admin:orgs",
+        lambda: {"email": f"{unique('boss')}@example.com"},
+        ("same_org", "other_org"),
     ),
-    "GET /api/v1/org": Case(),
-    "PATCH /api/v1/org": Case(lambda: {}),
-    "GET /api/v1/teams": Case(),
-    "POST /api/v1/teams": Case(lambda: {"name": unique("Відділ")}),
+    "GET /api/v1/org": Case("org:read"),
+    "PATCH /api/v1/org": Case("org:manage", lambda: {}),
+    "GET /api/v1/teams": Case("org:read"),
+    "POST /api/v1/teams": Case("org:manage", lambda: {"name": unique("Відділ")}),
     "PATCH /api/v1/teams/{team_id}": Case(
-        lambda: {"name": unique("Відділ")}, ("same_org", "other_org")
+        "org:manage", lambda: {"name": unique("Відділ")}, ("same_org", "other_org")
     ),
-    "DELETE /api/v1/teams/{team_id}": Case(None, ("same_org", "other_org")),
-    "GET /api/v1/users": Case(),
-    "PATCH /api/v1/users/{user_id}": Case(lambda: {"is_active": True}, ("same_org", "other_org")),
+    "DELETE /api/v1/teams/{team_id}": Case("org:manage", None, ("same_org", "other_org")),
+    "GET /api/v1/users": Case("member:read"),
+    "PATCH /api/v1/users/{user_id}": Case(
+        "member:manage", lambda: {"is_active": True}, ("same_org", "other_org")
+    ),
     "POST /api/v1/invites": Case(
-        lambda: {"email": f"{unique('rep')}@example.com", "role": "viewer"}
+        "member:manage", lambda: {"email": f"{unique('rep')}@example.com", "role": "viewer"}
     ),
 }
 
@@ -85,6 +92,8 @@ def all_cases() -> list[tuple[str, str, str | None]]:
 
 async def test_every_route_has_a_case(route_actions: dict[str, str]) -> None:
     assert set(route_actions) == set(CASES), "опишите новый маршрут в CASES"
+    changed = {r: a for r, a in route_actions.items() if CASES[r].action != a}
+    assert changed == {}, "действие в routes.rego изменилось — проверьте, что так и задумано"
 
 
 def expected_status(role: str, action: str, target: str | None, success: int) -> int:
@@ -166,5 +175,5 @@ async def test_access(
         headers={"Authorization": f"Bearer {token}"},
     )
 
-    expected = expected_status(role, route_actions[route], target, success)
+    expected = expected_status(role, case.action, target, success)
     assert resp.status_code == expected, resp.text

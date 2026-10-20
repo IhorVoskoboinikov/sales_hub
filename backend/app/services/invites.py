@@ -82,7 +82,9 @@ class InviteService:
         expires_at = datetime.now(UTC) + self.ttl
         invite = {"role": role.value, "team_id": str(team_id) if team_id else None}
         if await self.uow.users.get_by_email(email) is not None:
-            self._audit(actor_id, org.id, "invite.email_taken", email, invite)
+            # В журнал организации — то же, что при обычном приглашении: журнал читают её
+            # админы (audit:read), и отдельная запись выдала бы, что email занят.
+            self._audit(actor_id, org.id, "invite.created", email, invite)
             await self.uow.commit()
             # Ответ тот же 202: админ чужой организации не должен узнать, что email занят.
             # А сам человек получит письмо и поймёт, что его пытались пригласить.
@@ -122,7 +124,11 @@ class InviteService:
         # Пока письмо шло, всё могло поменяться: email заняли, отдел или организацию удалили.
         stale = await self.uow.users.get_by_email(token.email) is not None or (
             await self.uow.organizations.get(org_id) is None
-            or (team_id is not None and await self.uow.teams.get(team_id, org_id) is None)
+            # FOR KEY SHARE: отдел не удалят, пока не закоммитим (иначе 500 из-за FK).
+            or (
+                team_id is not None
+                and await self.uow.teams.get(team_id, org_id, lock="key_share") is None
+            )
         )
         if stale:
             raise Conflict("invite.stale")

@@ -5,9 +5,9 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 from httpx import AsyncClient, Response
-from sqlalchemy import update
+from sqlalchemy import select, update
 
-from app.models import EmailToken
+from app.models import AuditEntry, EmailToken
 from app.uow import UnitOfWork
 from tests.integration.conftest import (
     Mailpit,
@@ -153,7 +153,11 @@ async def test_only_org_admin_invites(
 
 
 async def test_taken_email_looks_like_success_and_warns_the_person(
-    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+    client: AsyncClient,
+    make_user: MakeUser,
+    make_org: MakeOrg,
+    mailpit: Mailpit,
+    uow: UnitOfWork,
 ) -> None:
     org = await make_org()
     admin = await org_admin(client, make_user, org)
@@ -169,6 +173,11 @@ async def test_taken_email_looks_like_success_and_warns_the_person(
     [letter] = await read_emails(mailpit, taken)
     assert "уже є обліковий запис" in letter["Text"]
     assert "Токен" not in letter["Text"]
+    # И журнал организации не выдаёт разницы: для обоих — invite.created.
+    logged = await uow.session.scalars(
+        select(AuditEntry.action).where(AuditEntry.entity_id.in_([taken, fresh]))
+    )
+    assert sorted(logged) == ["invite.created", "invite.created"]
 
 
 async def test_token_works_once(
@@ -278,3 +287,19 @@ async def test_invalid_email_is_rejected(
     resp = await invite(client, admin, "not-an-email", "viewer")
 
     assert resp.status_code == 422
+
+
+async def test_other_org_invite_does_not_cancel_mine(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+) -> None:
+    mine = await org_admin(client, make_user, await make_org())
+    rival = await org_admin(client, make_user, await make_org())
+    email = new_email()
+    await invite(client, mine, email, "viewer")
+    await invite(client, rival, email, "viewer")  # чужая организация приглашает тот же email
+    rivals_letter, my_letter = await read_emails(mailpit, email)
+
+    # Моё приглашение живо: приглашение другой организации его не погасило.
+    assert (await accept(client, token_from_email(my_letter))).status_code == 201
+    # Человек уже в моей организации — второе приглашение устарело.
+    assert (await accept(client, token_from_email(rivals_letter))).json()["code"] == "invite.stale"

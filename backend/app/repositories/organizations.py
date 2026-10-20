@@ -1,4 +1,5 @@
 import uuid
+from typing import Literal
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,10 +39,23 @@ class TeamRepository:
             )
         )
 
-    async def get(self, team_id: uuid.UUID, org_id: uuid.UUID) -> Team | None:
-        return await self.session.scalar(
-            select(Team).where(Team.id == team_id, Team.org_id == org_id)
-        )
+    async def get(
+        self,
+        team_id: uuid.UUID,
+        org_id: uuid.UUID,
+        *,
+        lock: Literal["update", "key_share"] | None = None,
+    ) -> Team | None:
+        """lock="update" — для удаления отдела; lock="key_share" — для того, кто кладёт в отдел
+        человека (перевод, принятие приглашения). Эти блокировки конфликтуют: удаление ждёт
+        перевод и видит нового человека (409), а перевод ждёт удаление и видит, что отдела
+        нет (422), — вместо 500 от внешнего ключа."""
+        query = select(Team).where(Team.id == team_id, Team.org_id == org_id)
+        if lock == "update":
+            query = query.with_for_update()
+        elif lock == "key_share":
+            query = query.with_for_update(read=True, key_share=True)
+        return await self.session.scalar(query)
 
     async def get_by_name(self, org_id: uuid.UUID, name: str) -> Team | None:
         return await self.session.scalar(

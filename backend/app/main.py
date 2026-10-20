@@ -91,7 +91,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(well_known.router)
     app.include_router(auth.router)
-    # Модули с эндпоинтами импортированы выше: include_router копирует уже объявленные маршруты.
+    # Модули с эндпоинтами импортированы выше и объявили маршруты на этих роутерах. FastAPI 0.151
+    # подключает роутер обёрткой (_IncludedRouter) и берёт его маршруты при каждом поиске.
     app.include_router(protected_router)
     app.include_router(admin_router)
     return app

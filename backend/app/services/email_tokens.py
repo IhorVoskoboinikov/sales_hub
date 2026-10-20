@@ -29,7 +29,8 @@ async def issue_email_token(
     """Новый токен для письма; предыдущие той же цели на этот email перестают работать.
     Коммит — за вызывающим."""
     now = datetime.now(UTC)
-    await uow.email_tokens.invalidate_active(email, purpose, now)
+    org_id = uuid.UUID(payload["org_id"]) if payload and payload.get("org_id") else None
+    await uow.email_tokens.invalidate_active(email, purpose, now, org_id=org_id)
     raw = new_token()
     row = EmailToken(
         user_id=user_id,

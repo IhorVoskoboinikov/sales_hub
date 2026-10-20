@@ -62,7 +62,9 @@ def install_openapi(app: FastAPI, roles: RoleCatalog) -> None:
         schema = build()
         actions: dict[str, str] = getattr(app.state, "route_actions", {})
         if not actions:
-            app.openapi_schema = None  # без прав не кэшируем — дособерём, когда OPA ответит
+            # Без прав не кэшируем. Маршруты читаются только при старте, поэтому права
+            # появятся в Swagger после перезапуска API, когда OPA уже отвечает.
+            app.openapi_schema = None
             return schema
         app.openapi_schema = describe_permissions(schema, actions, roles)
         return app.openapi_schema

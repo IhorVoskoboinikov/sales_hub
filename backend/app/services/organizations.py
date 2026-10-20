@@ -2,7 +2,7 @@
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from app.authz.access import Access
 from app.errors import Conflict, NotFound
@@ -90,15 +90,17 @@ class TeamService:
         return team
 
     async def delete(self, access: Access, team_id: uuid.UUID) -> None:
-        team = await self._get_or_404(access, team_id)
+        team = await self._get_or_404(access, team_id, lock="update")
         if await self.uow.teams.count_members(team.id):
             raise Conflict("team.has_members")
         await self.uow.teams.delete(team)
         self._audit(access, "team.deleted", team.id, {"name": team.name})
         await self.uow.commit()
 
-    async def _get_or_404(self, access: Access, team_id: uuid.UUID) -> Team:
-        team = await self.uow.teams.get(team_id, access.org_id)
+    async def _get_or_404(
+        self, access: Access, team_id: uuid.UUID, lock: Literal["update"] | None = None
+    ) -> Team:
+        team = await self.uow.teams.get(team_id, access.org_id, lock=lock)
         if team is None:  # отдел чужой организации — как несуществующий
             raise NotFound(entity="team", id=str(team_id))
         return team

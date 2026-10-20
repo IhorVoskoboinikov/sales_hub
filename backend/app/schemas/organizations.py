@@ -3,7 +3,7 @@ from datetime import datetime
 from typing import Annotated
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 
 from app.models import Role
 
@@ -40,6 +40,14 @@ class OrgUpdate(BaseModel):
     name: Name | None = None
     display_currency: Currency | None = None
     timezone: Timezone | None = None
+
+    @field_validator("name", "display_currency", "timezone", mode="before")
+    @classmethod
+    def not_null(cls, value: object) -> object:
+        # Не переданное поле не меняется, а явный null — ошибка: все эти поля обязательны.
+        if value is None:
+            raise ValueError("null is not allowed")
+        return value
 
 
 class OrgOut(BaseModel):

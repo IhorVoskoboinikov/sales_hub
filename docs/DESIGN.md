@@ -177,7 +177,7 @@ sales_hub/
 
 | Таблица | Ключевые поля | Заметки |
 | --- | --- | --- |
-| `users` | id (uuid), email (unique, citext), password\_hash, is\_active, is\_superadmin, **org\_id, team\_id, role**, email\_verified\_at, token\_version, timezone (null = как у организации), last\_login\_at, created\_at | один человек — одна организация и одна роль (раздел 5). `role` ∈ `org_admin` / `team_lead` / `sales_rep` / `viewer`. CHECK-и (в Postgres CHECK, который дал NULL, считается пройденным, поэтому условия написаны без сравнений с NULL): `role IN ('org_admin','team_lead','sales_rep','viewer')`; `(role IS NULL) = (org_id IS NULL)`; `NOT (is_superadmin AND org_id IS NOT NULL)`; `(team_id IS NOT NULL) = (role IS NOT NULL AND role IN ('team_lead','sales_rep'))`. FK `(team_id, org_id)` → `teams (id, org_id)` — отдел только из своей организации. Пользователь без организации и роли (не супер-админ) остаётся только с этапа 2 и ничего не может: OPA отвечает 403 |
+| `users` | id (uuid), email (unique, citext), password\_hash, is\_active, is\_superadmin, **org\_id, team\_id, role**, email\_verified\_at, token\_version, timezone (null = как у организации), last\_login\_at, created\_at | один человек — одна организация и одна роль (раздел 5). `role` ∈ `org_admin` / `team_lead` / `sales_rep` / `viewer`. CHECK-и (в Postgres CHECK, который дал NULL, считается пройденным, поэтому условия написаны без сравнений с NULL): `role IN ('org_admin','team_lead','sales_rep','viewer')`; `(role IS NULL) = (org_id IS NULL)`; `NOT (is_superadmin AND org_id IS NOT NULL)`; `(team_id IS NOT NULL) = (role IS NOT NULL AND role IN ('team_lead','sales_rep'))`. FK `(team_id, org_id)` → `teams (id, org_id)` — отдел только из своей организации. Пользователей без организации и роли (не супер-админов), оставшихся с этапа 2, удаляет миграция этапа 3 (это только dev-данные; `downgrade` их не возвращает). Если такой всё же появится — он ничего не может: OPA отвечает 403 |
 | `refresh_tokens` | id, user\_id, family\_id (= `sid`), token\_hash (unique), created\_at, expires\_at, revoked\_at, replaced\_by, user\_agent, ip | раздел 4 |
 | `email_tokens` | id, user\_id, email, purpose (`invite` / `reset_password`), token\_hash, payload jsonb (org\_id, team\_id, role для приглашения), created\_at, expires\_at, used\_at | раздел 4 |
 | `organizations` | id, name, slug (unique), plan, display\_currency (по умолчанию UAH), timezone (по умолчанию Europe/Kyiv), created\_at | тенант: компания, которая пользуется CRM; создаёт только супер-админ |
@@ -347,7 +347,7 @@ Refresh сделан непрозрачным и хранится в БД нам
 | GET | `/.well-known/jwks.json` | публичный ключ для проверки подписи |
 | POST | `/api/v1/admin/invites` | `{email}` — приглашение без организации, только супер-админ (на этапе 2 OPA ещё нет, поэтому проверяет зависимость `require_superadmin`: не супер-админ → 403 `forbidden`); живёт только на этапе 2, на этапе 3 удаляется — его заменяют `POST /api/v1/admin/orgs/{org_id}/invites` (первый админ организации) и `POST /api/v1/invites` (админ приглашает в свою организацию) |
 
-Приглашение создаёт админ организации: `POST /api/v1/invites {email, role, team_id}` — всегда в свою организацию, `org_id` берётся из него самого. OPA проверяет, что вызывающий — `org_admin` (`member:manage`); правила «отдел обязателен для `team_lead` и `sales_rep`» и «email уже есть в базе → 409» проверяет сервис (раздел 5).
+Приглашение создаёт админ организации: `POST /api/v1/invites {email, role, team_id}` — всегда в свою организацию, `org_id` берётся из него самого. OPA проверяет, что вызывающий — `org_admin` (`member:manage`); правило «отдел обязателен для `team_lead` и `sales_rep`» проверяет сервис (раздел 5). Если email уже есть в базе, ответ тот же 202, а человеку уходит письмо «вы уже состоите в организации SalesHub»: админ чужой организации не узнаёт, что email занят (как в `password/forgot`). На этапе 2 такое приглашение давало 409 — с этапа 3 это поведение заменено.
 
 ### Одноразовые токены из писем
 
@@ -1547,7 +1547,7 @@ deploy/
 - [ ] 3.3 `OpaClient`, `authorize()`, чтение `data.yaml`, `Access`.
 - [ ] 3.4 Защищённый роутер и тест `test_routes_match_policy`.
 - [ ] 3.5 Эндпоинты организаций (супер-админ) и отделов (org admin).
-- [ ] 3.6 Приглашения: `POST /api/v1/admin/orgs/{org_id}/invites` (первый админ) и `POST /api/v1/invites` (с ролью и отделом), письмо, `invite/accept`; удалить `POST /api/v1/admin/invites` и тестовых пользователей этапа 2 без организации.
+- [ ] 3.6 Приглашения: `POST /api/v1/admin/orgs/{org_id}/invites` (первый админ) и `POST /api/v1/invites` (с ролью и отделом), письмо, `invite/accept`; занятый email — 202 и письмо «вы уже состоите в организации»; удалить `POST /api/v1/admin/invites`, а тестовых пользователей этапа 2 без организации удаляет миграция 3.1.
 - [ ] 3.7 Смена роли и отдела, отключение пользователя; правила в сервисе (нельзя себе, отдел обязателен), причина отказа в ответе.
 - [ ] 3.8 `audit_log` (пока без партиций) и сброс кэша пользователя при смене роли.
 - [ ] 3.9 «Требуется: …» в описании операций Swagger.
@@ -1679,6 +1679,9 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Неожиданные ошибки (500) | ловит `UnhandledErrorMiddleware` внутри `RequestId` и `AccessLog`, а не `exception_handler(Exception)` — так в ответе есть `X-Request-ID`, а в логе `request_id` |
 | Домен | мульти-тенантная CRM: организации → отделы → компании, контакты, сделки, активности |
 | Кто создаёт организации | только супер-админ; дальше всё через приглашения |
+| Приглашение на занятый email | 202 и письмо «вы уже состоите в организации» — по ответу нельзя проверить, есть ли email в системе |
+| Пользователи этапа 2 без организации | удаляются миграцией этапа 3 (dev-данные, `downgrade` их не возвращает) |
+| Версия OPA | 1.21.3: образ `openpolicyagent/opa:1.21.3` в compose и testcontainers, `opa test` в CI — та же версия |
 | Удаление | мягкое (корзина 30 дней) для компаний, контактов, сделок; жёсткое для остального |
 | 2FA | не делаем |
 | Версии | Python 3.13, PostgreSQL 18 |

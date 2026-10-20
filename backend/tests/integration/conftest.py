@@ -188,6 +188,16 @@ def make_org(uow: UnitOfWork) -> MakeOrg:
 
 MakeUser = Callable[..., Awaitable[User]]
 
+_password_hash: list[str] = []
+
+
+async def password_hash() -> str:
+    """Хэш PASSWORD один на весь запуск: argon2 медленный специально, а пользователей в тестах
+    создаются сотни."""
+    if not _password_hash:
+        _password_hash.append(await hash_password(PASSWORD))
+    return _password_hash[0]
+
 
 @pytest.fixture
 def make_user(uow: UnitOfWork) -> MakeUser:
@@ -195,7 +205,7 @@ def make_user(uow: UnitOfWork) -> MakeUser:
 
     async def make(email: str = "ivan@example.com", **fields: object) -> User:
         fields.setdefault("email_verified_at", datetime.now(UTC))
-        user = User(email=email, password_hash=await hash_password(PASSWORD), **fields)
+        user = User(email=email, password_hash=await password_hash(), **fields)
         uow.users.add(user)
         await uow.commit()
         return user

@@ -64,11 +64,11 @@ lint:  ## ruff + mypy, как в CI
 fmt:  ## отформатировать код и исправить то, что ruff умеет сам
 	$(BACKEND) uv run ruff format . && uv run ruff check --fix .
 
-policy-test:  ## тесты политик OPA: формат, проверка, opa test с покрытием
+policy-test:  ## тесты политик OPA: формат, проверка, opa test с покрытием не ниже 90%
 	$(OPA) fmt --list --fail /policies
 	$(OPA) check --strict /policies
-	$(OPA) test -b /policies -v --coverage --format=json | python3 -c "import json,sys; print('покрытие', round(json.load(sys.stdin)['coverage'], 1), '%')"
-	$(OPA) test -b /policies
+	$(OPA) test -b /policies -v
+	$(OPA) test -b /policies --coverage --threshold 90 --format=json > /dev/null
 
 policy-fmt:  ## отформатировать .rego
 	docker run --rm -v $(CURDIR)/policies:/policies openpolicyagent/opa:1.21.3 fmt -w /policies

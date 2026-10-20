@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 
 from sqlalchemy import select, update
@@ -24,10 +25,17 @@ class EmailTokenRepository:
         )
 
     async def invalidate_active(
-        self, email: str, purpose: EmailTokenPurpose, now: datetime
+        self,
+        email: str,
+        purpose: EmailTokenPurpose,
+        now: datetime,
+        *,
+        org_id: uuid.UUID | None = None,
     ) -> None:
-        """Новый токен гасит предыдущие той же цели: работает только ссылка из последнего письма."""
-        await self.session.execute(
+        """Новый токен гасит предыдущие той же цели: работает только ссылка из последнего письма.
+        Для приглашений — только приглашения той же организации: иначе админ одной организации
+        мог бы гасить чужие приглашения, просто пригласив тот же email."""
+        query = (
             update(EmailToken)
             .where(
                 EmailToken.email == email,
@@ -36,3 +44,6 @@ class EmailTokenRepository:
             )
             .values(used_at=now)
         )
+        if org_id is not None:
+            query = query.where(EmailToken.payload["org_id"].astext == str(org_id))
+        await self.session.execute(query)

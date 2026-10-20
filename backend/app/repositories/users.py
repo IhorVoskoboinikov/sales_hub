@@ -1,9 +1,10 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import User
+from app.authz.access import Access
+from app.models import Role, User
 
 
 class UserRepository:
@@ -27,3 +28,30 @@ class UserRepository:
 
     def add(self, user: User) -> None:
         self.session.add(user)
+
+    async def list_visible(self, access: Access) -> list[User]:
+        """Люди, которых видит роль: вся организация или свой отдел (member:read)."""
+        return list(
+            await self.session.scalars(
+                select(User).where(access.sql_filter(User)).order_by(User.email)
+            )
+        )
+
+    async def get_visible(
+        self, user_id: uuid.UUID, access: Access, *, for_update: bool = False
+    ) -> User | None:
+        """Пользователь вне уровня — как несуществующий (404, а не 403)."""
+        query = select(User).where(User.id == user_id, access.sql_filter(User))
+        if for_update:
+            query = query.with_for_update().execution_options(populate_existing=True)
+        return await self.session.scalar(query)
+
+    async def count_active_admins(self, org_id: uuid.UUID) -> int:
+        return (
+            await self.session.scalar(
+                select(func.count())
+                .select_from(User)
+                .where(User.org_id == org_id, User.role == Role.ORG_ADMIN, User.is_active)
+            )
+            or 0
+        )

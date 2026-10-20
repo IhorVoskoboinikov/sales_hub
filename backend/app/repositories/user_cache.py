@@ -4,7 +4,7 @@
 import uuid
 
 import structlog
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
@@ -24,6 +24,10 @@ class CachedUser(BaseModel):
     is_superadmin: bool
     email_verified: bool
     token_version: int
+    # Права: роль уходит в OPA, организация и отдел — в Access (раздел 5).
+    org_id: uuid.UUID | None
+    team_id: uuid.UUID | None
+    role: str | None
 
 
 class UserCache:
@@ -42,7 +46,13 @@ class UserCache:
         except RedisError as exc:
             logger.warning("user_cache_unavailable", error=repr(exc))
             return None
-        return CachedUser.model_validate_json(raw) if raw else None
+        if not raw:
+            return None
+        try:
+            return CachedUser.model_validate_json(raw)
+        except ValidationError:
+            # Запись старого формата (после выкатки с новыми полями) — как промах.
+            return None
 
     async def set(self, user: CachedUser) -> None:
         # NX — только если ключа нет. Ключ есть, если запись уже свежая или стоит «надгробие».

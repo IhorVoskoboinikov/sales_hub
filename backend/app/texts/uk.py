@@ -20,18 +20,38 @@ ERRORS: dict[str, str] = {
     "unavailable": "Сервіс тимчасово недоступний",
     "http_error": "Помилка запиту",
     # Приглашения и токены из писем
-    "invite.email_taken": "Користувач з таким email уже існує",
+    "invite.stale": "Запрошення застаріло: email уже зайнятий або відділ видалено",
+    "member.cannot_change_self": "Не можна змінювати власні роль, відділ чи статус",
+    "member.last_admin": "В організації має залишитися хоча б один активний адміністратор",
+    "member.team_required": "Для цієї ролі потрібен відділ",
+    "member.team_not_allowed": "Для цієї ролі відділ не вказується",
+    "member.team_not_found": "Такого відділу немає в організації",
     "email_token.invalid": "Токен недійсний або вже використаний",
     "email_token.expired": "Термін дії токена минув",
+    # Организации и отделы
+    "org.slug_taken": "Організація з таким slug уже існує",
+    "team.name_taken": "Відділ з такою назвою вже є",
+    "team.has_members": "У відділі є люди — спочатку переведіть їх в інший відділ",
+    # Права
+    "authz.policy_out_of_sync": "Правила доступу не узгоджені, зверніться до адміністратора",
     # Пароль
     "password.too_short": "Пароль закороткий",
     "password.too_long": "Пароль задовгий",
     "password.same_as_email": "Пароль не може збігатися з email",
 }
 
+# Названия ролей — в письмах и для людей. Коды ролей (org_admin…) не переводятся.
+ROLE_TITLES: dict[str, str] = {
+    "org_admin": "Адміністратор організації",
+    "team_lead": "Керівник відділу продажів",
+    "sales_rep": "Менеджер з продажів",
+    "viewer": "Спостерігач",
+}
+
 # Темы писем по имени шаблона (app/texts/emails/<имя>.txt и .html).
 EMAIL_SUBJECTS: dict[str, str] = {
     "invite": "Запрошення до SalesHub",
+    "already_member": "Запрошення до SalesHub",
     "reset_password": "Зміна пароля в SalesHub",
 }
 

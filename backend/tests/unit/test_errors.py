@@ -36,7 +36,7 @@ async def raise_not_found() -> None:
 
 @router.get("/last-admin")
 async def raise_conflict_with_own_code() -> None:
-    raise Conflict("member.last_admin")
+    raise Conflict("test.code_without_text")
 
 
 @router.get("/no-text")
@@ -94,7 +94,7 @@ async def test_own_code_keeps_class_title(client: AsyncClient) -> None:
     resp = await client.get("/test/last-admin")
 
     assert resp.status_code == 409
-    assert resp.json()["code"] == "member.last_admin"
+    assert resp.json()["code"] == "test.code_without_text"
     assert resp.json()["title"] == "Конфлікт даних"
 
 

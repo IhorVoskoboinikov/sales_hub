@@ -9,11 +9,14 @@ from app.uow import UnitOfWork
 from tests.integration.conftest import (
     PASSWORD,
     Mailpit,
+    MakeOrg,
     MakeUser,
     bearer,
     login,
+    member,
     read_emails,
     token_from_email,
+    tokens_for,
 )
 
 NEW_PASSWORD = "brand new password"
@@ -85,14 +88,12 @@ async def test_reset_token_works_once(
 
 
 async def test_invite_token_cannot_reset_password(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
 ) -> None:
-    admin = await make_user(unique_email(), is_superadmin=True)
-    admin_tokens = await login(client, admin.email)
+    org = await make_org()
+    admin = await tokens_for(client, await member(make_user, org, "org_admin"))
     invited = unique_email()
-    await client.post(
-        "/api/v1/admin/invites", json={"email": invited}, headers=bearer(admin_tokens)
-    )
+    await client.post("/api/v1/invites", json={"email": invited, "role": "viewer"}, headers=admin)
     invite_token = token_from_email((await read_emails(mailpit, invited))[0])
 
     resp = await reset(client, invite_token)

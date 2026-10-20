@@ -3,12 +3,23 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
 from app.api import health, well_known
-from app.api import v1 as api_v1
-from app.api.v1 import admin, auth
+from app.api.v1 import (  # noqa: F401 — модули с эндпоинтами регистрируют маршруты
+    admin_router,
+    auth,
+    invites,
+    organizations,
+    protected_router,
+    teams,
+    users,
+)
+from app.authz.opa import OpaClient
+from app.authz.openapi import fetch_route_actions, install_openapi
+from app.authz.roles import RoleCatalog
 from app.core.config import Settings, get_settings
 from app.core.jwt import KeySet
 from app.core.logging import configure_logging
@@ -35,9 +46,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.redis = Redis.from_url(
             settings.redis_url, socket_connect_timeout=2, socket_timeout=2
         )
+        http = httpx.AsyncClient()  # один пул соединений к OPA на процесс
+        app.state.opa = OpaClient(http, settings.opa_url)
+        if settings.show_docs:
+            app.state.route_actions = await fetch_route_actions(
+                app.state.opa, settings.opa_startup_attempts
+            )
         try:
             yield
         finally:
+            await http.aclose()
             await app.state.redis.aclose()
             await engine.dispose()
 
@@ -50,6 +68,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json" if settings.show_docs else None,
     )
     app.state.settings = settings
+    # Тот же data.yaml, что читает OPA. Нет файла — приложение не создаётся.
+    app.state.roles = RoleCatalog.load(settings.policies_dir)
     app.state.email_sender = SmtpEmailSender(
         host=settings.smtp_host,
         port=settings.smtp_port,
@@ -60,6 +80,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
 
     register_error_handlers(app)
+    install_openapi(app, app.state.roles)
 
     # add_middleware добавляет слой снаружи предыдущих, поэтому порядок здесь — изнутри наружу.
     # Запрос проходит: RequestId → AccessLog → UnhandledError → маршрут.
@@ -69,7 +90,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(well_known.router)
-    app.include_router(api_v1.router)
     app.include_router(auth.router)
-    app.include_router(admin.router)
+    # Модули с эндпоинтами импортированы выше и объявили маршруты на этих роутерах. FastAPI 0.151
+    # подключает роутер обёрткой (_IncludedRouter) и берёт его маршруты при каждом поиске.
+    app.include_router(protected_router)
+    app.include_router(admin_router)
     return app

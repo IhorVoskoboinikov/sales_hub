@@ -9,6 +9,8 @@ x-app-env: &app-env
   DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@postgres:5432/saleshub
   REDIS_URL: redis://redis:6379/0
   SMTP_HOST: mailpit  # письма видно на localhost:8025
+  OPA_URL: http://opa:8181
+  POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA
   LOG_LEVEL: INFO
 
 services:
@@ -64,16 +66,20 @@ services:
     build: ../../backend
     image: saleshub-api:dev
     # dev: код смонтирован с хоста, --reload перезапускает сервер при сохранении файла.
+    # --reload-dir /policies: uvicorn перечитывает и data.yaml (по умолчанию следит только за .py).
     command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",
-              "--no-access-log", "--reload"]
+              "--no-access-log", "--reload", "--reload-dir", "/app/app",
+              "--reload-dir", "/policies", "--reload-include", "data.yaml"]
     volumes:
       - ../../backend/app:/app/app:ro
       - ../../backend/secrets:/app/secrets:ro  # ключ JWT: make keys (make up вызывает его сам)
+      - ../../policies:/policies:ro
     environment: *app-env
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
       seed: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
+      opa: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
@@ -81,6 +87,25 @@ services:
       timeout: 5s
       retries: 6
       start_period: 10s
+
+  # Решения о доступе (раздел 5): «может ли роль вызвать эндпоинт». --watch — правка .rego и
+  # data.yaml применяется сразу. Тесты политик (*_test.rego) серверу не нужны.
+  opa:
+    image: openpolicyagent/opa:1.21.3
+    command: ["run", "--server", "--addr=0.0.0.0:8181", "--watch",
+              "--ignore=..*", "--ignore=*_test.rego",
+              "--set=decision_logs.console=true",  # каждое решение — строкой в лог
+              "/policies"]
+    volumes: [../../policies:/policies:ro]
+    ports: ["127.0.0.1:8181:8181"]
+    # Сервер отвечает и роли загружены (раздел 5: «не должен быть пустым»). В образе нет
+    # shell, wget и curl — HTTP-запрос к самому себе делает opa eval через http.send.
+    healthcheck:
+      test: ["CMD", "/opa", "eval", "--fail",
+             "http.send({\"method\": \"get\", \"url\": \"http://127.0.0.1:8181/v1/data/saleshub/roles\"}).body.result.org_admin"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   # --- Веб-интерфейсы (раздел 11)
 

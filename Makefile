@@ -1,9 +1,11 @@
 # Команды проекта. Список с описаниями: make help
 COMPOSE = docker compose -f deploy/compose/docker-compose.yml
+# opa из Docker — ставить его локально не нужно. Версия — как в compose и CI.
+OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.21.3
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt
+.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -12,8 +14,8 @@ up: keys  ## поднять стенд: API, Postgres, Redis и все UI (жд�
 	$(COMPOSE) up -d --build --wait
 	@$(MAKE) --no-print-directory urls
 
-infra:  ## только Postgres, Redis и Mailpit — для make run (API запускается без Docker)
-	$(COMPOSE) up -d --wait postgres redis mailpit
+infra:  ## только Postgres, Redis, Mailpit и OPA — для make run (API запускается без Docker)
+	$(COMPOSE) up -d --wait postgres redis mailpit opa
 
 down:  ## остановить стенд (данные сохраняются)
 	$(COMPOSE) down
@@ -32,6 +34,7 @@ urls:  ## адреса веб-интерфейсов
 	@echo "pgAdmin      http://localhost:5050"
 	@echo "RedisInsight http://localhost:5540"
 	@echo "Mailpit      http://localhost:8025"
+	@echo "OPA          http://localhost:8181/v1/data/saleshub/roles"
 	@echo "RustFS (S3)  http://localhost:9001/rustfs/console/   логин saleshub / saleshub-secret"
 
 keys:  ## создать приватный ключ JWT в backend/secrets/ (если его ещё нет)
@@ -60,3 +63,12 @@ lint:  ## ruff + mypy, как в CI
 
 fmt:  ## отформатировать код и исправить то, что ruff умеет сам
 	$(BACKEND) uv run ruff format . && uv run ruff check --fix .
+
+policy-test:  ## тесты политик OPA: формат, проверка, opa test с покрытием не ниже 90%
+	$(OPA) fmt --list --fail /policies
+	$(OPA) check --strict /policies
+	$(OPA) test -b /policies -v
+	$(OPA) test -b /policies --coverage --threshold 90 --format=json > /dev/null
+
+policy-fmt:  ## отформатировать .rego
+	docker run --rm -v $(CURDIR)/policies:/policies openpolicyagent/opa:1.21.3 fmt -w /policies

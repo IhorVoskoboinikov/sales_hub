@@ -1,0 +1,81 @@
+# policies/saleshub/data.yaml — кто что может.
+# Читают оба: OPA (есть ли у роли действие) и бэкенд (уровень видимости данных).
+# Уровень: own — только свои записи, team — записи своего отдела, org — вся организация.
+# super_admin здесь не описан: это флаг users.is_superadmin, ему разрешены только админские
+# эндпоинты /api/v1/admin/* (действия admin:*), в данные организаций он не ходит.
+roles:
+  org_admin:
+    title: Администратор организации
+    permissions:
+      org:read: org
+      org:manage: org          # настройки организации, отделы, воронки
+      member:read: org
+      member:manage: org       # пригласить, сменить роль или отдел, отключить
+      company:read: org
+      company:write: org       # создать и изменить
+      company:delete: org      # удалить в корзину и восстановить
+      contact:read: org
+      contact:write: org
+      contact:delete: org
+      deal:read: org
+      deal:write: org
+      deal:delete: org
+      activity:read: org
+      activity:write: org      # создать, изменить, удалить (активности удаляются насовсем)
+      bulk:run: org            # импорт, передача клиентов, теги, закрытие просроченных
+      bulk_job:read: org
+      bulk_job:cancel: org
+      export:run: org
+      report:read: org
+      audit:read: org
+
+  team_lead:
+    title: Руководитель отдела продаж
+    permissions:
+      org:read: org
+      member:read: team
+      company:read: org        # компании — общий справочник: видны всем, чтобы не плодить дубли
+      company:write: team
+      company:delete: team
+      contact:read: team
+      contact:write: team
+      contact:delete: team
+      deal:read: team
+      deal:write: team
+      deal:delete: team
+      activity:read: team
+      activity:write: team
+      bulk:run: team
+      bulk_job:read: team
+      bulk_job:cancel: team
+      export:run: team
+      report:read: team
+
+  sales_rep:
+    title: Менеджер по продажам
+    permissions:
+      org:read: org
+      member:read: team
+      company:read: org
+      company:write: own
+      contact:read: own
+      contact:write: own
+      deal:read: own
+      deal:write: own
+      activity:read: own
+      activity:write: own
+      report:read: own
+
+  viewer:
+    title: Наблюдатель (директор, аналитик)
+    permissions:
+      org:read: org
+      member:read: org
+      company:read: org
+      contact:read: org
+      deal:read: org
+      activity:read: org
+      bulk_job:read: own       # свои выгрузки
+      bulk_job:cancel: own
+      export:run: org
+      report:read: org

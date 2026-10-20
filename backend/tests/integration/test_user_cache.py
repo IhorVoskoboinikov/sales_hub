@@ -1,5 +1,6 @@
 """Кэш пользователя: устаревшая версия не возвращается в кэш после invalidate."""
 
+import json
 import uuid
 from collections.abc import AsyncIterator
 
@@ -25,6 +26,9 @@ def snapshot(user_id: uuid.UUID, version: int) -> CachedUser:
         is_superadmin=False,
         email_verified=True,
         token_version=version,
+        org_id=None,
+        team_id=None,
+        role=None,
     )
 
 
@@ -45,3 +49,11 @@ async def test_stale_write_after_invalidate_is_ignored(cache: UserCache) -> None
     await cache.set(snapshot(user_id, 1))  # опоздавшая запись старой версии
 
     assert await cache.get(user_id) is None  # промах → следующий запрос прочитает базу
+
+
+async def test_old_format_entry_is_a_miss(cache: UserCache) -> None:
+    user_id = uuid.uuid4()
+    old_format = json.dumps({"id": str(user_id), "email": "a@b.cd"})  # без новых полей
+    await cache.redis.set(f"user:{user_id}", old_format)
+
+    assert await cache.get(user_id) is None

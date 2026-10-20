@@ -4,6 +4,7 @@
 него. Коммиты сервисов внутри теста становятся SAVEPOINT-ами — таблицы чистить не нужно.
 """
 
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -25,8 +26,9 @@ from testcontainers.core.wait_strategies import HttpWaitStrategy
 from app.api.deps import get_session
 from app.core.config import Settings
 from app.core.security import hash_password
-from app.models import User
+from app.models import Organization, Team, User
 from app.uow import UnitOfWork
+from tests.conftest import POLICIES_DIR
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
@@ -34,6 +36,7 @@ BACKEND_DIR = Path(__file__).resolve().parents[2]
 POSTGRES_IMAGE = "postgres:18.6"
 REDIS_IMAGE = "redis:8.10"
 MAILPIT_IMAGE = "axllent/mailpit:v1.31.6"
+OPA_IMAGE = "openpolicyagent/opa:1.21.3"
 
 
 def alembic_config(database_url: str) -> Config:
@@ -80,8 +83,24 @@ def mailpit() -> Iterator[Mailpit]:
         )
 
 
+@pytest.fixture(scope="session")
+def opa_url() -> Iterator[str]:
+    """Настоящий OPA с политиками из policies/ — как сервис opa в compose."""
+    container = (
+        DockerContainer(OPA_IMAGE)
+        .with_volume_mapping(str(POLICIES_DIR), "/policies", "ro")
+        .with_command("run --server --addr=0.0.0.0:8181 --ignore=*_test.rego /policies")
+        .with_exposed_ports(8181)
+        .waiting_for(HttpWaitStrategy(8181, "/health"))
+    )
+    with container:
+        yield f"http://{container.get_container_host_ip()}:{container.get_exposed_port(8181)}"
+
+
 @pytest.fixture
-def settings(settings: Settings, postgres_url: str, redis_url: str, mailpit: Mailpit) -> Settings:
+def settings(
+    settings: Settings, postgres_url: str, redis_url: str, mailpit: Mailpit, opa_url: str
+) -> Settings:
     # Те же настройки, что у unit-тестов, но с адресами настоящих контейнеров.
     return settings.model_copy(
         update={
@@ -89,6 +108,7 @@ def settings(settings: Settings, postgres_url: str, redis_url: str, mailpit: Mai
             "redis_url": redis_url,
             "smtp_host": mailpit.smtp_host,
             "smtp_port": mailpit.smtp_port,
+            "opa_url": opa_url,
         }
     )
 
@@ -134,7 +154,49 @@ def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
 
 PASSWORD = "correct horse battery"  # пароль всех пользователей из make_user
 
+
+@dataclass(frozen=True)
+class OrgFixture:
+    """Простые значения, а не ORM-объекты: ответ 4xx откатывает сессию теста, и объекты
+    «протухают» — обращение к ним после этого упало бы."""
+
+    id: uuid.UUID
+    name: str
+    team_ids: list[uuid.UUID]  # два отдела: «Продажі 1» и «Продажі 2»
+
+
+MakeOrg = Callable[..., Awaitable[OrgFixture]]
+
+
+@pytest.fixture
+def make_org(uow: UnitOfWork) -> MakeOrg:
+    """Организация с двумя отделами."""
+
+    async def make(slug: str | None = None) -> OrgFixture:
+        slug = slug or f"org-{uuid.uuid4().hex[:8]}"
+        org = Organization(id=uuid.uuid4(), name=slug.title(), slug=slug)
+        uow.organizations.add(org)
+        await uow.flush()
+        teams = [Team(id=uuid.uuid4(), org_id=org.id, name=f"Продажі {i}") for i in (1, 2)]
+        for team in teams:
+            uow.teams.add(team)
+        await uow.commit()
+        return OrgFixture(org.id, org.name, [team.id for team in teams])
+
+    return make
+
+
 MakeUser = Callable[..., Awaitable[User]]
+
+_password_hash: list[str] = []
+
+
+async def password_hash() -> str:
+    """Хэш PASSWORD один на весь запуск: argon2 медленный специально, а пользователей в тестах
+    создаются сотни."""
+    if not _password_hash:
+        _password_hash.append(await hash_password(PASSWORD))
+    return _password_hash[0]
 
 
 @pytest.fixture
@@ -143,7 +205,7 @@ def make_user(uow: UnitOfWork) -> MakeUser:
 
     async def make(email: str = "ivan@example.com", **fields: object) -> User:
         fields.setdefault("email_verified_at", datetime.now(UTC))
-        user = User(email=email, password_hash=await hash_password(PASSWORD), **fields)
+        user = User(email=email, password_hash=await password_hash(), **fields)
         uow.users.add(user)
         await uow.commit()
         return user
@@ -172,3 +234,22 @@ def token_from_email(email: dict[str, Any]) -> str:
     """Токен в письме стоит отдельной строкой после строки «Токен…:»."""
     lines: list[str] = [line.strip() for line in str(email["Text"]).splitlines()]
     return next(lines[i + 1] for i, line in enumerate(lines) if line.startswith("Токен"))
+
+
+async def member(
+    make_user: MakeUser, org: OrgFixture, role: str, team: int | None = 0, **fields: object
+) -> User:
+    """Пользователь организации с ролью. team — номер отдела (только для team_lead и sales_rep)."""
+    needs_team = team is not None and role in ("team_lead", "sales_rep")
+    team_id = org.team_ids[team] if team is not None and needs_team else None
+    return await make_user(
+        f"{role}-{uuid.uuid4().hex[:8]}@example.com",
+        org_id=org.id,
+        role=role,
+        team_id=team_id,
+        **fields,
+    )
+
+
+async def tokens_for(client: AsyncClient, user: User) -> dict[str, str]:
+    return bearer(await login(client, user.email))

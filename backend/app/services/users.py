@@ -1,3 +1,4 @@
+import uuid
 from datetime import UTC, datetime
 
 from app.core.security import check_password_rules, hash_password
@@ -20,6 +21,14 @@ async def create_superadmin(uow: UnitOfWork, email: str, password: str) -> tuple
         email_verified_at=now,
         created_at=now,
     )
+    user.id = uuid.uuid4()
     uow.users.add(user)
+    uow.audit.record(
+        actor_id=None,  # команда при деплое, а не человек
+        org_id=None,
+        action="superadmin.created",
+        entity_type="user",
+        entity_id=user.id,
+    )
     await uow.commit()
     return user, True

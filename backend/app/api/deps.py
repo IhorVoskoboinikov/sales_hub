@@ -11,15 +11,19 @@ from fastapi.security import OAuth2PasswordBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from app.authz.opa import OpaClient
+from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.core.jwt import KeySet
 from app.emails.mailer import BackgroundMailer
 from app.emails.sender import EmailSender, Mailer
-from app.errors import Forbidden, Unauthorized
+from app.errors import Unauthorized
 from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.invites import InviteService
+from app.services.members import MemberService
+from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
 from app.uow import UnitOfWork
 
@@ -42,6 +46,14 @@ def get_redis(request: Request) -> Redis:
 
 def get_key_set(request: Request) -> KeySet:
     return cast(KeySet, request.app.state.keys)
+
+
+def get_opa(request: Request) -> OpaClient:
+    return cast(OpaClient, request.app.state.opa)
+
+
+def get_roles(request: Request) -> RoleCatalog:
+    return cast(RoleCatalog, request.app.state.roles)
 
 
 def get_email_sender(request: Request) -> EmailSender:
@@ -114,6 +126,20 @@ def get_password_reset_service(
     )
 
 
+def get_org_service(uow: UnitOfWork = Depends(get_uow)) -> OrganizationService:
+    return OrganizationService(uow)
+
+
+def get_team_service(uow: UnitOfWork = Depends(get_uow)) -> TeamService:
+    return TeamService(uow)
+
+
+def get_member_service(
+    uow: UnitOfWork = Depends(get_uow), cache: UserCache = Depends(get_user_cache)
+) -> MemberService:
+    return MemberService(uow, cache)
+
+
 def get_client_info(request: Request) -> ClientInfo:
     user_agent = request.headers.get("user-agent")
     return ClientInfo(
@@ -133,11 +159,4 @@ async def current_user(
     user = await auth.authenticate(token)
     request.state.user_id = user.id  # для access-лога
     structlog.contextvars.bind_contextvars(user_id=str(user.id))  # для остальных строк лога
-    return user
-
-
-async def require_superadmin(user: CurrentUser = Depends(current_user)) -> CurrentUser:
-    """Только супер-админ. Этап 2: OPA ещё нет, проверяем флаг; с этапа 3 это делает OPA."""
-    if not user.is_superadmin:
-        raise Forbidden()
     return user

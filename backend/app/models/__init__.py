@@ -2,7 +2,18 @@
 
 from app.db.base import Base
 from app.models.email_token import EmailToken, EmailTokenPurpose
+from app.models.organization import Organization, Team
 from app.models.refresh_token import RefreshToken
-from app.models.user import User
+from app.models.user import ROLES_WITH_TEAM, Role, User
 
-__all__ = ["Base", "EmailToken", "EmailTokenPurpose", "RefreshToken", "User"]
+__all__ = [
+    "ROLES_WITH_TEAM",
+    "Base",
+    "EmailToken",
+    "EmailTokenPurpose",
+    "Organization",
+    "RefreshToken",
+    "Role",
+    "Team",
+    "User",
+]

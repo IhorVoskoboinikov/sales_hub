@@ -8,6 +8,7 @@ x-app-env: &app-env
   APP_ENV: dev
   DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@postgres:5432/saleshub
   REDIS_URL: redis://redis:6379/0
+  SMTP_HOST: mailpit  # письма видно на localhost:8025
   LOG_LEVEL: INFO
 
 services:
@@ -47,17 +48,31 @@ services:
       postgres: {condition: service_healthy}
     restart: "no"
 
+  # Одноразовый: создаёт супер-админа (идемпотентно — повторный запуск ничего не меняет).
+  seed:
+    image: saleshub-api:dev
+    command: ["python", "-m", "app.cli", "create-superadmin"]
+    environment:
+      <<: *app-env
+      SUPERADMIN_EMAIL: admin@example.com
+      SUPERADMIN_PASSWORD: admin-password
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    restart: "no"
+
   api:
     build: ../../backend
     image: saleshub-api:dev
     # dev: код смонтирован с хоста, --reload перезапускает сервер при сохранении файла.
     command: ["uvicorn", "app.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000",
               "--no-access-log", "--reload"]
-    volumes: [../../backend/app:/app/app:ro]
+    volumes:
+      - ../../backend/app:/app/app:ro
+      - ../../backend/secrets:/app/secrets:ro  # ключ JWT: make keys (make up вызывает его сам)
     environment: *app-env
     ports: ["127.0.0.1:8000:8000"]
     depends_on:
-      migrate: {condition: service_completed_successfully}
+      seed: {condition: service_completed_successfully}
       redis: {condition: service_healthy}
     healthcheck:
       test: ["CMD", "python", "-c",

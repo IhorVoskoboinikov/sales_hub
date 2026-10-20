@@ -134,10 +134,12 @@ sales_hub/
 │   │   ├── uow.py
 │   │   ├── authz/               # OPA-клиент, authorize(), чтение data.yaml, Access (scope → SQL)
 │   │   ├── api/
-│   │   │   ├── deps.py          # get_session, get_engine, get_redis, позже current_user
+│   │   │   ├── deps.py          # get_session, get_engine, get_redis, current_user, сборка сервисов
+│   │   │   ├── well_known.py    # /.well-known/jwks.json — публичные ключи JWT, без авторизации
 │   │   │   ├── health.py        # /health/live, /health/ready — вне /api/v1, без авторизации
 │   │   │   └── v1/              # auth, users, orgs, teams, companies, contacts, deals, activities, bulk, reports
 │   │   ├── errors/              # AppError иерархия + exception handlers
+│   │   ├── emails/              # EmailSender (SMTP), Mailer (пока BackgroundTasks), Jinja2-рендер
 │   │   ├── middleware/          # request_id, access log, unhandled errors (500), позже metrics
 │   │   ├── events/              # доменные события, outbox relay
 │   │   ├── workers/             # celery_app.py, runtime.py, schedule.py, tasks/ (раздел 15)
@@ -150,6 +152,7 @@ sales_hub/
 │   ├── scripts/seed_big.sql     # генерация миллионов строк
 │   ├── Dockerfile
 │   ├── .env.example             # переменные для запуска API без Docker (make run)
+│   ├── secrets/                 # dev-ключ JWT (make keys), в .gitignore
 │   └── pyproject.toml
 ├── policies/saleshub/            # OPA: routes.rego, authz.rego, data.yaml (роли), *_test.rego
 ├── frontend/                    # в самом конце
@@ -176,7 +179,7 @@ sales_hub/
 | --- | --- | --- |
 | `users` | id (uuid), email (unique, citext), password\_hash, is\_active, is\_superadmin, **org\_id, team\_id, role**, email\_verified\_at, token\_version, timezone (null = как у организации), last\_login\_at, created\_at | один человек — одна организация и одна роль (раздел 5). `role` ∈ `org_admin` / `team_lead` / `sales_rep` / `viewer`. CHECK-и (в Postgres CHECK, который дал NULL, считается пройденным, поэтому условия написаны без сравнений с NULL): `role IN ('org_admin','team_lead','sales_rep','viewer')`; `(role IS NULL) = (org_id IS NULL)`; `NOT (is_superadmin AND org_id IS NOT NULL)`; `(team_id IS NOT NULL) = (role IS NOT NULL AND role IN ('team_lead','sales_rep'))`. FK `(team_id, org_id)` → `teams (id, org_id)` — отдел только из своей организации. Пользователь без организации и роли (не супер-админ) остаётся только с этапа 2 и ничего не может: OPA отвечает 403 |
 | `refresh_tokens` | id, user\_id, family\_id (= `sid`), token\_hash (unique), created\_at, expires\_at, revoked\_at, replaced\_by, user\_agent, ip | раздел 4 |
-| `email_tokens` | id, user\_id, email, purpose (`invite` / `reset_password`), token\_hash, payload jsonb (org\_id, team\_id, role для приглашения), expires\_at, used\_at | раздел 4 |
+| `email_tokens` | id, user\_id, email, purpose (`invite` / `reset_password`), token\_hash, payload jsonb (org\_id, team\_id, role для приглашения), created\_at, expires\_at, used\_at | раздел 4 |
 | `organizations` | id, name, slug (unique), plan, display\_currency (по умолчанию UAH), timezone (по умолчанию Europe/Kyiv), created\_at | тенант: компания, которая пользуется CRM; создаёт только супер-админ |
 | `teams` | id, org\_id, name, created\_at | отдел продаж; UNIQUE (id, org\_id) для составного FK из `users`; отдел с людьми удалить нельзя — 409 |
 
@@ -324,6 +327,7 @@ Refresh сделан непрозрачным и хранится в БД нам
 2. Выдать новую пару access + refresh; старый refresh пометить `revoked_at`, `replaced_by = новый`.
 3. Все refresh одной сессии связаны `family_id`. Если пришёл **уже отозванный** refresh — его украли и использовали повторно: отзываем всю семью, пользователь выходит на этом устройстве.
 4. Срок семьи не продлевается бесконечно: абсолютный предел сессии — 30 дней с логина (настраивается).
+5. Всё, что выдаёт или отзывает refresh-токены (login, refresh, logout, logout-all, удаление сессии, смена и сброс пароля), сначала блокирует строку пользователя (`SELECT … FOR UPDATE`), и только потом — токены. Без этого refresh, начатый одновременно с logout-all, успевал вставить новый токен, которого `UPDATE` в logout-all уже не видел (так работает READ COMMITTED), и сессия переживала «выйти везде». Один порядок блокировок (пользователь → токены) исключает взаимные блокировки.
 
 ### Эндпоинты
 
@@ -337,11 +341,11 @@ Refresh сделан непрозрачным и хранится в БД нам
 | DELETE | `/api/v1/auth/sessions/{sid}` | выйти на конкретном устройстве |
 | POST | `/api/v1/auth/password/forgot` | `{email}` → письмо со ссылкой; ответ **всегда 202**, чтобы нельзя было проверить, есть ли email в базе |
 | POST | `/api/v1/auth/password/reset` | `{token, new_password}` → новый пароль, отзыв всех сессий |
-| POST | `/api/v1/auth/password/change` | `{old_password, new_password}` для залогиненного, отзыв остальных сессий |
+| POST | `/api/v1/auth/password/change` | `{old_password, new_password}` для залогиненного: отзыв остальных сессий и `token_version += 1` (их access-токены умирают сразу); в ответе — новая пара токенов для текущей сессии, иначе вышел бы и он сам |
 | POST | `/api/v1/auth/invite/accept` | `{token, password}` — приглашённый задаёт пароль; в базе появляется пользователь с организацией, отделом и ролью из приглашения |
-| GET | `/api/v1/auth/me` | профиль, роль, отдел и `permissions` — действия роли с уровнями из `data.yaml` (фронт по ним решает, что показывать) |
+| GET | `/api/v1/auth/me` | профиль, роль, отдел и `permissions` — действия роли с уровнями из `data.yaml` (фронт по ним решает, что показывать). На этапе 2 ролей ещё нет — только профиль: id, email, `is_superadmin`, timezone |
 | GET | `/.well-known/jwks.json` | публичный ключ для проверки подписи |
-| POST | /api/v1/admin/invites | приглашение без организации, только супер-админ; живёт только на этапе 2, на этапе 3 удаляется — его заменяют `POST /api/v1/admin/orgs/{org_id}/invites` (первый админ организации) и `POST /api/v1/invites` (админ приглашает в свою организацию) |
+| POST | `/api/v1/admin/invites` | `{email}` — приглашение без организации, только супер-админ (на этапе 2 OPA ещё нет, поэтому проверяет зависимость `require_superadmin`: не супер-админ → 403 `forbidden`); живёт только на этапе 2, на этапе 3 удаляется — его заменяют `POST /api/v1/admin/orgs/{org_id}/invites` (первый админ организации) и `POST /api/v1/invites` (админ приглашает в свою организацию) |
 
 Приглашение создаёт админ организации: `POST /api/v1/invites {email, role, team_id}` — всегда в свою организацию, `org_id` берётся из него самого. OPA проверяет, что вызывающий — `org_admin` (`member:manage`); правила «отдел обязателен для `team_lead` и `sales_rep`» и «email уже есть в базе → 409» проверяет сервис (раздел 5).
 
@@ -349,12 +353,12 @@ Refresh сделан непрозрачным и хранится в БД нам
 
 Одна таблица `email_tokens` для двух целей: `invite` (живёт 7 дней) и `reset_password` (1 час). В письмо уходит случайная строка, в БД — только её SHA-256 хэш; токен одноразовый (`used_at`), новый запрос на ту же цель гасит предыдущие. Для приглашения в `payload` лежат организация, отдел и роль.
 
-Письмо отправляет не API, а воркер: сервис пишет событие `member.invited` / `password.reset_requested` в outbox → задача `notifications.send_email` (Jinja2-шаблоны). Приглашение не падает, если SMTP недоступен, — письмо уйдёт с ретраем. До этапа 5 (воркеры) письма отправляются синхронно через тот же интерфейс `EmailSender`. В dev — Mailpit (SMTP на 1025, веб на 8025), в prod — любой SMTP или Amazon SES.
+Письмо отправляет не API, а воркер: сервис пишет событие `member.invited` / `password.reset_requested` в outbox → задача `notifications.send_email` (Jinja2-шаблоны). Приглашение не падает, если SMTP недоступен, — письмо уйдёт с ретраем. До этапа 5 (воркеры) письмо отправляет `BackgroundTasks` FastAPI через тот же интерфейс `EmailSender` — после коммита и уже после ответа клиенту: ответ не ждёт SMTP — по времени ответа `password/forgot` не видно отправки письма (небольшая разница остаётся: для существующего email сервис ещё записывает токен в базу), а ошибка SMTP только пишется в лог (письмо теряется; ретраи появятся вместе с очередью). На этапе 5 меняется только место вызова `EmailSender`: вместо `BackgroundTasks` — outbox и задача. В dev — Mailpit (SMTP на 1025, веб на 8025), в prod — любой SMTP или Amazon SES.
 
 ### Зависимость `current_user`
 
 1. Достать Bearer-токен, проверить подпись по JWKS, `iss`, `aud`, `exp`, `typ=access`.
-2. Найти пользователя по `sub` (кэш Redis на 60 с), проверить `is_active`, `email_verified_at` и `ver == token_version`.
+2. Найти пользователя по `sub` (кэш Redis на 60 с), проверить `is_active`, `email_verified_at` и `ver == token_version`. Изменение, после которого старые токены не должны работать (logout-all, смена и сброс пароля), после коммита ставит вместо записи кэша пустое «надгробие» на 5 секунд, а запись в кэш идёт с `SET NX`: иначе запрос, прочитавший пользователя до коммита, вернул бы в кэш старую `token_version` ещё на 60 секунд.
 3. Вернуть `CurrentUser` (id, email, is\_superadmin, org\_id, team\_id, role) — роль и отдел приходят тем же запросом, отдельной загрузки прав нет (раздел 5).
 
 Ошибки: нет токена, битая подпись, истёк → 401 `auth.invalid_token` / `auth.token_expired` (клиент по второму коду понимает, что пора делать refresh); email не подтверждён → 403 `auth.email_not_verified`; заблокирован → 403 `auth.user_inactive`.
@@ -362,9 +366,9 @@ Refresh сделан непрозрачным и хранится в БД нам
 ### Безопасность
 
 - Пароли — argon2 (pwdlib), минимум 10 символов, проверка на совпадение с email.
-- Rate limit в Redis: логин 5 попыток / 15 мин на email+IP, `password/forgot` — 3 / час на email, приглашения — 50 / час на организацию.
+- Rate limit в Redis (фиксированное окно: `INCR` + `EXPIRE NX`): логин — 5 неудачных попыток / 15 мин на email+IP, `password/change` — 5 неверных старых паролей / 15 мин на пользователя, `password/forgot` — 3 / час на email (и для несуществующих тоже), приглашения — 50 / час на организацию (на этапе 2 — на супер-админа). Попытка засчитывается до проверки пароля, а успех обнуляет счётчик: проверка «сначала прочитать счётчик, потом увеличить» пропустила бы сотню одновременных запросов. Redis недоступен → 503: без счётчика пароли можно перебирать бесконечно.
 - Ответы `login` и `forgot` не раскрывают, существует ли пользователь.
-- Ключи RS256: приватный — в Secret, поддержка ротации через `kid` в заголовке JWT и несколько ключей в JWKS.
+- Ключи RS256: приватный ключ — файл `JWT_PRIVATE_KEY_FILE`. В dev его создаёт `make keys` (`python -m app.cli generate-jwt-key`) в `backend/secrets/` — папка в `.gitignore`, compose монтирует её в `api`; в Kubernetes это Secret, смонтированный файлом; тесты создают ключ фикстурой. `kid` в заголовке JWT — отпечаток публичного ключа (RFC 7638), поэтому его не нужно настраивать. Ротация: новый ключ становится `JWT_PRIVATE_KEY_FILE`, а старый публичный кладётся в `JWT_PREVIOUS_PUBLIC_KEY_FILES` на время жизни access-токена (1 час) — JWKS отдаёт оба, и уже выданные токены продолжают проверяться.
 - Для будущего фронта refresh переедет в httpOnly-cookie; пока, для Swagger, он в теле ответа.
 
 ### Супер-админ: откуда берётся
@@ -1195,9 +1199,10 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 ### Изоляция БД в integration-тестах
 
 - Один контейнер Postgres на сессию pytest, `alembic upgrade head` один раз.
-- Каждый тест — во внешней транзакции с `SAVEPOINT` (`join_transaction_mode="create_savepoint"`), откат после теста: быстро и без очистки таблиц.
+- Каждый тест — во внешней транзакции с `SAVEPOINT` (`join_transaction_mode="create_savepoint"`), откат после теста: быстро и без очистки таблиц. Подменённая `get_session` при ошибке в запросе откатывает его SAVEPOINT — как настоящий запрос, который при ошибке ничего не сохраняет. После такого отката объекты сессии «протухают», поэтому значения, нужные тесту после ответа 4xx (например, email), держат в переменных.
 - Сессия подменяется через `app.dependency_overrides[get_session]`.
-- Тесты bulk-операций, которые коммитят в нескольких транзакциях (воркер), используют `TRUNCATE` в фикстуре — отдельный маркер `@pytest.mark.committing`.
+- Тесты bulk-операций, которые коммитят в нескольких транзакциях (воркер), используют `TRUNCATE` в фикстуре — отдельный маркер `@pytest.mark.committing`. Пока такой тест один (гонка refresh и logout-all) — он сам удаляет своего пользователя.
+- Письма: контейнер Mailpit на сессию pytest, тест читает письма через его REST API (`/api/v1/search`, `/api/v1/message/{id}`); у каждого теста свой email, потому что Mailpit и Redis общие на весь запуск.
 
 ### Матрица прав (генерируется)
 
@@ -1236,8 +1241,9 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 
 | Сервис | Порт на хосте | Заметки |
 | --- | --- | --- |
-| `api` | 8000 | код смонтирован с хоста, `--reload` подхватывает правки без пересборки образа |
+| `api` | 8000 | код смонтирован с хоста, `--reload` подхватывает правки без пересборки образа; `backend/secrets` (ключ JWT) — только на чтение; стартует после `migrate` и `seed` |
 | `migrate` | — | одноразовый `alembic upgrade head`; `api` стартует только после его успешного завершения |
+| `seed` (с этапа 2) | — | одноразовый `create-superadmin` после `migrate`; dev-логин супер-админа задан в compose, команда идемпотентна |
 | `postgres` 18 | `${POSTGRES_PORT:-5432}` | том монтируется в `/var/lib/postgresql` (у образа 18 данные в `/var/lib/postgresql/18/docker`) |
 | `redis` 8 | `${REDIS_PORT:-6379}` | если порт занят другим проектом — поменять в `deploy/compose/.env` (шаблон `.env.example` рядом) и в `backend/.env` |
 | `pgadmin` | 5050 | без экрана входа; сервер и пароль заданы заранее (`servers.json` + `pgpass`, права 600 ставятся при старте контейнера) |
@@ -1245,7 +1251,7 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 | `mailpit` | 1025, 8025 | |
 | `rustfs` | 9000 (S3), 9001 (консоль `/rustfs/console/`) | S3-совместимое хранилище вместо MinIO: официальные образы MinIO больше не публикуются |
 
-Все порты открыты только на `127.0.0.1`: у pgAdmin нет входа, у Redis нет пароля, поэтому из сети стенд не виден. `make up` ждёт, пока все сервисы станут healthy (`--wait`), и печатает адреса UI. Для запуска API без Docker (`make run`, отладка в IDE) — `make infra`: только Postgres и Redis.
+Все порты открыты только на `127.0.0.1`: у pgAdmin нет входа, у Redis нет пароля, поэтому из сети стенд не виден. `make up` ждёт, пока все сервисы станут healthy (`--wait`), и печатает адреса UI. Для запуска API без Docker (`make run`, отладка в IDE) — `make infra`: только Postgres, Redis и Mailpit. `make up` и `make run` сначала вызывают `make keys`.
 
 ### Шаг 2 — Kubernetes локально
 
@@ -1509,26 +1515,30 @@ deploy/
 - [x] 1.7 Async engine, сессия на запрос, `Base` с naming convention, `/health/ready`.
 - [x] 1.8 Alembic с async `env.py`, первая пустая миграция, `make migrate`.
 - [x] 1.9 pytest: `conftest`, testcontainers Postgres, первый тест health.
-- [ ] 1.10 Минимальный `ci.yml`: lint + unit + integration. Файл готов и проверен actionlint; галочка — после первого зелёного прогона на GitHub.
+- [x] 1.10 Минимальный `ci.yml`: lint + unit + integration; первый зелёный прогон — PR #1 и push в `main`.
 
 **Готово, когда:** `make up` поднимает всё, все UI открываются (раздел 11), `/health/ready` отвечает 200, CI зелёный.
 
+**Статус: ✅ этап закрыт** — смержен в `main` (PR #1), CI зелёный.
+
 ### Этап 2 — Вход по почте (раздел 4)
 
-- [ ] 2.1 Модели `users`, `refresh_tokens`, `email_tokens` + миграция.
-- [ ] 2.2 Хеширование argon2, правила пароля.
-- [ ] 2.3 Ключи RS256, выпуск и проверка JWT, `/.well-known/jwks.json`.
-- [ ] 2.4 Команда `create-superadmin` — первый пользователь, под которым можно войти.
-- [ ] 2.5 `login`, зависимость `current_user`, кнопка Authorize в Swagger.
-- [ ] 2.6 `refresh` с ротацией и защитой от повторного использования.
-- [ ] 2.7 `logout`, `logout-all`, `sessions`, удаление сессии.
-- [ ] 2.8 `EmailSender` (пока синхронно в Mailpit), шаблоны писем на Jinja2.
-- [ ] 2.9 Приглашения: супер-админ приглашает по email → письмо → `invite/accept` задаёт пароль и подтверждает email. Организация и роль в приглашении — на этапе 3.
-- [ ] 2.10 `password/forgot`, `password/reset`, `password/change`.
-- [ ] 2.11 Rate limit на Redis для логина, `forgot` и приглашений.
-- [ ] 2.12 Интеграционный тест всего сценария: письма читаются через API Mailpit, сроки — через freezegun.
+- [x] 2.1 Модели `users`, `refresh_tokens`, `email_tokens` + миграция.
+- [x] 2.2 Хеширование argon2, правила пароля.
+- [x] 2.3 Ключи RS256 (`make keys`), выпуск и проверка JWT, `/.well-known/jwks.json`.
+- [x] 2.4 Команда `create-superadmin` — первый пользователь, под которым можно войти; в compose — одноразовый сервис `seed`.
+- [x] 2.5 `login`, зависимость `current_user`, кнопка Authorize в Swagger.
+- [x] 2.6 `refresh` с ротацией и защитой от повторного использования.
+- [x] 2.7 `logout`, `logout-all`, `sessions`, удаление сессии.
+- [x] 2.8 `EmailSender` (пока через `BackgroundTasks` в Mailpit), шаблоны писем на Jinja2.
+- [x] 2.9 Приглашения: супер-админ приглашает по email → письмо → `invite/accept` задаёт пароль и подтверждает email. Организация и роль в приглашении — на этапе 3.
+- [x] 2.10 `password/forgot`, `password/reset`, `password/change`.
+- [x] 2.11 Rate limit на Redis для логина, `forgot` и приглашений.
+- [x] 2.12 Интеграционный тест всего сценария: письма читаются через API Mailpit, сроки — через freezegun.
 
 **Готово, когда:** сценарий проверки из раздела 4 проходит руками в Swagger и автотестом.
+
+**Статус: ✅ этап выполнен и закрыт** (2026-10-20, ветка `stage-2`) — сценарий раздела 4 пройден на стенде compose и автотестом `test_auth_flow.py`; 113 тестов зелёные.
 
 ### Этап 3 — Организации и права на OPA (раздел 5)
 
@@ -1661,6 +1671,11 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Коммиты | `тип(модуль) сообщение`, например `docs(design) …`; типы: feat, fix, refactor, docs, config, deploy (test, chore — если не подходит другое) |
 | Хранилище файлов (S3) | RustFS вместо MinIO: официальные образы MinIO больше не публикуются; код работает только через S3 API, поэтому хранилище заменяемо |
 | Роутеры FastAPI | полный префикс у роутера (`/api/v1`, `/api/v1/admin`), эндпоинты прямо на нём, подключение только в `app`; вложенные роутеры не используем — у них `scope["route"].path` теряет внешний префикс (FastAPI 0.151) |
+| Ключи JWT | приватный RS256-ключ — файл `JWT_PRIVATE_KEY_FILE` (в dev — `make keys` в `backend/secrets/`, в Kubernetes — Secret файлом); `kid` — отпечаток ключа (RFC 7638); при ротации старый публичный ключ остаётся в JWKS на 1 час |
+| Письма до этапа 5 | `BackgroundTasks` после коммита и ответа: ответ не ждёт SMTP; ошибка SMTP — в лог; на этапе 5 заменяется outbox и очередью |
+| Выдача и отзыв токенов | сначала блокировка строки пользователя, потом токены — refresh не обгоняет logout-all, смену и сброс пароля |
+| Rate limit | `INCR` до проверки, успех обнуляет счётчик; Redis недоступен → 503 |
+| Смена пароля | отзыв остальных сессий + `token_version += 1`, в ответе новая пара токенов для текущей сессии |
 | Неожиданные ошибки (500) | ловит `UnhandledErrorMiddleware` внутри `RequestId` и `AccessLog`, а не `exception_handler(Exception)` — так в ответе есть `X-Request-ID`, а в логе `request_id` |
 | Домен | мульти-тенантная CRM: организации → отделы → компании, контакты, сделки, активности |
 | Кто создаёт организации | только супер-админ; дальше всё через приглашения |
@@ -1696,7 +1711,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 
 - [x] Уведомления — email и Telegram-бот (раздел 16).
 - [x] Поиск — Elasticsearch (раздел 17).
-- [ ] Новых открытых вопросов нет; следующий шаг — этап 1 дорожной карты.
+- [ ] Новых открытых вопросов нет; этапы 1 и 2 закрыты, следующий шаг — этап 3 дорожной карты.
 
 ## 15. Модуль: система воркеров
 

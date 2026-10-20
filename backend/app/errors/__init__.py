@@ -4,7 +4,7 @@
 NotFound(entity="deal", id=123).
 """
 
-from typing import Any
+from typing import Any, ClassVar
 
 from app.texts import uk
 
@@ -12,12 +12,16 @@ from app.texts import uk
 class AppError(Exception):
     status: int = 500
     code: str = "internal"
+    headers: ClassVar[dict[str, str] | None] = None  # заголовки ответа: WWW-Authenticate
 
     def __init__(self, code: str | None = None, **details: Any) -> None:
         if code is not None:
             self.code = code
         self.details = details
         super().__init__(self.code)
+
+    def response_headers(self) -> dict[str, str] | None:
+        return self.headers
 
     @property
     def title(self) -> str:
@@ -40,6 +44,8 @@ class Forbidden(AppError):
 class Unauthorized(AppError):
     status = 401
     code = "auth.invalid_token"
+    # RFC 6750: подсказка клиенту, как пройти аутентификацию.
+    headers: ClassVar[dict[str, str] | None] = {"WWW-Authenticate": "Bearer"}
 
 
 class Conflict(AppError):
@@ -55,6 +61,11 @@ class ValidationFailed(AppError):
 class RateLimited(AppError):
     status = 429
     code = "rate_limited"
+
+    def response_headers(self) -> dict[str, str] | None:
+        # Через сколько секунд можно повторить (RFC 9110). То же число — в details.retry_after.
+        retry_after = self.details.get("retry_after")
+        return {"Retry-After": str(retry_after)} if retry_after is not None else None
 
 
 class ServiceUnavailable(AppError):

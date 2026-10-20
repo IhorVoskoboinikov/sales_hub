@@ -7,7 +7,7 @@ logger = structlog.get_logger("access")
 
 
 class AccessLogMiddleware:
-    """Одна строка лога на запрос: метод, шаблон пути, статус, длительность.
+    """Одна строка лога на запрос: метод, шаблон пути, статус, длительность, пользователь.
 
     Путь пишем шаблоном (/api/v1/deals/{deal_id}), а не реальным URL: так по логам
     удобно группировать запросы, и в лог не попадают id и query-параметры.
@@ -38,10 +38,13 @@ class AccessLogMiddleware:
             path = getattr(scope.get("route"), "path", None) or "<unmatched>"
             # Пробы Kubernetes и compose дёргают health каждые несколько секунд — не засоряем лог.
             log = logger.debug if path.startswith("/health/") else logger.info
+            # user_id кладёт зависимость current_user в request.state (это scope["state"]).
+            user_id = (scope.get("state") or {}).get("user_id")
             log(
                 "request",
                 method=scope["method"],
                 path=path,
                 status=status,
                 duration_ms=round((time.perf_counter() - started) * 1000, 1),
+                user_id=str(user_id) if user_id else None,
             )

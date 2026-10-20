@@ -6,11 +6,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from redis.asyncio import Redis
 
-from app.api import health
+from app.api import health, well_known
 from app.api import v1 as api_v1
+from app.api.v1 import admin, auth
 from app.core.config import Settings, get_settings
+from app.core.jwt import KeySet
 from app.core.logging import configure_logging
 from app.db.session import create_engine, create_session_factory
+from app.emails.sender import SmtpEmailSender
 from app.errors.handlers import register_error_handlers
 from app.middleware.access_log import AccessLogMiddleware
 from app.middleware.request_id import RequestIdMiddleware
@@ -25,6 +28,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Создаётся один раз при старте и закрывается при остановке процесса.
         # Соединения открываются лениво — при первом запросе, а не здесь.
+        app.state.keys = KeySet.from_settings(settings)  # нет ключа — сервер не стартует
         engine = create_engine(settings.database_url)
         app.state.engine = engine
         app.state.session_factory = create_session_factory(engine)
@@ -46,6 +50,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json" if settings.show_docs else None,
     )
     app.state.settings = settings
+    app.state.email_sender = SmtpEmailSender(
+        host=settings.smtp_host,
+        port=settings.smtp_port,
+        sender=settings.email_from,
+        username=settings.smtp_username,
+        password=settings.smtp_password.get_secret_value() if settings.smtp_password else None,
+        start_tls=settings.smtp_start_tls,
+    )
 
     register_error_handlers(app)
 
@@ -56,5 +68,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(RequestIdMiddleware)
 
     app.include_router(health.router)
+    app.include_router(well_known.router)
     app.include_router(api_v1.router)
+    app.include_router(auth.router)
+    app.include_router(admin.router)
     return app

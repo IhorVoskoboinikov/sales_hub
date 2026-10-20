@@ -37,7 +37,9 @@ class RequestIdMiddleware:
 
         token = request_id_var.set(request_id)
         try:
-            with structlog.contextvars.bound_contextvars(request_id=request_id):
+            # user_id привяжет current_user; на выходе оба поля вернутся к прежним значениям,
+            # и следующий запрос в том же контексте не унаследует чужого пользователя.
+            with structlog.contextvars.bound_contextvars(request_id=request_id, user_id=None):
                 await self.app(scope, receive, send_with_request_id)
         finally:
             request_id_var.reset(token)

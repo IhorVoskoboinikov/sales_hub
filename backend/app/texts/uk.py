@@ -9,11 +9,30 @@ ERRORS: dict[str, str] = {
     "method_not_allowed": "Метод не підтримується",
     "forbidden": "Недостатньо прав",
     "auth.invalid_token": "Недійсний токен",
+    "auth.token_expired": "Термін дії токена минув",
+    "auth.invalid_credentials": "Невірний email або пароль",
+    "auth.user_inactive": "Користувача заблоковано",
+    "auth.email_not_verified": "Email не підтверджено",
+    "auth.wrong_password": "Невірний поточний пароль",
     "conflict": "Конфлікт даних",
     "validation": "Помилка валідації",
     "rate_limited": "Забагато запитів, спробуйте пізніше",
     "unavailable": "Сервіс тимчасово недоступний",
     "http_error": "Помилка запиту",
+    # Приглашения и токены из писем
+    "invite.email_taken": "Користувач з таким email уже існує",
+    "email_token.invalid": "Токен недійсний або вже використаний",
+    "email_token.expired": "Термін дії токена минув",
+    # Пароль
+    "password.too_short": "Пароль закороткий",
+    "password.too_long": "Пароль задовгий",
+    "password.same_as_email": "Пароль не може збігатися з email",
+}
+
+# Темы писем по имени шаблона (app/texts/emails/<имя>.txt и .html).
+EMAIL_SUBJECTS: dict[str, str] = {
+    "invite": "Запрошення до SalesHub",
+    "reset_password": "Зміна пароля в SalesHub",
 }
 
 # Сообщения валидации по типу ошибки Pydantic. В фигурных скобках — поля из ctx ошибки.

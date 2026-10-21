@@ -172,6 +172,10 @@ class ContactService(CrmService[Contact]):
             await self._check_email(access, fields["email"], exclude=contact.id)
         return await self._update(access, contact, version, fields)
 
+    async def trash(self, access: Access, page: Page) -> PageResult[Contact]:
+        """Удалённые контакты в уровне contact:delete — их можно восстановить 30 дней."""
+        return await self.uow.contacts.trash(access, page)
+
     async def _before_restore(self, access: Access, obj: Contact) -> None:
         await self._check_email(access, obj.email, exclude=obj.id)
 

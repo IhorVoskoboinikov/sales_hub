@@ -18,7 +18,7 @@ from app.models import ContactStatus
 from app.repositories.contacts import SEARCH_PATTERN, ContactFilters
 from app.repositories.pagination import Page
 from app.schemas.common import MAX_ID, PageOut, RecordId
-from app.schemas.crm import ContactIn, ContactOut, ContactUpdate
+from app.schemas.crm import ContactIn, ContactOut, ContactUpdate, DeletedContactOut
 from app.services.contacts import ContactService
 
 Search = Annotated[
@@ -47,6 +47,21 @@ async def list_contacts(
     result = await contacts.list(access, filters, page)
     return PageOut(
         items=[ContactOut.model_validate(c) for c in result.items], next_cursor=result.next_cursor
+    )
+
+
+# Раньше /contacts/{contact_id}: иначе Starlette сопоставил бы «trash» с {contact_id}.
+@protected_router.get("/contacts/trash", tags=["contacts"], responses=PROTECTED)
+async def list_trash(
+    page: Page = Depends(get_page),
+    access: Access = Depends(authorize),
+    contacts: ContactService = Depends(get_contact_service),
+) -> PageOut[DeletedContactOut]:
+    """Корзина: удалённые контакты в моём уровне, недавно удалённые сначала."""
+    result = await contacts.trash(access, page)
+    return PageOut(
+        items=[DeletedContactOut.model_validate(c) for c in result.items],
+        next_cursor=result.next_cursor,
     )
 
 
@@ -93,3 +108,33 @@ async def update_contact(
     fields = body.model_dump(exclude_unset=True, exclude={"version"})
     contact = await contacts.update(access, contact_id, body.version, fields)
     return ContactOut.model_validate(contact)
+
+
+@protected_router.delete(
+    "/contacts/{contact_id}",
+    tags=["contacts"],
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={**PROTECTED, **NOT_FOUND},
+)
+async def delete_contact(
+    contact_id: RecordId,
+    access: Access = Depends(authorize),
+    service: ContactService = Depends(get_contact_service),
+) -> None:
+    """Удалить в корзину: запись перестаёт быть видна, но 30 дней её можно восстановить."""
+    await service.delete(access, contact_id)
+
+
+@protected_router.post(
+    "/contacts/{contact_id}/restore",
+    tags=["contacts"],
+    responses={**PROTECTED, **NOT_FOUND, **CONFLICT},
+)
+async def restore_contact(
+    contact_id: RecordId,
+    access: Access = Depends(authorize),
+    service: ContactService = Depends(get_contact_service),
+) -> ContactOut:
+    """Восстановить из корзины в текущий отдел ответственного. Ответственный отключён или
+    больше не ведёт записи — 409 owner.inactive."""
+    return ContactOut.model_validate(await service.restore(access, contact_id))

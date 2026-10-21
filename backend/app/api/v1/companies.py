@@ -85,3 +85,33 @@ async def update_company(
     fields = body.model_dump(exclude_unset=True, exclude={"version"})
     company = await companies.update(access, company_id, body.version, fields)
     return CompanyOut.model_validate(company)
+
+
+@protected_router.delete(
+    "/companies/{company_id}",
+    tags=["companies"],
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={**PROTECTED, **NOT_FOUND},
+)
+async def delete_company(
+    company_id: RecordId,
+    access: Access = Depends(authorize),
+    service: CompanyService = Depends(get_company_service),
+) -> None:
+    """Удалить в корзину: запись перестаёт быть видна, но 30 дней её можно восстановить."""
+    await service.delete(access, company_id)
+
+
+@protected_router.post(
+    "/companies/{company_id}/restore",
+    tags=["companies"],
+    responses={**PROTECTED, **NOT_FOUND, **CONFLICT},
+)
+async def restore_company(
+    company_id: RecordId,
+    access: Access = Depends(authorize),
+    service: CompanyService = Depends(get_company_service),
+) -> CompanyOut:
+    """Восстановить из корзины в текущий отдел ответственного. Ответственный отключён или
+    больше не ведёт записи — 409 owner.inactive."""
+    return CompanyOut.model_validate(await service.restore(access, company_id))

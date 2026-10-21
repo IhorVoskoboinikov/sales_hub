@@ -21,6 +21,7 @@ other_org.
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -178,6 +179,25 @@ CASES: dict[str, Case] = {
         "contact:read",
     ),
     "GET /api/v1/audit": Case("audit:read"),
+    # --- корзина: удаление ищет живую запись по уровню чтения, восстановление и список —
+    # удалённую по уровню *:delete.
+    "DELETE /api/v1/companies/{company_id}": Case(
+        "company:delete", None, CRM_TARGETS, "company:read"
+    ),
+    "POST /api/v1/companies/{company_id}/restore": Case(
+        "company:delete", lambda w, r: {}, tuple(f"deleted_{t}" for t in CRM_TARGETS)
+    ),
+    "GET /api/v1/contacts/trash": Case("contact:delete", lists="deleted_contact"),
+    "DELETE /api/v1/contacts/{contact_id}": Case(
+        "contact:delete", None, CRM_TARGETS, "contact:read"
+    ),
+    "POST /api/v1/contacts/{contact_id}/restore": Case(
+        "contact:delete", lambda w, r: {}, tuple(f"deleted_{t}" for t in CRM_TARGETS)
+    ),
+    "DELETE /api/v1/deals/{deal_id}": Case("deal:delete", None, CRM_TARGETS, "deal:read"),
+    "POST /api/v1/deals/{deal_id}/restore": Case(
+        "deal:delete", lambda w, r: {}, tuple(f"deleted_{t}" for t in CRM_TARGETS)
+    ),
 }
 
 
@@ -208,6 +228,7 @@ def in_scope(target: str | None, scope: Scope | None) -> bool:
     владельцы целей own и same_team."""
     if target is None:
         return True
+    target = target.removeprefix("deleted_")  # запись в корзине — тот же владелец
     if scope is None or target == "other_org":
         return False
     match scope:
@@ -279,6 +300,27 @@ async def build_world(
         for t, o in owners.items()
     }
     world.ids["activity"] = {t: (await make_activity(o)).id for t, o in owners.items()}
+    # Записи в корзине — для восстановления и списка корзины.
+    gone = datetime.now(UTC)
+    world.ids["company"].update(
+        {f"deleted_{t}": (await make_company(o, deleted_at=gone)).id for t, o in owners.items()}
+    )
+    world.ids["contact"].update(
+        {f"deleted_{t}": (await make_contact(o, deleted_at=gone)).id for t, o in owners.items()}
+    )
+    world.ids["deleted_contact"] = {t: world.ids["contact"][f"deleted_{t}"] for t in CRM_TARGETS}
+    world.ids["deal"].update(
+        {
+            f"deleted_{t}": (
+                await make_deal(
+                    o,
+                    pipelines["other_org" if t == "other_org" else "same_org"].stages[0],
+                    deleted_at=gone,
+                )
+            ).id
+            for t, o in owners.items()
+        }
+    )
     return world
 
 
@@ -304,6 +346,7 @@ def url_for(route: str, target: str | None, world: World) -> str:
 
 
 SUCCESS = {"GET": 200, "PATCH": 200, "POST": 201, "DELETE": 204}
+RESTORE = 200  # POST …/restore возвращает восстановленную запись, а не создаёт новую
 ACCEPTED = {"POST /api/v1/invites", "POST /api/v1/admin/orgs/{org_id}/invites"}
 
 
@@ -340,6 +383,8 @@ async def test_access(
     method = route.split(" ", 1)[0]
     case = CASES[route]
     success = 202 if route in ACCEPTED else SUCCESS[method]
+    if route.endswith("/restore"):
+        success = RESTORE
 
     path = url_for(route, target, world) if case.query is None else route.split(" ", 1)[1]
     resp = await client.request(

@@ -170,3 +170,33 @@ async def update_deal(
     version — из последнего GET."""
     fields = body.model_dump(exclude_unset=True, exclude={"version"})
     return DealOut.model_validate(await deals.update(access, deal_id, body.version, fields))
+
+
+@protected_router.delete(
+    "/deals/{deal_id}",
+    tags=["deals"],
+    status_code=status.HTTP_204_NO_CONTENT,
+    responses={**PROTECTED, **NOT_FOUND},
+)
+async def delete_deal(
+    deal_id: RecordId,
+    access: Access = Depends(authorize),
+    service: DealService = Depends(get_deal_service),
+) -> None:
+    """Удалить в корзину: запись перестаёт быть видна, но 30 дней её можно восстановить."""
+    await service.delete(access, deal_id)
+
+
+@protected_router.post(
+    "/deals/{deal_id}/restore",
+    tags=["deals"],
+    responses={**PROTECTED, **NOT_FOUND, **CONFLICT},
+)
+async def restore_deal(
+    deal_id: RecordId,
+    access: Access = Depends(authorize),
+    service: DealService = Depends(get_deal_service),
+) -> DealOut:
+    """Восстановить из корзины в текущий отдел ответственного. Ответственный отключён или
+    больше не ведёт записи — 409 owner.inactive."""
+    return DealOut.model_validate(await service.restore(access, deal_id))

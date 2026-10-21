@@ -118,6 +118,18 @@ test_only_org_admin_reads_audit if {
 	}
 }
 
+# Менеджер не удаляет даже свои записи — только руководитель и админ (раздел 5).
+test_sales_rep_cannot_delete_contact if {
+	not authz.allow with input as req(sales_rep, "DELETE", "/api/v1/contacts/{contact_id}")
+	not authz.allow with input as req(sales_rep, "GET", "/api/v1/contacts/trash")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/deals/{deal_id}/restore")
+	every user in [org_admin, team_lead] {
+		authz.allow with input as req(user, "DELETE", "/api/v1/companies/{company_id}")
+		authz.allow with input as req(user, "POST", "/api/v1/contacts/{contact_id}/restore")
+		authz.allow with input as req(user, "DELETE", "/api/v1/deals/{deal_id}")
+	}
+}
+
 # У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
 test_super_admin_only_admin_routes if {
 	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/orgs")

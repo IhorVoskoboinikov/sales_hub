@@ -1615,7 +1615,7 @@ deploy/
 - [x] 4.3 Воронки, этапы, `deals` (пока только USD), эндпоинт канбана + строки в `routes.rego` и кейсы матрицы.
 - [x] 4.4 `fx_rates`, `FxService` (НБУ, кэш, резерв), суммы сделок в любой валюте, параметр `?currency=`.
 - [x] 4.5 `activities` с партициями по месяцам, `ensure_monthly_partitions`, `notes`; `audit_log` на партициях и `GET /audit` + строки в `routes.rego`.
-- [ ] 4.6 Корзина: удаление, восстановление, список удалённых + строки в `routes.rego`.
+- [x] 4.6 Корзина: удаление, восстановление, список удалённых + строки в `routes.rego`.
 - [ ] 4.7 Отчёты: materialized view `deal_stats` и эндпоинты + строки в `routes.rego`.
 - [ ] 4.8 `seed_big.sql` (5 млн контактов, 1 млн сделок, 20 млн активностей), `make seed-big`.
 - [ ] 4.9 Индексы из раздела 3: замеры «без / с» → `docs/experiments.md`; `make explain`.

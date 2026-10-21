@@ -44,4 +44,12 @@ actions := {
 	"GET /api/v1/contacts/{contact_id}/notes": "contact:read",
 	"POST /api/v1/contacts/{contact_id}/notes": "contact:write",
 	"GET /api/v1/audit": "audit:read",
+	# --- этап 4: корзина
+	"DELETE /api/v1/companies/{company_id}": "company:delete",
+	"POST /api/v1/companies/{company_id}/restore": "company:delete",
+	"GET /api/v1/contacts/trash": "contact:delete",
+	"DELETE /api/v1/contacts/{contact_id}": "contact:delete",
+	"POST /api/v1/contacts/{contact_id}/restore": "contact:delete",
+	"DELETE /api/v1/deals/{deal_id}": "deal:delete",
+	"POST /api/v1/deals/{deal_id}/restore": "deal:delete",
 }

@@ -23,6 +23,8 @@ from app.repositories.pagination import Key, Page, PageResult, fetch_page, pagin
 # Сортировка списков: новые сначала. Тот же порядок колонок — в индексах ix_contacts_*_created_at.
 CONTACT_ORDER = (Key(Contact.created_at, desc=True), Key(Contact.id, desc=True))
 COMPANY_ORDER = (Key(Company.name), Key(Company.id))
+# Корзина: удалённые недавно — сначала. Тот же порядок — в индексе ix_contacts_trash.
+TRASH_ORDER = (Key(Contact.deleted_at, desc=True), Key(Contact.id, desc=True))
 
 
 # Поиск по подстроке идёт через триграммы pg_trgm: из запроса без трёх букв или цифр подряд
@@ -80,6 +82,13 @@ class ContactRepository(SoftDeleteRepository[Contact]):
     ) -> PageResult[Contact]:
         query = self.list_query(access, filters, page)
         return await fetch_page(self.session, query, CONTACT_ORDER, page)
+
+    def trash_query(self, access: Access, page: Page) -> Select[Any]:
+        query = select(Contact).where(Contact.deleted_at.is_not(None), access.sql_filter(Contact))
+        return paginate(query, TRASH_ORDER, page)
+
+    async def trash(self, access: Access, page: Page) -> PageResult[Contact]:
+        return await fetch_page(self.session, self.trash_query(access, page), TRASH_ORDER, page)
 
     async def find_by_email(self, org_id: Any, email: str) -> tuple[Contact, str] | None:
         """Живой контакт организации с таким email и email его ответственного — без Access:

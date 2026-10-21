@@ -12,6 +12,7 @@ from app.repositories.email_tokens import EmailTokenRepository
 from app.repositories.fx import FxRateRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
+from app.repositories.reports import ReportRepository
 from app.repositories.users import UserRepository
 
 
@@ -32,6 +33,7 @@ class UnitOfWork:
         self.activities = ActivityRepository(session)
         self.notes = NoteRepository(session)
         self.audit_log = AuditQueries(session)
+        self.reports = ReportRepository(session)
         self.live_records = LiveRecords(session, (Company, Contact, Deal))
 
     async def flush(self) -> None:

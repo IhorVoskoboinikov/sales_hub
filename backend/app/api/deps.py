@@ -30,6 +30,7 @@ from app.services.invites import InviteService
 from app.services.members import MemberService
 from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
+from app.services.reports import ReportService
 from app.uow import UnitOfWork
 
 # Кнопка Authorize в Swagger: форма логина отправляется на tokenUrl.
@@ -189,6 +190,12 @@ def get_note_service(
 
 def get_audit_service(uow: UnitOfWork = Depends(get_uow)) -> AuditService:
     return AuditService(uow)
+
+
+def get_report_service(
+    uow: UnitOfWork = Depends(get_uow), fx: FxService = Depends(get_fx_service)
+) -> ReportService:
+    return ReportService(uow, fx)
 
 
 def get_page(

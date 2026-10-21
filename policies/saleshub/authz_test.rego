@@ -130,6 +130,15 @@ test_sales_rep_cannot_delete_contact if {
 	}
 }
 
+test_everyone_in_org_reads_reports_in_own_level if {
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		d := authz.decision with input as req(user, "GET", "/api/v1/reports/managers")
+		d.allow
+		d.action == "report:read"
+	}
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/reports/pipeline")
+}
+
 # У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
 test_super_admin_only_admin_routes if {
 	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/orgs")

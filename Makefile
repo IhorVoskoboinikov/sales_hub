@@ -5,7 +5,7 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt
+.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -42,6 +42,9 @@ keys:  ## создать приватный ключ JWT в backend/secrets/ (е
 
 migrate:  ## применить миграции в compose
 	$(COMPOSE) run --rm --build migrate
+
+refresh-reports:  ## обновить отчёты (materialized view deal_stats) в compose
+	$(COMPOSE) exec api python -m app.cli refresh-reports
 
 revision:  ## новая миграция по моделям: make revision m="add users"
 	$(BACKEND) uv run alembic revision --autogenerate -m "$(m)"

@@ -3,6 +3,7 @@
 generate-jwt-key   создать приватный RS256-ключ для JWT (make keys)
 create-superadmin  создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD
 ensure-partitions  месячные партиции activities и audit_log на 2 месяца вперёд
+refresh-reports    обновить отчёты (REFRESH MATERIALIZED VIEW CONCURRENTLY deal_stats)
 """
 
 import argparse
@@ -88,6 +89,20 @@ async def ensure_partitions_command(settings: Settings) -> int:
     return 0
 
 
+async def refresh_reports_command(settings: Settings) -> int:
+    """Отчёты читают materialized view — он обновляется этой командой (с этапа 5 — задачей
+    beat reports.refresh каждые 5 минут)."""
+    engine = create_engine(settings.database_url)
+    try:
+        async with create_session_factory(engine)() as session:
+            await UnitOfWork(session).reports.refresh()
+            await session.commit()
+    finally:
+        await engine.dispose()
+    print("отчёты обновлены")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -98,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         "create-superadmin", help="создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD"
     )
     commands.add_parser("ensure-partitions", help="месячные партиции на 2 месяца вперёд")
+    commands.add_parser("refresh-reports", help="обновить materialized view отчётов")
 
     args = parser.parse_args(argv)
     settings = get_settings()
@@ -106,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "ensure-partitions":
         return asyncio.run(ensure_partitions_command(settings))
+    if args.command == "refresh-reports":
+        return asyncio.run(refresh_reports_command(settings))
     return asyncio.run(create_superadmin_command(settings))
 
 

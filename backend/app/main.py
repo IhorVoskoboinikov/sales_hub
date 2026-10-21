@@ -20,6 +20,7 @@ from app.api.v1 import (  # noqa: F401 — модули с эндпоинтам�
     organizations,
     pipelines,
     protected_router,
+    reports,
     teams,
     users,
 )

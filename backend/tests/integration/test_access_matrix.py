@@ -198,6 +198,13 @@ CASES: dict[str, Case] = {
     "POST /api/v1/deals/{deal_id}/restore": Case(
         "deal:delete", lambda w, r: {}, tuple(f"deleted_{t}" for t in CRM_TARGETS)
     ),
+    "GET /api/v1/reports/pipeline": Case(
+        "report:read",
+        targets=ORG_TARGETS,
+        query=lambda w, t: {"pipeline_id": w.ids["pipeline"][t]},
+        org_object=True,
+    ),
+    "GET /api/v1/reports/managers": Case("report:read"),
 }
 
 

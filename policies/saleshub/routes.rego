@@ -52,4 +52,7 @@ actions := {
 	"POST /api/v1/contacts/{contact_id}/restore": "contact:delete",
 	"DELETE /api/v1/deals/{deal_id}": "deal:delete",
 	"POST /api/v1/deals/{deal_id}/restore": "deal:delete",
+	# --- этап 4: отчёты
+	"GET /api/v1/reports/pipeline": "report:read",
+	"GET /api/v1/reports/managers": "report:read",
 }

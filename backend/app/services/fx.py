@@ -15,9 +15,11 @@ get_rate(валюта, дата):
 """
 
 import contextlib
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
+from zoneinfo import ZoneInfo
 
 import httpx
 import structlog
@@ -123,6 +125,18 @@ class FxService:
             "fx_rate_stale", currency=currency, on=on.isoformat(), used=str(fallback.rate_date)
         )
         return Rate(currency, fallback.rate_uah, fallback.rate_date, stale=True)
+
+    async def org_today(self, org_id: uuid.UUID) -> date:
+        """Сегодня по часовому поясу организации: курс НБУ — на её календарную дату."""
+        org = await self.uow.organizations.get(org_id)
+        return datetime.now(ZoneInfo(org.timezone if org else "UTC")).date()
+
+    async def display_for(self, org_id: uuid.UUID, currency: str | None) -> Display:
+        """Курс для ответа: ?currency= или валюта организации по умолчанию, на её сегодня."""
+        if currency is None:
+            org = await self.uow.organizations.get(org_id)
+            currency = org.display_currency if org else "USD"
+        return await self.display(currency, await self.org_today(org_id))
 
     async def display(self, currency: str, on: date) -> Display:
         if currency == "USD":

@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
@@ -221,14 +220,7 @@ class DealService(CrmService[Deal]):
         return Money(converted.amount_usd, amount, currency, converted.fx_rate, converted.fx_date)
 
     async def today(self, access: Access) -> date:
-        """Сегодня по часовому поясу организации: курс НБУ — на её календарную дату."""
-        org = await self.uow.organizations.get(access.org_id)
-        zone = ZoneInfo(org.timezone if org else "UTC")
-        return datetime.now(zone).date()
+        return await self.fx.org_today(access.org_id)
 
     async def display(self, access: Access, currency: str | None) -> Display:
-        """Курс для ответа: ?currency= или валюта организации по умолчанию."""
-        if currency is None:
-            org = await self.uow.organizations.get(access.org_id)
-            currency = org.display_currency if org else "USD"
-        return await self.fx.display(currency, await self.today(access))
+        return await self.fx.display_for(access.org_id, currency)

@@ -24,7 +24,7 @@ SalesHub — мульти-тенантная CRM для отделов прод�
 | ORM / БД | SQLAlchemy 2.0 async + asyncpg, PostgreSQL 18 | партиции, частичные/покрывающие индексы, COPY |
 | Миграции | Alembic (async env.py) |  |
 | Auth | PyJWT, pwdlib/argon2 | вход по почте, access 1 ч, refresh 30 дней; письма через Jinja2, в dev — Mailpit |
-| Очереди | Celery + Redis (broker + result backend), Celery beat, Flower | этап 5, детали — раздел 15 |
+| Очереди | Celery 5.6 + Redis (broker; result backend не нужен), Celery beat, Flower | этап 5, детали — раздел 15 |
 | События (этап 9) | Transactional outbox → Redpanda (Kafka API), aiokafka или FastStream | сравнение с Celery |
 | Логи | structlog (JSON), Loki |  |
 | Метрики / алерты | Prometheus, Grafana, Alertmanager → Telegram |  |
@@ -35,10 +35,13 @@ SalesHub — мульти-тенантная CRM для отделов прод�
 | CI/CD | GitHub Actions, GHCR, Argo CD (локальный CD) |  |
 | Фронт (в конце) | Vite + React + TanStack Query/Table |  |
 | Авторизация | OPA (Open Policy Agent), правила на Rego, сайдкар | policy as code: правила в git, тесты opa test |
-| Уведомления | aiogram (Telegram-бот), письма через SMTP | раздел 16 |
+| Уведомления | aiogram 3 (Telegram-бот), письма через SMTP; отправка из воркеров через outbox | раздел 16 |
+| Файлы | S3 API через aiobotocore; локально RustFS | импорт CSV (этап 5) |
 | Поиск | Elasticsearch + Kibana | раздел 17 |
 
 **Версии:** Python 3.13 и PostgreSQL 18. Python 3.13 — проверенная ветка: у всех библиотек (asyncpg, pydantic-core, argon2) есть готовые wheels, поддержка до октября 2029. PostgreSQL 18 — текущая стабильная ветка. Переход на Python 3.14/3.15 и PostgreSQL 19 — отдельное упражнение на этапе 10. Точные версии пакетов фиксируются в `uv.lock`.
+
+**Версии этапа 5 и временные ограничения.** Стабильный Celery 5.6.3 тянет kombu 5.6, а он требует redis-py < 6.5; aiogram 3.31 требует pydantic < 2.14. Поэтому на этапе 5 стоят `celery[redis]==5.6.3` + `redis>=6.4,<6.5` и `aiogram==3.31.0` + `pydantic[email]>=2.13.5,<2.14`; `aiobotocore` тянет aiohttp 3.14 (потолок aiohttp < 3.15 от aiogram действует и на него). Код использует из redis-py и pydantic только то, что есть в этих версиях. У `testcontainers` экстра `redis` требует redis-py ≥ 7, поэтому в dev стоит `testcontainers[postgres]`: модулю Redis-контейнера нужен только импортируемый `redis`, а его даёт основная зависимость. Когда выйдут Celery 5.7 (kombu 5.7 разрешает redis < 9) и aiogram с поддержкой pydantic 2.14, ограничения снимаются одним коммитом `config(deps)` с полным прогоном тестов. Типы для mypy — `celery-types` и `types-aiobotocore-s3` (dev).
 
 ## 2. Архитектура слоёв
 
@@ -116,7 +119,7 @@ class DealService:
         return deal
 ```
 
-**Celery-воркеры** используют те же сервисы, UoW и репозитории, но получают сессию не из FastAPI Depends, а из своей фабрики (`worker_session_factory`, engine создаётся на процесс воркера в сигнале `worker_process_init`). Так бизнес-логика пишется один раз.
+**Celery-воркеры** используют те же сервисы, UoW и репозитории, но получают сессию не из FastAPI Depends, а из своих `Resources` (engine и фабрика сессий создаются лениво, один раз на процесс воркера — раздел 15). Так бизнес-логика пишется один раз.
 
 ### Структура репозитория
 
@@ -125,7 +128,8 @@ sales_hub/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # create_app(): роутеры, middleware, handlers
-│   │   ├── core/                # config (pydantic-settings), logging, security (jwt, hash)
+│   │   ├── core/                # config (pydantic-settings), logging, security (jwt, hash),
+│   │   │                        # resources.py — ресурсы процесса для API, воркеров и бота
 │   │   ├── db/                  # engine, session factory, base, naming convention
 │   │   ├── models/              # SQLAlchemy-модели
 │   │   ├── schemas/             # Pydantic in/out
@@ -137,16 +141,19 @@ sales_hub/
 │   │   │   ├── deps.py          # get_session, get_engine, get_redis, current_user, сборка сервисов
 │   │   │   ├── well_known.py    # /.well-known/jwks.json — публичные ключи JWT, без авторизации
 │   │   │   ├── health.py        # /health/live, /health/ready — вне /api/v1, без авторизации
-│   │   │   └── v1/              # auth, users, orgs, teams, companies, contacts, deals, activities, bulk, reports
+│   │   │   └── v1/              # auth, users, orgs, teams, companies, contacts, deals, activities, bulk, reports,
+│   │   │                        # me (личные настройки: только current_user, без OPA)
 │   │   ├── errors/              # AppError иерархия + exception handlers
-│   │   ├── emails/              # EmailSender (SMTP), Mailer (пока BackgroundTasks), Jinja2-рендер
+│   │   ├── emails/              # EmailSender (SMTP) и Jinja2-рендер; с этапа 5 письма отправляет только воркер
 │   │   ├── middleware/          # request_id, access log, unhandled errors (500), позже metrics
-│   │   ├── events/              # доменные события, outbox relay
-│   │   ├── workers/             # celery_app.py, runtime.py, schedule.py, tasks/ (раздел 15)
+│   │   ├── events/              # типы событий, маршруты «событие → задача», outbox relay
+│   │   ├── notifications/       # каталог событий и каналов, ключи дедупа, клиент Telegram Bot API
+│   │   ├── storage/             # FileStorage: S3 API (aiobotocore)
+│   │   ├── workers/             # celery_app.py, runtime.py, base.py, context.py, queue.py, schedule.py, tasks/ (раздел 15)
 │   │   ├── bot/                 # Telegram-бот на aiogram (раздел 16)
 │   │   ├── search/              # SearchRepository, индексатор (раздел 17)
 │   │   ├── texts/               # украинские тексты: ошибки, письма, бот
-│   │   └── cli.py               # create-superadmin, seed
+│   │   └── cli.py               # create-superadmin, ensure-partitions, ensure-bucket, refresh-reports
 │   ├── migrations/              # alembic
 │   ├── tests/{unit,integration,e2e}/
 │   ├── scripts/seed_big.sql     # генерация миллионов строк
@@ -179,7 +186,7 @@ sales_hub/
 | --- | --- | --- |
 | `users` | id (uuid), email (unique, citext), password\_hash, is\_active, is\_superadmin, **org\_id, team\_id, role**, email\_verified\_at, token\_version, timezone (null = как у организации), last\_login\_at, created\_at | один человек — одна организация и одна роль (раздел 5). `role` ∈ `org_admin` / `team_lead` / `sales_rep` / `viewer`. CHECK-и (в Postgres CHECK, который дал NULL, считается пройденным, поэтому условия написаны без сравнений с NULL): `role IN ('org_admin','team_lead','sales_rep','viewer')`; `(role IS NULL) = (org_id IS NULL)`; `NOT (is_superadmin AND org_id IS NOT NULL)`; `(team_id IS NOT NULL) = (role IS NOT NULL AND role IN ('team_lead','sales_rep'))`. FK `(team_id, org_id)` → `teams (id, org_id)` — отдел только из своей организации. Пользователей без организации и роли (не супер-админов), оставшихся с этапа 2, удаляет миграция этапа 3 (это только dev-данные; `downgrade` их не возвращает). Если такой всё же появится — он ничего не может: OPA отвечает 403 |
 | `refresh_tokens` | id, user\_id, family\_id (= `sid`), token\_hash (unique), created\_at, expires\_at, revoked\_at, replaced\_by, user\_agent, ip | раздел 4 |
-| `email_tokens` | id, user\_id, email, purpose (`invite` / `reset_password`), token\_hash, payload jsonb (org\_id, team\_id, role для приглашения), created\_at, expires\_at, used\_at | раздел 4 |
+| `email_tokens` | id, user\_id, email, purpose (`invite` / `reset_password` / `telegram_link` — с этапа 5), token\_hash, payload jsonb (org\_id, team\_id, role для приглашения), created\_at, expires\_at, used\_at | одноразовые токены трёх целей (разделы 4 и 16) |
 | `organizations` | id, name, slug (unique), plan, display\_currency (по умолчанию UAH), timezone (по умолчанию Europe/Kyiv), created\_at | тенант: компания, которая пользуется CRM; создаёт только супер-админ |
 | `teams` | id, org\_id, name, created\_at | отдел продаж; UNIQUE (id, org\_id) для составного FK из `users`; UNIQUE (org\_id, name) — два одинаковых отдела в организации путают (409 `team.name_taken`); отдел с людьми удалить нельзя — 409 `team.has_members` |
 
@@ -188,7 +195,7 @@ sales_hub/
 | Таблица | Ключевые поля | Объём / заметки |
 | --- | --- | --- |
 | `companies` | id, org\_id, team\_id, owner\_id, name, domain, industry, size, created\_at, updated\_at, deleted\_at, version | 300 тыс.; компании-клиенты — общий справочник: видны всей организации (`company:read` — org у всех ролей), меняются по уровню `company:write` |
-| `contacts` | id, org\_id, team\_id, owner\_id, company\_id, first\_name, last\_name, email (citext), phone, status (`lead` / `customer` / `churned`), source, tags text\[\], created\_at, updated\_at, deleted\_at, version | **5 млн**; уникальность `(org_id, email)` для дедупликации при импорте |
+| `contacts` | id, org\_id, team\_id, owner\_id, company\_id, first\_name, last\_name, email (citext), phone, status (`lead` / `customer` / `churned`), source, tags varchar(64)\[\] (до 20; в запросах — `ARRAY[:t]::varchar(64)[]`, раздел 6), created\_at, updated\_at, deleted\_at, version | **5 млн**; уникальность `(org_id, email)` для дедупликации при импорте |
 | `pipelines`, `pipeline_stages` | pipeline: id, org\_id, name (UNIQUE в организации), created\_at; stage: id, pipeline\_id, name, position, probability (0–100); UNIQUE (id, pipeline\_id) — для составного FK из `deals` | воронки и этапы, настраивает org admin; новая организация создаётся без воронок |
 | `deals` | id, org\_id, team\_id, owner\_id, contact\_id, company\_id, pipeline\_id, stage\_id, title, amount\_usd numeric(14,2), amount\_original numeric(14,2), currency\_original char(3), fx\_rate numeric(14,6), fx\_date, status (`open` / `won` / `lost`), expected\_close\_date, closed\_at, created\_at, updated\_at, deleted\_at, version | **1 млн**; FK `(stage_id, pipeline_id)` → `pipeline_stages (id, pipeline_id)`: этап всегда из воронки сделки, `pipeline_id` берётся из этапа. `won` / `lost` ставят `closed_at`, возврат в `open` его снимает |
 | `activities` | id, org\_id, team\_id, owner\_id, deal\_id, contact\_id, type (`call` / `meeting` / `email` / `task`), subject, due\_at, done\_at, created\_at | **20 млн**, `PARTITION BY RANGE (created_at)` по месяцам, PK `(id, created_at)` (ключ партиционирования обязан входить в PK). Запланированная активность — с `due_at`, `done_at` пуст до отметки «выполнено»; без `due_at` — это запись о том, что уже было (звонок, письмо), `done_at = created_at` сразу. Поэтому «открытые» — ровно `done_at IS NULL` |
@@ -198,14 +205,17 @@ sales_hub/
 
 | Таблица | Назначение |
 | --- | --- |
-| `bulk_jobs` | id, kind (`import_contacts`, `reassign_owner`, `move_team`, `close_stale_deals`, `add_tags`, `export`, `reindex`), status, stage (шаг импорта), params jsonb (фильтр + `Access` того, кто запустил), idempotency\_key, total, processed, failed, error, org\_id (NULL у задач супер-админа), team\_id, owner\_id (кто запустил — по этим полям работают `bulk_job:read` и `bulk_job:cancel`), timestamps |
-| `import_errors` | job\_id, row\_no, raw jsonb, error — строки CSV, которые не прошли валидацию |
-| `outbox_events` | transactional outbox: события и письма |
-| `audit_log` | кто что изменил: id, occurred\_at, org\_id, actor\_id (оба без FK — журнал переживает удаление), action (`member.updated`, `team.created`, `invite.created`…), entity\_type, entity\_id, changes jsonb (`{"role": ["viewer", "org_admin"]}` — было и стало), request\_id. Запись — в той же транзакции, что и изменение. Этап 3 — обычная таблица; с этапа 4 — `PARTITION BY RANGE (occurred_at)` по месяцам, PK (id, occurred\_at), индексы (org\_id, occurred\_at, id) и (org\_id, entity\_type, entity\_id, occurred\_at, id), `GET /audit`. В журнал пишутся и CRM-изменения: создание, изменение (diff), удаление и восстановление компаний, контактов, сделок, воронок; активности и заметки — нет, их слишком много |
+| `bulk_jobs` | id uuid; org\_id (NOT NULL, FK); team\_id (отдел автора на момент запуска, без FK); owner\_id — **автор** job (FK users; имя `owner_id`, чтобы `Access` работал для `bulk_job:read` / `bulk_job:cancel` без изменений); kind CHECK IN (`reassign_owner`, `move_team`, `import_contacts`, `close_overdue_deals`, `add_tags`, `remove_tags`) — `export` и `reindex` добавят расширяющие миграции этапов 10 и 9; status CHECK IN (`pending`, `running`, `cancelling`, `done`, `partial_failed`, `failed`, `cancelled`); stage (последний завершённый шаг импорта); params jsonb (параметры + `Access` автора); idempotency\_key varchar(64), request\_hash char(64); счётчики total, processed, failed\_rows, chunks\_total, failed\_chunks; result jsonb (итоги: `{created, updated}` импорта, строки по сущностям); error varchar(64) — код причины провала; reaps smallint; created\_at, started\_at, updated\_at (время последнего прогресса — по нему работает `bulk.reap_stuck`), finished\_at. Колонки `version` нет: переходы статуса — условными `UPDATE … WHERE status IN (…)`. Индексы: `UNIQUE (owner_id, idempotency_key)`; `UNIQUE (org_id, kind) WHERE status IN ('pending','running','cancelling') AND kind <> 'move_team'` — одна тяжёлая job вида на организацию (раздел 15) |
+| `bulk_job_chunks` | job\_id (FK, ON DELETE CASCADE), no; PK (job\_id, no); entity CHECK IN (`companies`, `contacts`, `deals`, `activities`); lo, hi bigint — границы id; status CHECK IN (`pending`, `done`, `failed`, `skipped`); rows; error; finished\_at — учёт каждого чанка: повтор идемпотентен, прогресс не считается дважды, завершение job видно по базе (раздел 6) |
+| `contacts_staging` | job\_id (FK, CASCADE), row\_no; PK (job\_id, row\_no); проверенные и нормализованные поля строки CSV (email — `text`, сравнение по `lower()`; first\_name, last\_name, phone, status, source, tags, owner\_email), owner\_id, error, merged — общая обычная (logged) таблица шагов импорта: любой воркер видит данные любого шага; строки job удаляются при финальном статусе |
+| `import_errors` | job\_id (FK, CASCADE), row\_no; PK (job\_id, row\_no) — у строки одна, первая ошибка; code, field, raw jsonb (ячейки строки файла; у `duplicate_outside_scope` — без данных существующего контакта) |
+| `outbox_events` | id bigint identity; event\_type; org\_id (без FK, NULL — у супер-админа); payload jsonb; request\_id; created\_at; published\_at. Частичный индекс `(id) WHERE published_at IS NULL`, триггер `AFTER INSERT … FOR EACH STATEMENT` → `pg_notify('outbox_new')`. Команды на отправку (`email.send`, `telegram.send`) и доменные события (раздел 6) |
+| `audit_log` | кто что изменил: id, occurred\_at, org\_id, actor\_id (оба без FK — журнал переживает удаление), action (`member.updated`, `team.created`, `invite.created`…), entity\_type, entity\_id, changes jsonb (`{"role": ["viewer", "org_admin"]}` — было и стало), request\_id. Запись — в той же транзакции, что и изменение. Этап 3 — обычная таблица; с этапа 4 — `PARTITION BY RANGE (occurred_at)` по месяцам, PK (id, occurred\_at), индексы (org\_id, occurred\_at, id) и (org\_id, entity\_type, entity\_id, occurred\_at, id), `GET /audit`. В журнал пишутся и CRM-изменения: создание, изменение (diff), удаление и восстановление компаний, контактов, сделок, воронок; активности и заметки — нет, их слишком много. Массовая операция пишет **одну** строку на job (`action = bulk.<kind>`, `entity_type = bulk_job`, в `changes` — параметры и число строк по сущностям): история карточки массовых изменений не показывает, построчный аудит через `RETURNING OLD` (PostgreSQL 18) — эксперимент этапа 10 |
 | fx\_rates | rate\_date, currency, rate\_uah numeric(14,6) (гривен за 1 единицу валюты), source = NBU, fetched\_at; PK (rate\_date, currency) — курсы НБУ |
-| failed\_tasks | задачи Celery, упавшие после всех ретраев: имя, аргументы, ошибка, request\_id, replayed\_at (раздел 15) |
-| sent\_notifications | dedup\_key (unique), channel, user\_id, sent\_at — защита от повторной отправки писем и сообщений |
-| telegram\_links, notification\_settings | привязка chat\_id к пользователю; настройки «событие × канал» (раздел 16) |
+| failed\_tasks | задачи Celery, упавшие после всех ретраев (раздел 15): id; task\_id (UNIQUE — повторная доставка не даёт дубля); task\_name, queue, args, kwargs jsonb; request\_id, user\_id (без FK); exc\_type, exc\_message (до 2 000 символов), traceback (до 20 000); retries; failed\_at; replayed\_at, replayed\_by, replay\_task\_id. Индекс (failed\_at, id) |
+| sent\_notifications | dedup\_key (PK), channel CHECK IN (`email`, `telegram`), user\_id (без FK: у приглашения пользователя ещё нет), sent\_at; индекс (sent\_at) для очистки — защита от повторной отправки писем и сообщений |
+| telegram\_links | user\_id (PK, FK users ON DELETE CASCADE), chat\_id bigint UNIQUE, username, linked\_at — один чат ↔ один пользователь (раздел 16) |
+| notification\_settings | user\_id (FK, CASCADE), event\_type, channel; PK (user\_id, event\_type, channel); enabled — только отличия от умолчаний из кода (раздел 16) |
 
 Таблиц `roles`, `permissions`, `role_permissions` и членств нет: права ролей живут в файле `policies/saleshub/data.yaml` (его читают OPA и бэкенд), в базе только `users.role` и `users.team_id`. У всех CRM-таблиц (компании, контакты, воронки, этапы, сделки, активности, заметки) id — `bigint` identity: для чанков по диапазонам id, keyset-пагинации и `generate_series` в генераторе данных это проще и быстрее; организации, отделы и пользователи остаются на uuid.
 
@@ -220,7 +230,7 @@ sales_hub/
 | `contacts.company_id`, `deals.contact_id`, `deals.company_id` | `ON DELETE SET NULL` | окончательное удаление компании или контакта из корзины не трогает связанные записи; полные индексы — они же для фильтров `?company_id=`, `?contact_id=` |
 | `deals (stage_id, pipeline_id)` | → `pipeline_stages (id, pipeline_id)` | этап не может быть из чужой воронки; удалить этап можно, только если на нём нет сделок, **включая корзину** (409 `pipeline.stage_has_deals`), полный индекс `deals (stage_id)` |
 | `activities.deal_id` / `contact_id` | `ON DELETE CASCADE` / `SET NULL` | история уходит вместе со сделкой; удаление контакта не стирает историю его сделки |
-| `activities.org_id`, `team_id`, `owner_id`; `notes.entity_id` | **нет** | 20 млн строк; у заметки родитель полиморфный (`entity_type`), его удаляет `trash.purge` |
+| `activities.org_id`, `team_id`, `owner_id`; `notes.entity_id` | **нет** | 20 млн строк; у заметки родитель полиморфный (`entity_type`), заметки удаляет `trash.purge` вместе с родителем |
 
 Связь «запись — та же организация» (`company_id` из своей организации) проверяет сервис: ссылка загружается через `Access` (раздел 5).
 
@@ -231,7 +241,7 @@ sales_hub/
 - Все запросы по умолчанию добавляют `deleted_at IS NULL` (общий фильтр в репозитории, а не в каждом запросе руками).
 - Эндпоинты корзины: `DELETE` и `POST …/restore` у компаний, контактов и сделок; список удалённых — только `GET /contacts/trash` (уровень `contact:delete`, новые сначала).
 - Восстановление возвращает запись в **текущий** отдел её ответственного; если ответственный отключён или больше не может вести записи — 409 `owner.inactive`. У контакта ещё проверяется, что живого контакта с тем же email нет (409 `contact.duplicate_email`).
-- Через 30 дней задача beat `trash.purge` удаляет строки физически, чанками.
+- Через 30 дней задача beat `trash.purge` удаляет строки физически, чанками по 1 000 в своей транзакции: сделки → контакты → компании (от детей к родителям — меньше работы `SET NULL`), по каждой организации, `FOR UPDATE SKIP LOCKED` (строку, которую сейчас восстанавливают, задача пропускает). Вместе с записью удаляются её заметки; у контакта ещё и его активности без сделки (`deal_id IS NULL`), а активности с живой сделкой остаются (их `contact_id` обнуляет FK — история сделки не теряется). Ссылки `company_id` / `contact_id` обнуляет FK без `version + 1`. В журнал purge не пишет: мягкое удаление там уже есть. Запуск не дольше 200 секунд, остаток удалит следующий.
 - Индексы делаются частичными: `... WHERE deleted_at IS NULL` — удалённые строки не раздувают индекс.
 - Уникальность email тоже частичная: `UNIQUE (org_id, email) WHERE deleted_at IS NULL` — иначе нельзя завести контакт с email удалённого.
 - `activities`, `notes`, `audit_log` удаляются жёстко (или старыми партициями целиком).
@@ -269,7 +279,7 @@ sales_hub/
 Отсюда логика:
 
 1. Задача beat `fx.fetch_nbu_rates` в будни в 18:30 (повтор в 19:30) загружает курсы на следующий день в `fx_rates`.
-2. `FxService.get_rate(currency, date)`: Redis-кэш (1 ч) → строка `fx_rates` на эту дату → запрос к НБУ за все валюты на эту дату (`exchange?date=YYYYMMDD&json`, таймаут 3 с) и upsert. НБУ отдаёт курс и на выходные (тот, что действует в этот день), а на будущую дату — пустой список. До этапа 5 (задача beat) курсы так подтягиваются по первому запросу дня.
+2. `FxService.get_rate(currency, date)`: Redis-кэш (1 ч) → строка `fx_rates` на эту дату → запрос к НБУ за все валюты на эту дату (`exchange?date=YYYYMMDD&json`, таймаут 3 с) и upsert. НБУ отдаёт курс и на выходные (тот, что действует в этот день), а на будущую дату — пустой список. Так курс подтягивается по первому запросу дня; с этапа 5 задача beat `fx.fetch_nbu_rates` загружает его заранее, а запрос остаётся резервом.
 3. Если НБУ недоступен или пуст — последняя строка с `rate_date ≤ date`, в ответе `fx.stale: true` (такой курс не кэшируется, в лог — warning, алерт `FxRatesStale`, раздел 8); строк нет совсем — 503 `fx.unavailable`.
 4. При импорте сделок из CSV конвертация идёт в SQL одним `JOIN` на `fx_rates`, а не построчно в Python.
 
@@ -295,7 +305,7 @@ sales_hub/
 | открытые задачи («на сегодня», просроченные) | `activities (owner_id \| team_id \| org_id, due_at, id) WHERE done_at IS NULL` | частичный индекс на партиционированной таблице: открытых задач несколько процентов от 20 млн |
 | лента за период (эксперимент) | BRIN `activities (created_at)` + partition pruning | BRIN полезен, только когда строки лежат на диске в порядке времени; в API не используется — только замер |
 | журнал организации | `audit_log (org_id, occurred_at, id)`, `(org_id, entity_type, entity_id, occurred_at, id)` | партиции по месяцам |
-| корзина | `contacts (org_id, deleted_at, id) WHERE deleted_at IS NOT NULL` | маленький частичный индекс «наоборот» |
+| корзина | `contacts \| deals \| companies (org_id, deleted_at, id) WHERE deleted_at IS NOT NULL` (у сделок и компаний — с этапа 5, `CONCURRENTLY`) | маленький частичный индекс «наоборот»: список корзины и `trash.purge` |
 
 Предикаты частичных индексов (`status = 'open'`, `done_at IS NULL`) в запросах пишутся литералами, а не параметрами: asyncpg готовит запросы, и в общем (generic) плане с `status = $1` Postgres не может доказать, что частичный индекс подходит.
 
@@ -375,9 +385,11 @@ Refresh сделан непрозрачным и хранится в БД нам
 
 ### Одноразовые токены из писем
 
-Одна таблица `email_tokens` для двух целей: `invite` (живёт 7 дней) и `reset_password` (1 час). В письмо уходит случайная строка, в БД — только её SHA-256 хэш; токен одноразовый (`used_at`), новый запрос на ту же цель гасит предыдущие — для приглашений только той же организации (`payload.org_id`): иначе админ одной организации мог бы гасить чужие приглашения, пригласив тот же email. Для приглашения в `payload` лежат организация, отдел и роль.
+Одна таблица `email_tokens` для одноразовых токенов: `invite` (живёт 7 дней), `reset_password` (1 час) и с этапа 5 `telegram_link` (10 минут, раздел 16). В письмо уходит случайная строка, в БД — только её SHA-256 хэш; токен одноразовый (`used_at`), новый запрос на ту же цель гасит предыдущие — для приглашений только той же организации (`payload.org_id`): иначе админ одной организации мог бы гасить чужие приглашения, пригласив тот же email. Для приглашения в `payload` лежат организация, отдел и роль.
 
-Письмо отправляет не API, а воркер: сервис пишет событие `member.invited` / `password.reset_requested` в outbox → задача `notifications.send_email` (Jinja2-шаблоны). Приглашение не падает, если SMTP недоступен, — письмо уйдёт с ретраем. До этапа 5 (воркеры) письмо отправляет `BackgroundTasks` FastAPI через тот же интерфейс `EmailSender` — после коммита и уже после ответа клиенту: ответ не ждёт SMTP — по времени ответа `password/forgot` не видно отправки письма (небольшая разница остаётся: для существующего email сервис ещё записывает токен в базу), а ошибка SMTP только пишется в лог (письмо теряется; ретраи появятся вместе с очередью). На этапе 5 меняется только место вызова `EmailSender`: вместо `BackgroundTasks` — outbox и задача. В dev — Mailpit (SMTP на 1025, веб на 8025), в prod — любой SMTP или Amazon SES.
+Письмо отправляет не API, а воркер. Сервис в той же транзакции, что токен и строка журнала, пишет в `outbox_events` **команду** `email.send` (`{to, template, context, user_id, dedup_key}`) — не доменное событие: в контексте лежит сырой токен, и на этапе 9 он не должен попасть в Kafka. После коммита relay публикует задачу `notifications.send_email(event_id)` (раздел 15). Так письмо не теряется, если коммит прошёл, а SMTP или Redis недоступны (ретраи), и не уходит, если коммит откатился. Ответ `password/forgot` по-прежнему не ждёт SMTP. До этапа 5 письмо отправлял `BackgroundTasks` FastAPI после коммита (ошибка SMTP только в лог, письмо терялось); с этапа 5 `Mailer` и `BackgroundMailer` удаляются, а API почту не отправляет вовсе — `EmailSender` создаёт только воркер. В dev — Mailpit (SMTP на 1025, веб на 8025), в prod — любой SMTP или Amazon SES.
+
+**Токен в outbox.** В `email_tokens` лежит только хэш, а сырой токен живёт в `outbox_events.payload` от коммита до отправки (обычно секунды). Relay передаёт в Redis только `event_id`, поэтому в сообщениях брокера токена нет; `send_email` после успешной отправки в той же транзакции стирает его из payload (`payload #- '{context,token}'`), а опубликованные строки удаляются через 7 дней. Если отправка упала, токен остаётся — ретрай и перезапуск из `failed_tasks` работают.
 
 ### Зависимость `current_user`
 
@@ -474,7 +486,7 @@ Refresh сделан непрозрачным и хранится в БД нам
 - `owner_id` — по умолчанию текущий пользователь; руководитель и админ могут указать другого, но ответственным может быть только активный `team_lead` или `sales_rep` той же организации (иначе 422 `owner.invalid`). `org_admin` и `viewer` сами записей не ведут: создавая запись, `org_admin` обязан указать ответственного (422 `owner.required`);
 - `team_id` — всегда отдел ответственного; его ставит сервис, из тела запроса он не берётся.
 - Ответственный проверяется и `team_id` пересчитывается только при создании и при смене `owner_id`; обычный `PATCH` их не трогает. Строка ответственного читается с `FOR SHARE`: перевод его в другой отдел (`FOR UPDATE` в сервисе пользователей) ждёт, пока запись создастся, и потом её видит.
-- Пока нет bulk job `move_team` (этап 5), сменить отдел или роль (на `org_admin` / `viewer`) человеку, у которого есть живые компании, контакты или сделки, нельзя: 409 `member.has_records` — иначе `team_id` его записей разошёлся бы с отделом. Отключать можно: записи остаются, их передадут bulk-ом.
+- Смена отдела человека, у которого есть живые компании, контакты, открытые сделки или открытые активности: с этапа 5 `users.team_id` меняется сразу, а в той же транзакции создаётся bulk job `move_team` — она «догоняет» записи чанками (раздел 6). Пока job идёт, `team_id` части записей отстаёт — это допустимая, описанная задержка. Смена роли на `org_admin` / `viewer` при живых записях по-прежнему 409 `member.has_records`: отдела у человека больше не будет, записи сначала передают через `POST /bulk/reassign-owner`. Отключать можно: записи остаются, их передадут bulk-ом. (До этапа 5 при живых записях запрещена была и смена отдела.)
 
 Так `team_id` и `owner_id` никогда не расходятся, и проверка «новая версия в моём уровне» у `team_lead` автоматически означает «новый ответственный — из моего отдела».
 
@@ -482,7 +494,7 @@ Refresh сделан непрозрачным и хранится в БД нам
 
 **Дубль, которого не видно.** Email контакта уникален в организации (раздел 3), а видимость ограничена уровнем. Если менеджер создаёт контакт, меняет email или восстанавливает контакт из корзины, а такой email уже есть у записи вне его уровня, сервис возвращает 409 `contact.duplicate_email` и в `details` кладёт только ответственного: `{"owner": "ivan@acme.ua"}` — без id и данных контакта (имени у пользователей нет, поэтому это его рабочий email: внутри организации он не секрет). Менеджер знает, к кому обратиться, а передать клиента может руководитель (так делают контроль дублей в Bitrix24 и amoCRM). Дубль в моём уровне (`contact:read`) — тот же код и `{"contact_id": 123, "owner": …}`. Дублем считается только живой контакт; одновременное создание двух одинаковых ловит частичный UNIQUE — обработчик ошибок по имени ограничения отвечает тем же `contact.duplicate_email`.
 
-**Активности и заметки видны по родителю.** Карточка (`GET /contacts/{id}/notes`, активности сделки) загружает родителя через `get_visible_or_404` и дальше по `Access` не фильтрует: кто видит сделку, видит всю её историю. Уровень `activity:read` применяется к спискам вне карточки — например, «мои задачи на сегодня» (`GET /activities?due=today`). Заметку добавляет тот, кто может менять родителя; править и удалять её может только автор (эндпоинты — позже). Задачи сделки или контакта из корзины остаются в списке задач, пока корзину не очистят.
+**Активности и заметки видны по родителю.** Карточка (`GET /contacts/{id}/notes`, активности сделки) загружает родителя через `get_visible_or_404` и дальше по `Access` не фильтрует: кто видит сделку, видит всю её историю. Уровень `activity:read` применяется к спискам вне карточки — например, «мои задачи на сегодня» (`GET /activities?due=today`). Заметку добавляет тот, кто может менять родителя; править и удалять её может только автор (эндпоинты — позже). Задачи сделки или контакта из корзины остаются в списке задач, пока корзину не очистят: `trash.purge` удаляет их вместе со сделкой (FK CASCADE) или с контактом (активности без сделки).
 
 ### Как проходит запрос
 
@@ -630,7 +642,7 @@ roles:
       contact:read: org
       deal:read: org
       activity:read: org
-      bulk_job:read: own       # свои выгрузки
+      bulk_job:read: own       # свои выгрузки в S3 — с этапа 10 (job export); на этапе 5 своих job у viewer нет
       bulk_job:cancel: own
       export:run: org
       report:read: org
@@ -700,17 +712,20 @@ actions := {
 	"GET /api/v1/reports/pipeline": "report:read",
 	"GET /api/v1/reports/managers": "report:read",
 	"GET /api/v1/audit": "audit:read",
-	# --- этап 5: массовые операции и выгрузка
-	"POST /api/v1/contacts/import": "bulk:run",
+	# --- этап 5: массовые операции и выгрузка (каждый шаг добавляет свои строки)
 	"POST /api/v1/bulk/reassign-owner": "bulk:run",
-	"POST /api/v1/bulk/close-stale-deals": "bulk:run",
+	"POST /api/v1/bulk/close-overdue-deals": "bulk:run",
 	"POST /api/v1/bulk/add-tags": "bulk:run",
-	"POST /api/v1/exports": "export:run",
+	"POST /api/v1/bulk/remove-tags": "bulk:run",
+	"POST /api/v1/contacts/import": "bulk:run",
+	"GET /api/v1/contacts/export": "export:run",
 	"GET /api/v1/bulk-jobs/{job_id}": "bulk_job:read",
 	"GET /api/v1/bulk-jobs/{job_id}/events": "bulk_job:read",
+	"GET /api/v1/bulk-jobs/{job_id}/errors": "bulk_job:read",
 	"POST /api/v1/bulk-jobs/{job_id}/cancel": "bulk_job:cancel",
 	"GET /api/v1/admin/failed-tasks": "admin:system",
-	"POST /api/v1/admin/failed-tasks/{task_id}/replay": "admin:system",
+	"GET /api/v1/admin/failed-tasks/{failed_task_id}": "admin:system",
+	"POST /api/v1/admin/failed-tasks/{failed_task_id}/replay": "admin:system",
 	# --- этап 9: поиск
 	"GET /api/v1/search/contacts": "contact:read",
 	"GET /api/v1/search/suggest": "contact:read",
@@ -718,7 +733,7 @@ actions := {
 }
 ```
 
-Пути организации не содержат `org_id`: организация у пользователя одна и берётся из него самого. `org_id` в пути есть только у эндпоинтов супер-админа. Не проходят через OPA: `/api/v1/auth/*`, `/api/v1/me/*` (личные настройки и привязка Telegram — только `current_user`, работают с записями самого пользователя), `/health/*`, `/metrics`, `/.well-known/jwks.json`, `/telegram/webhook` (своя проверка секретным заголовком).
+Пути организации не содержат `org_id`: организация у пользователя одна и берётся из него самого. `org_id` в пути есть только у эндпоинтов супер-админа. Не проходят через OPA: `/api/v1/auth/*`, `/api/v1/me/*` (с этапа 5: личные настройки и привязка Telegram — отдельный роутер `app/api/v1/me.py` только с `current_member` = `current_user` + проверка, что у пользователя есть организация, иначе 403; работают с записями самого пользователя; `test_routes_match_policy` их не проверяет, а unit-тест проверяет, что на этих маршрутах нет `opa_decision`), `/health/*`, `/metrics`, `/.well-known/jwks.json`, `/telegram/webhook` (появится при переходе в облако, этап 10.7; своя проверка секретным заголовком).
 
 ```rego
 # policies/saleshub/authz.rego — можно ли этой роли вызвать этот эндпоинт.
@@ -830,10 +845,15 @@ rank := {"own": 1, "team": 2, "org": 3}
 # Массовые операции и выгрузка не шире, чем права на одну запись:
 # иначе через bulk можно было бы обойти ограничения роли.
 test_bulk_and_export_not_wider_than_single_record if {
-	pairs := {"bulk:run": "contact:write", "export:run": "contact:read"}
+	# Множество пар, а не объект: у bulk:run несколько «базовых» действий.
+	pairs := {
+		["bulk:run", "company:write"], ["bulk:run", "contact:write"],
+		["bulk:run", "deal:write"], ["bulk:run", "activity:write"],
+		["export:run", "contact:read"], ["bulk_job:cancel", "bulk_job:read"],
+	}
 	bad := {[name, a] |
 		some name, r in data.saleshub.roles
-		some a, base in pairs
+		some [a, base] in pairs
 		r.permissions[a]
 		not rank[r.permissions[a]] <= rank[r.permissions[base]]
 	}
@@ -907,8 +927,18 @@ class Access:
     role: str | None = None      # для for_action(): уровень другого действия того же человека
 
     @classmethod
-    def for_user(cls, user: CurrentUser, action: str) -> "Access":
-        return cls(action, scope_for(user, action), user.id, user.org_id, user.team_id)
+    def for_user(cls, user, action: str, roles: RoleCatalog) -> "Access | None":
+        # процессы без HTTP (бот, воркеры): None — у роли нет действия или нет организации
+        scope = roles.scope_or_none(user.role, action) if user.org_id else None
+        return None if scope is None else cls(action, scope, user.id, user.org_id,
+                                              user.team_id, user.role)
+
+    def own(self) -> "Access":                            # бот: «мои задачи», «мои сделки»
+        return replace(self, scope="own")
+
+    def to_params(self) -> dict: ...                      # bulk: Access автора в bulk_jobs.params (uuid → str)
+    @classmethod
+    def from_params(cls, d: dict) -> "Access": ...        # воркер восстанавливает его в каждом чанке
 
     def matches(self, obj) -> bool:                       # 1) объект в памяти
         match self.scope:
@@ -956,7 +986,7 @@ class Access:
    - `super_admin` нельзя назначить через API;
    - приглашение на email, который уже есть в базе, не создаётся, но ответ тот же 202, а человеку уходит письмо «у вас уже есть учётная запись в SalesHub» — админ чужой организации не узнаёт, что email занят (как в `password/forgot`). В журнал организации в обоих случаях пишется одно и то же `invite.created`: журнал читают её админы (`audit:read`), и отдельная запись выдала бы занятый email. При `invite/accept` сервис ещё раз проверяет, что email свободен и отдел существует (иначе 409 `invite.stale`).
    Причина отказа возвращается в теле ответа: 403 `member.cannot_change_self`, 409 `member.last_admin`, 422 `member.team_required` / `member.team_not_allowed` / `member.team_not_found`. Через обычный API `member.last_admin` недостижим (сам себе админ ничего не меняет, значит, пока он снимает другого, остаётся он сам) — правило срабатывает при гонке, и проверяет его тест на настоящих транзакциях.
-5. Перевод менеджера в другой отдел запускает bulk job `move_team`: `team_id` всех его записей переносится теми же чанками, что и при передаче клиентов (раздел 6), — клиенты переходят в новый отдел вместе с ним. До этапа 5 такой перевод (и смена роли на `org_admin` / `viewer`) при живых записях запрещён: 409 `member.has_records`.
+5. Перевод менеджера в другой отдел запускает bulk job `move_team`: `team_id` его живых компаний и контактов, открытых сделок и открытых активностей переносится теми же чанками, что и при передаче клиентов (раздел 6), — клиенты переходят в новый отдел вместе с ним. `PATCH /users/{id}` отвечает 200 с полем `bulk_job_id` (null, если переносить нечего). Смена роли на `org_admin` / `viewer` при живых записях — 409 `member.has_records`.
 6. Любое изменение `role`, `team_id`, `is_active` → **после** `commit` удалить пользователя из кэша Redis + запись в `audit_log`. Токен перевыпускать не нужно: роли нет в JWT, новая роль действует со следующего запроса (60 с — лишь страховка, если удаление ключа не прошло). Отключение пользователя дополнительно делает `token_version += 1` и отзывает все его refresh-токены — доступ пропадает сразу.
 7. Изменить права роли (что может `sales_rep`) — PR в `data.yaml` + `opa test` в CI + деплой.
 
@@ -981,7 +1011,7 @@ class Access:
 
 ## 6. Большие объёмы данных и фоновая обработка
 
-Массовая операция — это асинхронная job: API проверяет права, считает объём, создаёт запись `bulk_jobs` и сразу отвечает `202 + job_id`. Воркер режет выборку на чанки по диапазонам id и обновляет каждый чанк одним set-based SQL в своей транзакции. В очередь уходит одна команда, а SQL выполняется пачками — не одной транзакцией на миллион строк и не по одной строке.
+Массовая операция — это асинхронная job: API проверяет права и параметры, создаёт запись `bulk_jobs` и сразу отвечает `202` с job. Воркер считает объём, режет выборку на чанки по диапазонам id и обновляет каждый чанк одним set-based SQL в своей транзакции. В очередь уходит одна команда, а SQL выполняется пачками — не одной транзакцией на миллион строк и не по одной строке.
 
 > Система воркеров (очереди, ретраи, масштабирование, мониторинг, async внутри Celery) описана отдельным модулем в разделе 15. Здесь зафиксирован только общий подход к объёму данных.
 
@@ -989,12 +1019,12 @@ class Access:
 
 | Сценарий | Объём | Техника |
 | --- | --- | --- |
-| Импорт контактов из CSV с дедупликацией по email | 500 тыс. строк | файл в S3 (RustFS) → `COPY` в `contacts_staging` → валидация SQL-ом → `INSERT … ON CONFLICT (org_id, email) WHERE deleted_at IS NULL DO UPDATE SET … WHERE <фильтр Access из params>`: существующий контакт обновляется, только если он в уровне того, кто запустил импорт, остальные дубли → `import_errors` (`duplicate_outside_scope`). Новые строки: ответственный — из колонки `owner_email` (в уровне запустившего), иначе сам запустивший; `team_id` — отдел ответственного; битые строки → `import_errors` |
-| Менеджер уволился: передать всех его клиентов | до 100 тыс. контактов + сделки + открытые активности | чанки `UPDATE … SET owner_id = :new WHERE owner_id = :old AND id BETWEEN …` по трём таблицам |
-| Закрыть просроченные сделки как `lost` | десятки тысяч | частичный индекс `(org_id, expected_close_date) WHERE status = 'open'` + чанки |
-| Добавить тег сегменту | до 1 млн контактов | `UPDATE … SET tags = array_append(tags, :t) WHERE NOT tags @> ARRAY[:t]` — идемпотентно |
-| Экспорт сегмента в CSV | до 5 млн | серверный курсор + `StreamingResponse`; для больших — файл в S3 (RustFS) и ссылка |
-| Очистка корзины | всё, что удалено > 30 дней | задача beat, `DELETE` чанками |
+| Импорт контактов из CSV с дедупликацией по email | 500 тыс. строк | файл в S3 (RustFS) → проверка строк в Python (те же правила полей, что у `POST /contacts`) → `COPY` в `contacts_staging` → проверки по файлу и базе SQL-ом (дубли в файле, ответственный) → чанки `INSERT … ON CONFLICT (org_id, email) WHERE deleted_at IS NULL DO UPDATE SET … WHERE <фильтр Access из params>`: существующий контакт обновляется, только если он в уровне того, кто запустил импорт, остальные дубли → `import_errors` (`duplicate_outside_scope`). Подробно — «Поток: импорт контактов из CSV» |
+| Менеджер уволился: передать всех его клиентов | до 100 тыс. контактов + компании, открытые сделки и открытые активности | чанки `UPDATE … SET owner_id = :new WHERE owner_id = :old AND id BETWEEN …` по четырём таблицам |
+| Закрыть просроченные сделки как `lost` | десятки тысяч | ручной запуск руководителем; частичный индекс `(org_id, expected_close_date) WHERE status = 'open'` + чанки |
+| Добавить или снять тег у сегмента | до 1 млн контактов | `UPDATE … SET tags = array_append(tags, :t) WHERE NOT tags @> ARRAY[:t]` (снятие — `array_remove`) — идемпотентно |
+| Экспорт сегмента в CSV | до 1 млн | серверный курсор + `StreamingResponse`; больше — 422 «сузьте фильтр». Файл в S3 и ссылка для больших выгрузок — этап 10 |
+| Очистка корзины | всё, что удалено > 30 дней | задача beat, `DELETE` чанками (раздел 3) |
 
 ### Способы обновить много строк
 
@@ -1007,18 +1037,44 @@ class Access:
 | `COPY` в staging → `INSERT … ON CONFLICT DO UPDATE` | импорт, сотни тысяч+ | максимум | нужен файл или поток |
 | SQLAlchemy 2.0 bulk `update()` со списком dict-ов | средние объёмы | средняя | следить за размером батча |
 
-Каждый способ замеряется на 1 и 5 млн контактов, результаты — в `docs/experiments.md`.
+Каждый способ замеряется на 1 и 5 млн контактов (шаг 5.9): `make bench-updates` (`scripts/bench_updates.py`) после `make seed-big` копирует `contacts` в `bench_contacts (LIKE contacts INCLUDING ALL)` — рабочая таблица не трогается, в конце копия удаляется. Меняется то же, что при передаче клиентов (`owner_id`, `team_id`, `version`); ORM в цикле — только на 10 тыс. строк с экстраполяцией. Метрики: время, строк в секунду, объём WAL (`pg_wal_lsn_diff`), HOT- и мёртвые строки (`pg_stat_user_tables`) и задержка «пробника» — параллельной сессии, которая каждые 100 мс правит одну строку сегмента (сколько bulk держит ручную правку). Отдельно: `SET owner_id` (индексированная колонка — не HOT, обновляются все индексы, включая GIN) против `SET source` (HOT) и границы чанков «равные диапазоны id» против «по строкам». Результаты — в `docs/experiments.md`.
 
 ### Поток: «передать клиентов уволенного менеджера»
 
-1. `POST /api/v1/bulk/reassign-owner {from_user_id, to_user_id, include: [contacts, deals, open_activities]}` + заголовок `Idempotency-Key`.
-2. API: `authorize()` → OPA: `bulk:run` → проверка, что новый ответственный — активный `team_lead` или `sales_rep` в уровне запустившего (для `team_lead` — из его отдела, для `org_admin` — любой в организации) → фильтр `owner_id = :from` AND `access.sql_filter()` → `count`, `min(id)`, `max(id)` по каждой таблице → `bulk_jobs(status=pending, total=…, params={…, access})` → `uow.commit()` → задача `bulk.plan` → `202 {job_id}`.
-3. `bulk.plan`: режет диапазоны id по 10 000 и запускает группу задач `bulk.chunk` с финальной `bulk.finalize`.
-4. `bulk.chunk(job_id, table, lo, hi)`: одна транзакция: `UPDATE … SET owner_id = :to, team_id = :to_team, version = version + 1 WHERE id BETWEEN lo AND hi AND owner_id = :from AND <фильтр Access из params>`; воркер восстанавливает `Access` из `bulk_jobs.params`, иначе руководитель отдела мог бы массово переназначить чужих клиентов; перед работой чанк проверяет, что автор job всё ещё активен и его роль и отдел не менялись (иначе job → `failed`, `bulk.author_changed`); `processed += rowcount`; событие в outbox.
-5. `bulk.finalize`: статус `done` или `partial_failed`, событие `bulk_job.completed` → письмо новому ответственному «вам передано N клиентов».
-6. `GET /api/v1/bulk-jobs/{id}` отдаёт прогресс.
+1. `POST /api/v1/bulk/reassign-owner {from_user_id, to_user_id, include?}` + необязательный заголовок `Idempotency-Key`. `include` ⊆ {`companies`, `contacts`, `open_deals`, `open_activities`}, по умолчанию все четыре. Закрытые сделки и выполненные активности остаются у прежнего ответственного — это история («выиграно менеджером» — тем, кто выиграл), отчёт `/reports/managers` не меняется. Корзина не передаётся: фильтр `deleted_at IS NULL`.
+2. API: `authorize()` → OPA: `bulk:run` → `from_user` должен быть виден по `member:read` автора (иначе 422 `validation`, поле `from_user_id`); `from == to` → 422 `bulk.same_owner`; `to_user` проверяет тот же `resolve_owner`, что у одной записи (422 `owner.invalid` / 403 `out_of_scope`) → повтор по `Idempotency-Key` → `bulk_jobs(status=pending, total=0, params={from_user_id, to_user_id, include, access})` → `uow.commit()` → задача `bulk.plan(job_id)` (best-effort, см. ниже) → `202 BulkJobOut` и `Location: /api/v1/bulk-jobs/{id}`. Вторая активная job того же вида в организации → 409 `bulk.already_running` с `details.job_id` (частичный UNIQUE). Счёт строк — не в API: count по сегменту в миллион строк занял бы сотни миллисекунд HTTP-запроса.
+3. `bulk.plan(job_id)`: одна транзакция с условием `WHERE status = 'pending'` (повтор ничего не сделает). Для каждой сущности строит границы чанков по реальным строкам: `SELECT id FROM (SELECT id, row_number() OVER (ORDER BY id) rn FROM <t> WHERE <фильтр job>) s WHERE rn % :size = 1` плюс `max(id)` — получаются чанки ≈ `BULK_CHUNK_SIZE` строк (10 000), а не равные диапазоны id: у менеджера со 100 тыс. клиентов, разбросанных по 5 млн id, равные диапазоны дали бы ~500 почти пустых чанков (замер — 5.9). В той же транзакции: строки `bulk_job_chunks`, `total`, `chunks_total`, `status = running`, `started_at`. После коммита — обычная `group(bulk.chunk.s(job_id, no) …)`, без chord. Пустая выборка — сразу `done`. Записи, созданные после plan, в job не входят: это снимок на момент запуска.
+4. `bulk.chunk(job_id, no)`, одна транзакция: (1) строка чанка `FOR UPDATE` с `status = 'pending'` — нет строки, значит чанк уже выполнен, выход (повторная доставка безопасна); (2) job в `cancelling` или с заполненным `error` → свой чанк `skipped`; (3) автор `FOR SHARE`: активен, организация, роль и отдел совпадают с `params.access`, а `roles.scope_or_none(role, 'bulk:run')` равен уровню из params — иначе `UPDATE bulk_jobs SET error = 'bulk.author_changed' WHERE id = :id AND error IS NULL` и свой чанк `skipped` (чужие строки чанков не трогаем — иначе два чанка ждали бы друг друга; остальные увидят `error` на шаге 2); получатель `FOR SHARE`: может вести записи и в уровне автора — иначе так же `bulk.target_changed`; `to_team` — из **текущей** строки получателя; (4) `UPDATE <t> SET owner_id = :to, team_id = :to_team, version = version + 1, updated_at = now() WHERE id BETWEEN :lo AND :hi AND owner_id = :from AND <access.sql_filter> AND <живые / открытые>` (у активностей нет `version`, `updated_at` и `deleted_at`: для них только `SET owner_id, team_id`, «открытые» — `done_at IS NULL`); (5) чанк `done`, `rows`; (6) последним — `UPDATE bulk_jobs SET processed = processed + :n, updated_at = now()`. После коммита — `finalize_if_complete(job_id)`. Порядок блокировок: строка чанка → пользователи → строки данных → job; он совместим с сервисом людей (организация → пользователь `FOR UPDATE`): перевод получателя ждёт конца чанка и видит его записи. Ко всем таблицам job применяется один уровень — `bulk:run` (тест политик проверяет, что он не шире записи по каждой сущности). Чанк не пишет ни аудит, ни события.
+5. `finalize_if_complete(job_id)` — один запрос: `UPDATE bulk_jobs SET status = CASE WHEN status = 'cancelling' THEN 'cancelled' WHEN error IS NOT NULL THEN 'failed' WHEN failed_chunks = 0 AND failed_rows = 0 THEN 'done' WHEN chunks_total > 0 AND failed_chunks = chunks_total THEN 'failed' ELSE 'partial_failed' END, finished_at = now() WHERE id = :id AND kind <> 'import_contacts' AND status IN ('running', 'cancelling') AND NOT EXISTS (SELECT 1 FROM bulk_job_chunks WHERE job_id = :id AND status = 'pending') RETURNING status`. Его вызывают чанк после коммита, упавший чанк после последнего ретрая (`on_failure`: чанк `failed`, `failed_chunks += 1`), plan при пустой выборке и `bulk.reap_stuck`. Два чанка закончили одновременно — строку получит только один `UPDATE`, поэтому итог пишется ровно один раз: в той же транзакции — одна строка `audit_log` (`bulk.reassign_owner`, в `changes` — параметры и строки по сущностям из `GROUP BY entity`) и (с шага 5.12) одно событие `bulk_job.completed` → новому ответственному «вам передано N клиентов», автору — итог job.
+6. `GET /api/v1/bulk-jobs/{id}` отдаёт прогресс, `GET …/events` — тот же прогресс потоком SSE (раздел 15).
 
-Чанк обязан быть **идемпотентным**: повторный запуск того же диапазона даёт тот же результат (условие `owner_id = :from` после первого прогона уже ничего не найдёт). Поэтому `acks_late=True` и ретраи безопасны — упавший воркер не теряет и не дублирует работу.
+Чанк обязан быть **идемпотентным**: повторный запуск того же чанка ничего не делает (строка чанка уже не `pending`), а повторный `UPDATE` того же диапазона ничего не находит (`owner_id = :from`). Поэтому `acks_late=True` и ретраи безопасны — упавший воркер не теряет и не дублирует работу, а `processed` не считается дважды.
+
+**Почему не chord.** Группа с финальной задачей (chord) в Celery 5.6 не запускает финальную задачу, если хоть один чанк упал после всех ретраев (тело уходит в `ChordError`), а её счётчик в Redis — ещё одно состояние, которое считает повторно доставленный чанк дважды. Учёт в `bulk_job_chunks` и условный `UPDATE` проще и честнее: упавший чанк даёт `partial_failed`, а не повисшую job. Chord можно показать отдельным экспериментом (этап 10).
+
+**Как API ставит задачи.** Строка `bulk_jobs` — сама себе outbox: API после коммита best-effort ставит `bulk.plan` / `imports.import_contacts` через порт `TaskQueue` (`asyncio.to_thread(celery_app.send_task, …)`, без ретраев публикации). Ошибку брокера только логирует (`task_enqueue_failed`) и всё равно отвечает 202: job в `pending` через 2 минуты подберёт `bulk.reap_stuck`. Через `outbox_events` идут только письма, сообщения и доменные события — у них нет своей таблицы-состояния. В тестах API порт подменяется фейком.
+
+**Смена отдела человека (`move_team`).** `PATCH /users/{id} {team_id}` в своей транзакции (блокировки как на этапе 4: организация → пользователь `FOR UPDATE`) меняет `users.team_id`, пишет `member.updated` и, если у человека есть живые компании, контакты, открытые сделки или открытые активности вне нового отдела, вставляет `bulk_jobs(kind = move_team, owner_id = админ, params = {user_id})`; после коммита — `bulk.plan`. Записи, созданные до перевода, plan видит (создание читает ответственного `FOR SHARE`), созданные после — уже получают новый отдел. Чанк: `SET team_id = :current_team, version = version + 1 WHERE id BETWEEN … AND org_id = :org AND owner_id = :user AND team_id <> :current_team AND <живые / открытые>` (у активностей — без `version`), где `current_team` — из строки человека, прочитанной в чанке `FOR SHARE`: при цепочке переводов записи всегда догоняют текущий отдел. Проверки автора у `move_team` нет — это следствие уже сделанного изменения; отменить её нельзя (409 `bulk.not_cancellable`). Несколько `move_team` разных людей идут параллельно (они не входят в индекс «одна job вида на организацию»): строки у них не пересекаются. Повторный `PATCH` с тем же отделом создаёт новую job, если записи вне отдела остались, — так чинится упавшая.
+
+**Повтор запроса (`Idempotency-Key`).** Заголовок необязателен, 1–64 печатных ASCII-символа (иначе 422). `request_hash` — sha256 канонического JSON `{kind, body}`. Job с тем же `(owner_id = я, key)` и тем же хэшем → 202 с этой job в любом статусе; хэш другой → 422 `bulk.idempotency_key_reused`. Два одинаковых запроса одновременно: второй `INSERT` ловит уникальный индекс → откат, перечитать job по ключу и вернуть её же. У импорта хэш берётся только из `{kind}`: ключ проверяется до приёма файла, и тот же ключ — та же job.
+
+### Поток: импорт контактов из CSV
+
+1. `POST /api/v1/contacts/import` — `multipart/form-data`: `file` (CSV) и необязательный `owner_id` (ответственный строк без `owner_email`; по умолчанию — я; `org_admin` обязан указать — 422 `owner.required`). Обработчик не объявляет `UploadFile`: FastAPI читает тело формы до зависимостей, и неаутентифицированный клиент успел бы залить 100 МБ до 401. Поэтому порядок: `authorize` → нет `Content-Length` (`Transfer-Encoding: chunked` прочитался бы без предела) → 411 `import.length_required`; больше `IMPORT_MAX_BYTES` (100 МиБ) → 413 `import.file_too_large` → повтор по `Idempotency-Key` → уже идёт импорт в организации → 409 `bulk.already_running` → `async with request.form(max_files=1, max_fields=1) as form` (временный файл формы закрывается сразу после загрузки в S3; лишний файл или поле — ошибка парсера Starlette 400 → 422 `import.invalid_form`) → проверка заголовка CSV по первым 64 КиБ (ошибки формата — 422 сразу, без job) → `owner_id` через `resolve_owner` → файл в S3 `imports/{org_id}/{uuid}.csv` → `bulk_jobs(kind = import_contacts, params = {file_key, file_name, delimiter, columns, default_owner_id, access})` → commit → `imports.import_contacts(job_id)` → 202 `BulkJobOut` с `import_info: {delimiter, columns, ignored_columns}`. Схема формы для Swagger задаётся через `openapi_extra`.
+2. **Формат.** UTF-8, BOM допускается; не декодируется заголовок → 422 `import.invalid_encoding`. Разделитель — `,` или `;` (тот, что даёт больше колонок в заголовке; Excel с украинской локалью сохраняет `;`). Заголовок обязателен, имена без учёта регистра: `email`\*, `first_name`\*, `last_name`, `phone`, `status`, `source`, `tags` (через запятую внутри ячейки), `owner_email`. Нет обязательной или повтор колонки → 422 `import.invalid_header`; пустой файл → 422 `import.empty_file`. Незнакомые колонки (в том числе `id`, `created_at`, `company_id` из нашего экспорта) игнорируются и возвращаются в `ignored_columns`, поэтому свой экспорт загружается обратно. Ведущий апостроф перед `= + - @` снимается (пара к экранированию в экспорте). Лимиты: файл 100 МиБ, `IMPORT_MAX_ROWS` = 1 млн строк (больше → job `failed`, `import.too_many_rows`), поле до 10 000 символов; битый CSV (незакрытая кавычка) → `failed`, `import.malformed_csv` с номером строки. Компания на этапе 5 не импортируется (имя компании не уникально).
+3. **Задача** `imports.import_contacts(job_id)` (очередь `imports`, лимит 10 / 12 мин на запуск задачи, повтор продолжает с последнего завершённого шага) идёт шагами; `bulk_jobs.stage` хранит последний завершённый, повтор задачи пропускает готовые шаги. В начале задача берёт `pg_try_advisory_lock(hashtextextended(job_id::text, 0))` на отдельном соединении и держит его до конца: не взялся — работает другая копия (reaper переотправил или Redis выдал повторно), выход без изменений. Перед каждым шагом и чанком — статус (`cancelling` → стоп) и автор (`bulk.author_changed`), после каждого — `updated_at`.
+   - **parse**: файл из S3 скачивается во временный файл воркера и читается `csv.reader` (синхронный разбор многострочных полей из async-потока невозможен). Каждая строка проверяется pydantic-моделью `ContactImportRow` с теми же типами полей, что `ContactIn` (общие `Annotated`-типы в `schemas/crm.py`): API и импорт принимают одинаковые email и телефоны. В импорте email обязателен — иначе повторная загрузка файла плодила бы дубли. Одна транзакция: `copy_records_to_table` в `contacts_staging` (только валидные, уже нормализованные строки; `email` в staging — `text`, а не `citext`: у asyncpg нет бинарного кодека для типа из расширения, и COPY упал бы; дубли в stage и сопоставление с результатом merge сравниваются по `lower(email)`; `raw` передаётся строкой `json.dumps`) и в `import_errors` (коды `invalid_columns`, `invalid_encoding`, `validation` с полем, `email_required`), `total`, `stage = parse`.
+   - **stage**: одна транзакция set-based `UPDATE` по staging: дубли email в файле — побеждает первая строка, остальные `duplicate_in_file`; `owner_email` → активный `team_lead` / `sales_rep` организации, иначе `owner_invalid`; вне уровня запустившего → `owner_out_of_scope`; пустой — `default_owner_id`. Ошибки — в `import_errors`, `failed_rows`, `stage = stage`.
+   - **merge**: последовательные чанки по 5 000 строк `WHERE NOT merged ORDER BY row_no`, каждый — своя транзакция: ответственные чанка `FOR SHARE` (стали неактивными или вышли из уровня → `owner_invalid`; `team_id` новой записи — из `users` на момент merge), затем один statement `INSERT … SELECT … ON CONFLICT (org_id, email) WHERE deleted_at IS NULL DO UPDATE SET … WHERE <access.sql_filter> RETURNING email, (xmax = 0) AS inserted` в CTE, и тем же запросом строки без результата → `import_errors` `duplicate_outside_scope` (raw без данных существующего контакта); `merged = true`, `processed`, `failed_rows`, `result.created` / `result.updated`. Параллельные merge по одному уникальному индексу давали бы конфликты, поэтому чанки идут в одной задаче один за другим (500 тыс. строк — около минуты).
+   - **Обновление существующего контакта** (так делает HubSpot): непустая ячейка перезаписывает поле, пустая не трогает; `first_name` обязателен и перезаписывается; теги объединяются с имеющимися без дублей, не больше 20 (лишние новые отбрасываются, строка не считается ошибкой); `status` меняется, только если указан; ответственный и отдел не меняются (передача — это `reassign-owner`); `version + 1`. Email, который есть только у контакта в корзине, не конфликтует (UNIQUE частичный) — создаётся новый контакт.
+   - **финал**: свой условный `UPDATE … WHERE status IN ('running', 'cancelling')` (`done`, `partial_failed`, если `failed_rows > 0`, или `cancelled`), одна строка журнала `bulk.import_contacts`, (с 5.12) событие `bulk_job.completed` автору. Строки staging удаляются в той же транзакции, что **любой** финальный переход импорта — и отмена, и `failed`, и reaper.
+4. Ошибки строк — `GET /api/v1/bulk-jobs/{job_id}/errors?limit=&cursor=` (keyset по `row_no`), job ищется по уровню `bulk_job:read`. Файлы S3 завершённых импортов старше 7 дней и сироты `imports/*` старше суток (файл залит, а коммит job не прошёл) удаляет `maintenance.cleanup`.
+
+### Остальные массовые операции и выгрузка
+
+- **Закрыть просроченные сделки** — только ручной запуск (автоматическое закрытие без человека молча портит воронку): `POST /api/v1/bulk/close-overdue-deals {before?: date, pipeline_id?}` + `Idempotency-Key`. «Просрочена» — то же, что у `GET /deals?overdue=true`: `status = 'open' AND deleted_at IS NULL AND expected_close_date < :before`; `before` по умолчанию — сегодня по часовому поясу организации, дата позже сегодняшней → 422. Дата фиксируется в `params`, все чанки работают с одной границей. Общий plan, чанк `UPDATE deals SET status = 'lost', closed_at = now(), version = version + 1 …`; этап сделки не меняется. Уведомлений `deal.closed` по каждой сделке нет — одно `bulk_job.completed` автору.
+- **Теги сегмента** — `POST /api/v1/bulk/add-tags` и `/bulk/remove-tags` с телом `{tag, filter: {q?, status?, tag?, owner_id?, company_id?}}`: фильтр — те же поля и правила, что у `GET /contacts` (общая функция `ContactRepository.filter_conditions`), пустой — весь уровень. Типизированные массивы (`ARRAY[:t]::varchar(64)[]`), иначе не сработает GIN-индекс. Контакты, у которых уже 20 тегов, пропускаются и считаются в `failed_rows` → `partial_failed`.
+- **Выгрузка** — `GET /api/v1/contacts/export?q=&status=&tag=&owner_id=&company_id=` (`export:run`) → `text/csv; charset=utf-8` с BOM, `Content-Disposition: attachment`. Те же фильтры и порядок, что у списка (выгрузка не шире видимости), серверный курсор `session.stream(stmt, execution_options={"yield_per": 2000})`. Колонки: id, email, first\_name, last\_name, phone, status, source, tags, owner\_email, company\_id, created\_at, updated\_at — импорт принимает файл обратно. Значение, начинающееся с `= + - @ \t \r`, получает префикс `'` (CSV-инъекция). Заранее `count` с `LIMIT EXPORT_MAX_ROWS + 1`: больше 1 млн → 422 `export.too_large` («сузьте фильтр»); 10 выгрузок в час на пользователя → 429. В лог — пользователь, фильтр и число строк, без `audit_log`.
 
 ### Остальное про объём
 
@@ -1032,10 +1088,10 @@ class Access:
 | Компонент | Роль |
 | --- | --- |
 | Broker (Redis) | очередь сообщений-команд |
-| Workers | очереди `default`, `bulk`, `imports`, `notifications` — отдельные Deployment |
-| Beat | планировщик, **1 реплика**: курсы НБУ, `bulk.reap_stuck`, `trash.purge`, партиции, `reports.refresh` |
+| Workers | очереди `default`, `bulk`, `imports`, `notifications`; в compose — два воркера, в Kubernetes (этап 7) — Deployment на очередь |
+| Beat | планировщик, **1 реплика**: курсы НБУ, `bulk.reap_stuck`, `trash.purge`, партиции, `reports.refresh`, очистка, напоминания, дайджест |
 | Outbox relay | отдельный долгоживущий процесс, а не задача beat (раздел 15) |
-| Result backend (Redis) | статусы задач, нужен для групп с финальной задачей |
+| Result backend | не нужен: результаты задач никто не читает (`task_ignore_result=True`), завершение bulk job видно по базе |
 | Flower | веб-мониторинг |
 
 Детали (async внутри задач, `visibility_timeout`, `prefetch_multiplier`, маршрутизация, масштабирование) — в разделе 15.
@@ -1044,7 +1100,7 @@ class Access:
 
 Сервисы не шлют события в брокер напрямую: они пишут их в `outbox_events` в той же транзакции, что и данные. Relay читает неопубликованные события (`FOR UPDATE SKIP LOCKED`) и публикует. Событие не теряется, если коммит прошёл, а брокер недоступен, и не уходит, если коммит откатился.
 
-- **Этап 5:** relay публикует в Celery (письма, уведомления).
+- **Этап 5:** relay публикует в Celery: команды `email.send` и `telegram.send` и доменные события `record.assigned`, `deal.closed`, `bulk_job.completed` (их разбирает notifier, раздел 16). Команды на отправку в Kafka на этапе 9 не попадают — в них секреты и тексты для конкретного человека.
 - **Этап 9:** relay публикует в Redpanda (Kafka API): топики `saleshub.contacts.v1`, `saleshub.deals.v1`, ключ = `org_id`. Потребители — отдельные consumer group: `audit-writer`, `reports` (обновляет агрегаты воронки), `notifier`, `search-indexer`.
 
 |  | Celery + Redis | Redis Streams | RabbitMQ | Kafka |
@@ -1089,6 +1145,7 @@ class Forbidden(AppError):       status, code = 403, "forbidden"
 class Unauthorized(AppError):    status, code = 401, "auth.invalid_token"
 class Conflict(AppError):        status, code = 409, "conflict"          # version mismatch, дубль
 class ValidationFailed(AppError): status, code = 422, "validation"
+class PayloadTooLarge(AppError): status, code = 413, "payload_too_large"  # файл импорта больше лимита (этап 5)
 class RateLimited(AppError):     status, code = 429, "rate_limited"
 class ServiceUnavailable(AppError): status, code = 503, "unavailable"   # Postgres, Redis, OPA, SMTP
 
@@ -1127,7 +1184,7 @@ raise Conflict("member.last_admin")        # → 409, code=member.last_admin, ti
 
 - structlog, JSON в stdout (в dev — цветной консольный рендер), одна настройка для API и воркеров.
 - В каждой строке: `ts`, `level`, `event`, `request_id`, `user_id`, `path`, для задач — `task_id`, `job_id`.
-- `request_id` передаётся в Celery через заголовки задачи (`before_task_publish` / `task_prerun`) и в `outbox_events.payload.meta`.
+- `request_id` передаётся в Celery через заголовки задачи (`before_task_publish` / `task_prerun`) и в колонку `outbox_events.request_id`; у задач beat, где запроса нет, `request_id` = `task_id`. Воркеры настраивают логи той же функцией `configure_logging` (сигнал `setup_logging`), поэтому формат строк у API и воркеров один.
 - SQL-логи — только в dev и только медленные запросы (событие `before/after_cursor_execute`, порог 200 мс).
 - Никогда не логируются: пароли, токены, тело `/auth/login`.
 - Сбор логов в кластере: Loki + Grafana Alloy (собирает логи с подов), поиск по request\_id в той же Grafana.
@@ -1176,9 +1233,9 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 | `ApiHighErrorRate` | доля 5xx > 2% за 5 мин | critical |
 | `ApiSlowP95` | p95 > 500 мс за 10 мин | warning |
 | `CeleryQueueBacklog` | очередь `bulk` > 1 000 задач 10 мин | warning |
-| `BulkJobStuck` | job в `running` без прогресса 15 мин | warning |
+| `BulkJobStuck` | `bulk.reap_stuck` сдался: job в `failed` с `bulk.stuck` после трёх повторных отправок | warning |
 | `OutboxLag` | старейшее неопубликованное событие > 60 с | critical |
-| `CeleryBeatDown` | нет heartbeat beat 2 мин | critical |
+| `CeleryBeatDown` | heartbeat beat старше 3 мин | critical |
 | `PostgresLongTransaction` | транзакция > 5 мин | warning |
 | `PodCrashLooping` | > 3 рестарта за 15 мин | critical |
 | OpaUnavailable | ответы 503 unavailable от authorize > 0 за 2 мин | critical |
@@ -1230,7 +1287,7 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 | Уровень | Что тестируем | Инструменты | Скорость |
 | --- | --- | --- | --- |
 | unit | `Access.matches` / `ensure_allowed`, `sql_filter` (компиляция SQL), сервисы с `FakeUnitOfWork`, правила управления пользователями (нельзя менять себе роль, отдел обязателен), нарезка чанков, маппинг ошибок | pytest, pytest-asyncio, polyfactory | секунды |
-| integration | репозитории на настоящем Postgres, API через `httpx.AsyncClient(transport=ASGITransport(app))`, миграции, Celery-задачи в eager-режиме и с реальным воркером | testcontainers (postgres, redis), factory-boy | десятки секунд |
+| integration | репозитории на настоящем Postgres, API через `httpx.AsyncClient(transport=ASGITransport(app))`, миграции, Celery-задачи с реальным воркером на Redis из testcontainers, бот через `feed_update` | testcontainers (postgres, redis), factory-boy | десятки секунд |
 | e2e (smoke) | логин → создать контакт → передать клиентов (bulk) → дождаться job | pytest против `tilt`/kind-стенда | минуты, в CD |
 | нагрузка (опц.) | список контактов и bulk на 5 млн | locust / k6 | вручную |
 | policy (Rego) | роль × эндпоинт (allow / 403), опечатки в действиях и уровнях `data.yaml` | opa test --coverage, Regal (линтер) | миллисекунды |
@@ -1241,7 +1298,8 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 - Один контейнер Postgres на сессию pytest, `alembic upgrade head` один раз.
 - Каждый тест — во внешней транзакции с `SAVEPOINT` (`join_transaction_mode="create_savepoint"`), откат после теста: быстро и без очистки таблиц. Подменённая `get_session` при ошибке в запросе откатывает его SAVEPOINT — как настоящий запрос, который при ошибке ничего не сохраняет. После такого отката объекты сессии «протухают», поэтому значения, нужные тесту после ответа 4xx (например, email), держат в переменных.
 - Сессия подменяется через `app.dependency_overrides[get_session]`.
-- Тесты bulk-операций, которые коммитят в нескольких транзакциях (воркер), используют `TRUNCATE` в фикстуре — отдельный маркер `@pytest.mark.committing`. Пока такой тест один (гонка refresh и logout-all) — он сам удаляет своего пользователя.
+- Тесты bulk-операций, которые коммитят в нескольких транзакциях (воркер), используют `TRUNCATE` в фикстуре — отдельный маркер `@pytest.mark.committing`. На этапах 2–4 такой тест был один (гонка refresh и logout-all) — он сам удаляет своего пользователя.
+- Outbox внутри тестовой транзакции: строки не коммитятся, и отдельный relay их не видит. Поэтому фикстура `deliver_outbox` вызывает ту же функцию `publish_batch` со встроенным «издателем», который не ставит задачу в Celery, а сразу вызывает обработчик (`send_email`, `notify`…) в сессии теста, пока неопубликованные строки не кончатся (notify порождает новые команды). Тесты писем читают Mailpit через `inbox(email)` = `deliver_outbox` + чтение писем. Настоящий путь relay → Redis → воркер проверяет отдельный `committing`-тест.
 - Письма: контейнер Mailpit на сессию pytest, тест читает письма через его REST API (`/api/v1/search`, `/api/v1/message/{id}`); у каждого теста свой email, потому что Mailpit и Redis общие на весь запуск.
 
 ### Матрица прав (генерируется)
@@ -1263,7 +1321,7 @@ async def test_access(role, route, target, route_actions, client, ...):
     assert resp.status_code == expected_status(role, route_actions[route], target, success)
 ```
 
-На этапе 3 цели — `same_org` и `other_org` (объекты организации). С этапа 4 у CRM-маршрутов цели `own` (запись `sales_rep`-а из «мира»), `same_team` (коллеги из его отдела), `same_org` (другой отдел) и `other_org`; тело запроса зависит от роли (ответственный подставляется из «мира», `version` — текущая), а у `Case` есть query-параметры (канбан требует `?pipeline_id=`). Каждый шаг этапа 4, который добавляет маршруты, добавляет и их кейсы — иначе `test_every_route_has_a_case` падает. Чтобы сотня кейсов шла за секунды, хэш пароля считается один раз на запуск, а access-токен выпускается напрямую через `KeySet` — без логина с argon2.
+На этапе 3 цели — `same_org` и `other_org` (объекты организации). С этапа 4 у CRM-маршрутов цели `own` (запись `sales_rep`-а из «мира»), `same_team` (коллеги из его отдела), `same_org` (другой отдел) и `other_org`; тело запроса зависит от роли (ответственный подставляется из «мира», `version` — текущая), а у `Case` есть query-параметры (канбан требует `?pipeline_id=`). Каждый шаг этапа 4, который добавляет маршруты, добавляет и их кейсы — иначе `test_every_route_has_a_case` падает. Этап 5 — так же: у `reassign-owner` цель — `from_user` из `same_team` / `same_org` / `other_org` (вне `member:read` автора — 422), у `bulk-jobs/{job_id}` — job из фабрики в финальном статусе (SSE сразу отдаёт снимок и закрывается), у `cancel` — job в `running`; импорт идёт с маленьким CSV, фейковыми `FileStorage` и `TaskQueue` через `dependency_overrides`; выгрузка — 200 `text/csv` без чужих строк. Чтобы сотня кейсов шла за секунды, хэш пароля считается один раз на запуск, а access-токен выпускается напрямую через `KeySet` — без логина с argon2.
 
 Ожидаемый ответ считается из `data.yaml`: действия нет у роли → 403; чтение или изменение одного объекта: объект в уровне роли → 2xx, вне уровня чтения → 404, в уровне чтения, но вне уровня действия (чужая компания у `sales_rep`) → 403; создание или изменение, после которого объект выходит из уровня (чужой ответственный или отдел) → 403 `out_of_scope`; список → 200, но без строк вне уровня. Супер-админ на обычных эндпоинтах → 403.
 
@@ -1273,8 +1331,11 @@ async def test_access(role, route, target, route_actions, client, ...):
 
 ### Celery в тестах
 
-- unit: функция задачи вызывается напрямую (логика вынесена в сервис, задача — тонкая обёртка).
-- integration: `task_always_eager=True` для простых сценариев; для chord и ретраев — фикстура `celery_worker` с реальным Redis.
+- `task_always_eager` не используем: тесты асинхронные, и eager-задача внутри async-теста вызвала бы `run_until_complete` при уже запущенном loop pytest (RuntimeError); к тому же eager пропускает сериализацию, заголовки, маршрутизацию и acks.
+- unit: сервисы и функции (`FxService.load_rates`, `ensure_partitions`, `finalize_if_complete`, правила получателей, ключи дедупа) вызываются напрямую; задача — тонкая обёртка, её отдельно не тестируем.
+- integration (маркеры `worker` и `committing`): сессионная фикстура `celery_worker` запускает **наше** приложение `celery.contrib.testing.worker.start_worker(celery_app, pool="solo", perform_ping_check=False)` (ping-задаче нужен result backend, а его нет) в отдельном потоке со своим event loop, брокер — db 1 Redis из testcontainers, `runtime.configure(settings)` с адресами контейнеров. Тест ждёт результат опросом базы; данные коммитятся, после теста — `TRUNCATE`. НБУ и Telegram подменяет respx — он работает и в потоке воркера.
+- Бот: `create_dispatcher(...)` и `dp.feed_update(bot, update)` без сети — обработчики возвращают метод (`return message.answer(...)`), тест сравнивает его текст.
+- Время: freezegun для расписания, напоминаний и дайджеста.
 
 Покрытие собирается `pytest-cov`, порог в CI — 80% для `services/` и `authz/`, остальное без жёсткого порога.
 
@@ -1284,7 +1345,7 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 
 ### Шаг 1 — docker compose
 
-Сервисы: `api`, `worker`, `worker-bulk`, `beat`, `flower`, `postgres`, `redis`, `migrate` (одноразовый), `seed` (одноразовый). `make up` — и можно работать. Этого достаточно для разделов 2–10.
+Сервисы: `api`, `worker`, `worker-bulk`, `beat`, `outbox-relay`, `flower`, `postgres`, `redis`, `migrate` (одноразовый), `seed` (одноразовый), `telegram-bot` (по профилю). `make up` — и можно работать. Этого достаточно для разделов 2–10.
 
 Плюс два сервиса для этого проекта: `opa` (политики из `./policies`, `--watch` — правка `.rego` применяется сразу) и `mailpit` (SMTP-ловушка: SMTP на 1025, веб на `localhost:8025`).
 
@@ -1293,7 +1354,7 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 | Сервис | Порт на хосте | Заметки |
 | --- | --- | --- |
 | `api` | 8000 | код смонтирован с хоста, `--reload` подхватывает правки без пересборки образа; `backend/secrets` (ключ JWT) — только на чтение; стартует после `migrate` и `seed` |
-| `migrate` | — | одноразовый `alembic upgrade head`; `api` стартует только после его успешного завершения |
+| `migrate` | — | одноразовый `alembic upgrade head`, `ensure-partitions`, с этапа 5 — `ensure-bucket` (бакет в RustFS, идемпотентно: RustFS сам бакеты не создаёт); `api` стартует только после его успешного завершения |
 | `seed` (с этапа 2) | — | одноразовый `create-superadmin` после `migrate`; dev-логин супер-админа задан в compose, команда идемпотентна |
 | `postgres` 18 | `${POSTGRES_PORT:-5432}` | том монтируется в `/var/lib/postgresql` (у образа 18 данные в `/var/lib/postgresql/18/docker`) |
 | `redis` 8 | `${REDIS_PORT:-6379}` | если порт занят другим проектом — поменять в `deploy/compose/.env` (шаблон `.env.example` рядом) и в `backend/.env` |
@@ -1301,6 +1362,12 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 | `redisinsight` | 5540 | подключение к Redis стенда создаётся само (`RI_REDIS_HOST`) |
 | `mailpit` | 1025, 8025 | |
 | `rustfs` | 9000 (S3), 9001 (консоль `/rustfs/console/`) | S3-совместимое хранилище вместо MinIO: официальные образы MinIO больше не публикуются |
+| `worker` (этап 5) | — | `celery worker -Q default,notifications -c 4`: короткие задачи и письма; экземпляр один, поэтому лимит писем 50 в минуту общий |
+| `worker-bulk` (этап 5) | — | `-Q bulk,imports -c 4`: чанки и импорт — тяжёлая работа, её убивает chaos-тест, не трогая письма. Оба воркера в dev запускаются через `watchfiles` (у Celery нет `--reload`; на SIGINT он дорабатывает задачу), `stop_grace_period: 120s` — больше лимита чанка (90 с), healthcheck — `celery inspect ping -d <имя>@$HOSTNAME` (воркеры запускаются с `-n worker@%h` / `-n bulk@%h`; ping без адресата был бы зелёным, пока жив хоть один воркер). Четыре отдельных Deployment по очередям — на этапе 7 |
+| `beat` (этап 5) | — | `celery beat -s /tmp/celerybeat-schedule`, ровно один; правку расписания применяет `make restart-workers` |
+| `outbox-relay` (этап 5) | — | `python -m app.events.relay` через `watchfiles` |
+| `flower` (этап 5) | 5555 | образ `mher/flower:2.2.0`, без входа (порт только на localhost); в Kubernetes — basic auth из SealedSecret |
+| `telegram-bot` (этап 5) | — | `profiles: [telegram]`: `make up` его не запускает, `make bot` — запускает. Токен и имя бота — `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME` в `deploy/compose/.env`; без токена бот завершается с понятной ошибкой, отправка в Telegram пропускается, а `POST /me/telegram/link` отвечает 503 `telegram.disabled` |
 
 Все порты открыты только на `127.0.0.1`: у pgAdmin нет входа, у Redis нет пароля, поэтому из сети стенд не виден. `make up` ждёт, пока все сервисы станут healthy (`--wait`), и печатает адреса UI. Для запуска API без Docker (`make run`, отладка в IDE) — `make infra`: только Postgres, Redis и Mailpit. `make up` и `make run` сначала вызывают `make keys`.
 
@@ -1330,7 +1397,7 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 
 ### Секреты: Sealed Secrets с первого дня
 
-Секреты проекта: пароль Postgres, приватный RS256-ключ для JWT, пароль супер-админа, SMTP, токен Telegram-бота для алертов, ключи S3-хранилища (RustFS).
+Секреты проекта: пароль Postgres, приватный RS256-ключ для JWT, пароль супер-админа, SMTP, токен пользовательского Telegram-бота (раздел 16) и отдельный токен бота для алертов, ключи S3-хранилища (RustFS), basic auth Flower.
 
 | Где | Инструмент | Как работает |
 | --- | --- | --- |
@@ -1406,7 +1473,7 @@ local_resource('seed-5m', 'kubectl exec deploy/postgres -- psql -f /seed/seed_bi
 | Дашборды | Grafana | `grafana.saleshub.localhost` · 3000 | дашборды из раздела 8, логи (Loki) |
 | Алерты | Alertmanager UI | `alerts.saleshub.localhost` · 9093 | сработавшие алерты, тишина (silences) |
 | Почта | Mailpit | `mail.saleshub.localhost` · 8025 | письма приглашений и сброса пароля |
-| Файлы (S3) | консоль RustFS | `s3.saleshub.localhost` · 9001, путь `/rustfs/console/` | файлы импорта и экспорта |
+| Файлы (S3) | консоль RustFS | `s3.saleshub.localhost` · 9001, путь `/rustfs/console/` | файлы импорта (`imports/…`); выгрузки в S3 — с этапа 10 |
 | Kubernetes | Tilt UI + Headlamp | `localhost:10350` · `k8s.saleshub.localhost` | логи и статус ресурсов, поды, Jobs, события кластера |
 | OPA | отдельного UI нет | — | решения видны в decision logs (Grafana → Loki); правила удобно отлаживать в Rego Playground |
 | CD | Argo CD UI | argocd.saleshub.localhost | синхронизация с git, история выкаток, откат |
@@ -1505,7 +1572,7 @@ deploy/
 
 - Вся конфигурация — из переменных окружения (12-factor); в коде нет хостов, путей и названий бакетов.
 - Внешние зависимости в чарте — опциональные сабчарты с флагом `enabled`; приложение не знает, где запущена база.
-- Файлы — только через S3 API (`aioboto3`), а не через специфичный клиент хранилища: так RustFS локально и S3 в облаке взаимозаменяемы.
+- Файлы — только через S3 API (`aiobotocore` — живая async-обёртка botocore; `aioboto3` заброшен и держит старый aiobotocore), а не через специфичный клиент хранилища: так RustFS локально и S3 в облаке взаимозаменяемы. Для RustFS — path-style адреса и `request_checksum_calculation = when_required` (новые botocore по умолчанию считают CRC, а часть S3-совместимых хранилищ его не понимает).
 - Пробы `live`/`ready`, graceful shutdown по SIGTERM, `requests`/`limits` у каждого пода — без этого в облаке поды убивают.
 - Миграции — отдельный Job и совместимы со старой версией кода (раздел 9).
 - Образ один на все окружения, тег = SHA коммита; продвижение в staging/prod — коммит тега в папку окружения.
@@ -1524,7 +1591,7 @@ deploy/
 | Список контактов (TanStack Table, keyset-подгрузка, виртуальный скролл, поиск) | фильтр видимости `Access`, trigram-поиск на 5 млн строк |
 | Карточка контакта: сделки, активности, заметки | связи, оптимистическая блокировка (`version`) |
 | Импорт CSV: загрузка → прогресс → отчёт об ошибках | job, `import_errors`, дедупликация |
-| Массовые действия: выбрать сегмент → передать другому менеджеру / добавить тег | bulk job, предпросмотр количества, прогресс по SSE |
+| Массовые действия: выбрать сегмент → передать другому менеджеру / добавить тег | bulk job, число строк — из `total` job после plan, прогресс по SSE |
 | Корзина | мягкое удаление и восстановление |
 | Отчёты: воронка, сумма сделок по менеджерам | materialized view, права `report:read` |
 | Команда: отделы, участники, приглашения | назначение ролей и отделов, правила вроде «нельзя менять роль себе» (причина отказа видна в UI) |
@@ -1547,7 +1614,7 @@ deploy/
 
 ### Этап 0 — Подготовка
 
-- [ ] 0.1 Установить: Docker, uv, Python 3.13, k3d, kubectl, helm, tilt, opa, kubeseal, gh CLI. Уже есть: Docker, uv, Python 3.13, pre-commit (`uv tool install pre-commit`); остальное понадобится не раньше этапа 3 (opa) и этапа 6 (Kubernetes).
+- [ ] 0.1 Установить: Docker, uv, Python 3.13, k3d, kubectl, helm, tilt, opa, kubeseal, gh CLI. Уже есть: Docker, uv, Python 3.13, pre-commit (`uv tool install pre-commit`); остальное понадобится не раньше этапа 3 (opa) и этапа 7 (Kubernetes).
 - [x] 0.2 Создать публичный репозиторий на GitHub (`IhorVoskoboinikov/sales_hub`): README, лицензия MIT, `.gitignore`, `.editorconfig`.
 - [x] 0.3 Перенести этот документ в `docs/DESIGN.md` — дальше правим только его, копий нет.
 - [x] 0.4 pre-commit: ruff, ruff-format, mypy, gitleaks (поиск секретов). Ruff ограничен файлами `.py`: новые версии форматируют и Python-фрагменты в Markdown, а эскизы в этом документе специально написаны компактно.
@@ -1623,7 +1690,7 @@ deploy/
 
 **Готово, когда:** на сгенерированных данных все списки и отчёты идут по индексам (в `EXPLAIN` нет Seq Scan по большим таблицам — проверяет `make explain`), замеры записаны.
 
-**Статус: ✅ этап выполнен и закрыт** (2026-10-21, ветка `stage-4`) — `make seed-big` загружает 5 млн контактов, 1 млн сделок и 20 млн активностей за 10 минут; `make explain`: 224 плана, Seq Scan по большим таблицам — 0 (предупреждение — частая подстрока в `?q=`, её закрывает Elasticsearch на этапе 9); замеры — `docs/experiments.md`; тест-матрица (496 кейсов «роль × эндпоинт × цель»), `opa test` (20 тестов, покрытие ≥ 90%) и 726 тестов pytest зелёные. Каждый шаг прошёл независимое ревью; подтверждённые находки исправлены отдельными коммитами `fix(…)`.
+**Статус: ✅ этап выполнен и закрыт** (2026-10-21, ветка `stage-4`, смержен в `main` — PR #4) — `make seed-big` загружает 5 млн контактов, 1 млн сделок и 20 млн активностей за 10 минут; `make explain`: 224 плана, Seq Scan по большим таблицам — 0 (предупреждение — частая подстрока в `?q=`, её закрывает Elasticsearch на этапе 9); замеры — `docs/experiments.md`; тест-матрица (496 кейсов «роль × эндпоинт × цель»), `opa test` (20 тестов, покрытие ≥ 90%) и 726 тестов pytest зелёные. Каждый шаг прошёл независимое ревью; подтверждённые находки исправлены отдельными коммитами `fix(…)`.
 
 **API этапа 4** (пути — из `routes.rego`, раздел 5; все списки — keyset `?limit=&cursor=`):
 
@@ -1649,22 +1716,45 @@ deploy/
 
 ### Этап 5 — Воркеры, bulk и Telegram-бот (разделы 6, 15, 16)
 
-- [ ] 5.1 `celery_app`, очереди, event loop на процесс, `BaseTask`, передача `request_id`; воркер, beat и Flower в compose.
-- [ ] 5.2 Письма через очередь `notifications` + `sent_notifications` (без дублей).
-- [ ] 5.3 `outbox_events` и процесс relay (`LISTEN/NOTIFY` + опрос).
-- [ ] 5.4 `bulk_jobs`, `plan` / `chunk` / `finalize`, эндпоинт передачи клиентов, `move_team` при смене отдела, прогресс по SSE + строки в `routes.rego`.
-- [ ] 5.5 Отмена job, `reap_stuck`, `failed_tasks` и перезапуск + строки в `routes.rego`.
-- [ ] 5.6 Импорт CSV: загрузка в S3 (RustFS) → `COPY` → merge → `import_errors`.
-- [ ] 5.7 Закрытие просроченных сделок, теги, потоковый экспорт в CSV + строки в `routes.rego`.
-- [ ] 5.8 Расписание beat из раздела 15 (НБУ, корзина, партиции, отчёты, токены, heartbeat).
+- [ ] 5.1 Зависимости (Celery 5.6, раздел 1), `Resources` для API и воркеров, `celery_app` и маршруты очередей, event loop на процесс, `BaseTask` (что повторять), `request_id` в заголовках задачи; `schedule.py` с heartbeat; воркеры, beat и Flower в compose.
+- [ ] 5.2 `outbox_events` с NOTIFY-триггером и процесс relay (`LISTEN/NOTIFY` + опрос), `outbox-relay` в compose.
+- [ ] 5.3 Письма через outbox → очередь `notifications` (`send_email`) + `sent_notifications`; удалить `Mailer` и `BackgroundMailer`, стирать токен после отправки.
+- [ ] 5.4 `bulk_jobs`, `bulk_job_chunks`, `plan` / `chunk` / `finalize_if_complete` (без chord), `TaskQueue`, `POST /bulk/reassign-owner` с `Idempotency-Key`, `move_team` при смене отдела, `GET /bulk-jobs/{id}` и SSE + строки в `routes.rego`, кейсы матрицы и тесты в `authz_test.rego` (множество пар «bulk не шире записи», sales\_rep без bulk и выгрузки, viewer выгружает, но не запускает bulk).
+- [ ] 5.5 Отмена job, `bulk.reap_stuck` (в расписании), `failed_tasks`, список и перезапуск + строки в `routes.rego`.
+- [ ] 5.6 S3 (`FileStorage`, `ensure-bucket`, RustFS в testcontainers); генератор CSV на 500 тыс. строк (`make import-csv`); импорт CSV: загрузка → parse → `COPY` в staging → stage → merge → `import_errors` и `GET /bulk-jobs/{id}/errors` + строки в `routes.rego`.
+- [ ] 5.7 Закрытие просроченных сделок, добавление и снятие тегов, потоковый экспорт в CSV + строки в `routes.rego`.
+- [ ] 5.8 Периодическое обслуживание в beat (раздел 15): НБУ, корзина (+ индексы корзины сделок и компаний), партиции, отчёты, очистка.
 - [ ] 5.9 Замеры способов UPDATE → `docs/experiments.md`.
-- [ ] 5.10 Chaos-тест: убить воркер посреди job.
-- [ ] 5.11 Telegram-бот на aiogram (polling), привязка через `/start <token>`.
-- [ ] 5.12 `notification_settings` и обработчик notifier → Telegram и email.
+- [ ] 5.10 Chaos-тест: убить воркер посреди job (`make chaos` сам создаёт менеджеру 100 тыс. контактов через `generate_series`): job завершается, строки не посчитаны дважды.
+- [ ] 5.11 Telegram-бот на aiogram (polling), привязка через `/start <token>` (миграция: `telegram_link` в CHECK `email_tokens.purpose`, `telegram_links`), роутер `/api/v1/me` и `/me/telegram`.
+- [ ] 5.12 Доменные события (`record.assigned`, `deal.closed`, `bulk_job.completed`), notifier, `notification_settings` и `/me/notifications`, отправка в Telegram.
 - [ ] 5.13 Команды `/today`, `/deals`, `/stop`.
 - [ ] 5.14 Напоминания за 15 минут и утренний дайджест по часовому поясу.
+- [ ] 5.15 Приёмка этапа: e2e-тест «одно письмо и одно сообщение» и `make chaos` с проверкой уведомлений.
 
-**Готово, когда:** передача 100 тыс. клиентов идёт с прогрессом, переживает рестарт воркера, новый ответственный получает одно сообщение в Telegram и одно письмо.
+**Готово, когда:** передача 100 тыс. клиентов идёт с прогрессом, переживает рестарт воркера, новый ответственный получает одно сообщение в Telegram и одно письмо (автор job — своё одно письмо и одно сообщение с итогом).
+
+**API этапа 5** (пути — из `routes.rego`, раздел 5; все POST массовых операций принимают `Idempotency-Key` и отвечают `202 BulkJobOut` + `Location`):
+
+| Эндпоинт | Что делает |
+| --- | --- |
+| `POST /bulk/reassign-owner {from_user_id, to_user_id, include?}` | передать записи человека (раздел 6); 422 `bulk.same_owner`, `owner.invalid`, `validation` (`from_user_id` вне `member:read`); 403 `out_of_scope` (получатель вне уровня); 409 `bulk.already_running` |
+| `POST /bulk/close-overdue-deals {before?, pipeline_id?}` | закрыть просроченные открытые сделки как `lost`; `before` позже сегодняшней даты — 422 `validation` (поле `before`) |
+| `POST /bulk/add-tags`, `POST /bulk/remove-tags` `{tag, filter}` | тег сегменту; `filter` — поля `GET /contacts` |
+| `POST /contacts/import` (multipart: `file`, `owner_id?`) | импорт CSV; 411 `import.length_required`; 413 `import.file_too_large`; 422 `import.invalid_form`, `import.invalid_header`, `import.invalid_encoding`, `import.empty_file`; в ответе ещё `import_info` |
+| `GET /contacts/export?q=&status=&tag=&owner_id=&company_id=` | CSV потоком; 422 `export.too_large`, 429 — больше 10 в час |
+| `GET /bulk-jobs/{job_id}` | `{id, kind, status, total, processed, failed_rows, chunks_total, failed_chunks, result, error, created_at, started_at, finished_at}` |
+| `GET /bulk-jobs/{job_id}/events` | SSE: `progress` при изменениях, `end` на финальном статусе, не дольше 5 минут |
+| `GET /bulk-jobs/{job_id}/errors?limit=&cursor=` | ошибки строк импорта: `{row_no, code, field, raw}` |
+| `POST /bulk-jobs/{job_id}/cancel` | 202; 409 `bulk.not_cancellable` |
+| `PATCH /users/{user_id}` | теперь и смена отдела человека с записями: 200 с `bulk_job_id` |
+| `GET /admin/failed-tasks?task_name=&replayed=`, `GET /admin/failed-tasks/{id}`, `POST …/{id}/replay` | супер-админ; 409 `failed_task.already_replayed`, `failed_task.unknown_task`, `failed_task.not_replayable` |
+| `POST /me/telegram/link`, `GET`, `DELETE /me/telegram` | привязка бота (без OPA); 503 `telegram.disabled` |
+| `GET`, `PUT /me/notifications` | каналы по событиям (без OPA) |
+
+Коды причин в `bulk_jobs.error`: `bulk.author_changed` (автор отключён, сменил роль или отдел, или изменился уровень `bulk:run`), `bulk.target_changed` (получатель больше не может вести записи или вышел из уровня), `bulk.stuck`, `import.too_many_rows`, `import.malformed_csv`. Повтор ключа с другим телом — 422 `bulk.idempotency_key_reused`. Гонку двух одновременных запусков ловит частичный UNIQUE: сервис перехватывает `IntegrityError` по имени индекса, перечитывает активную job и отвечает тем же 409 `bulk.already_running` с `details.job_id`. Тексты всех кодов — в `app/texts/uk.py`.
+
+**Настройки этапа 5** (`Settings`, `.env.example`, compose): `CELERY_BROKER_URL`, `CELERY_VISIBILITY_TIMEOUT` (1200); `S3_ENDPOINT_URL`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_BUCKET` (saleshub), `S3_REGION` (us-east-1); `BULK_CHUNK_SIZE` (10 000); `IMPORT_MAX_BYTES` (100 МиБ), `IMPORT_MAX_ROWS` (1 млн), `EXPORT_MAX_ROWS` (1 млн), `EXPORT_RATE_PER_HOUR` (10); `BULK_REAP_PENDING_SECONDS` (120), `BULK_REAP_STALL_SECONDS` (300), `IMPORT_REAP_STALL_SECONDS` (900), `BULK_MAX_REAPS` (3); `OUTBOX_BATCH_SIZE` (100), `OUTBOX_POLL_SECONDS` (2); `TRASH_RETENTION_DAYS` (30); `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME`, `TELEGRAM_API_URL`, `TELEGRAM_LINK_TTL_MINUTES` (10).
 
 ### Этап 6 — Тесты и CI целиком (разделы 10, 12)
 
@@ -1723,13 +1813,14 @@ CI растёт с этапа 1; здесь он доводится до пол�
 
 ### Этап 10 — Эксперименты (по желанию, в любом порядке)
 
+- [ ] 10.0 Отложено с этапа 5: «тихие часы» уведомлений (`available_at` в outbox, переход через полночь и летнее время); экспорт в S3 по ссылке (`POST /exports`, job `export`, multipart-upload, скачивание через API); chord вместо учёта чанков в базе — сравнение; построчный аудит массовых операций через `RETURNING OLD`.
 - [ ] 10.1 OPA partial evaluation: перенести видимость данных в OPA (`/v1/compile` сам возвращает условия для SQL) и сравнить с `Access` — как это делают в больших системах.
 - [ ] 10.2 Taskiq вместо Celery на одной очереди.
 - [ ] 10.3 KEDA для `worker-bulk`.
 - [ ] 10.4 Vault + External Secrets.
 - [ ] 10.5 Auth0 dev-tenant как провайдер входа.
 - [ ] 10.6 Переход на Python 3.14+ и PostgreSQL 19.
-- [ ] 10.7 Pulumi-стек и staging в облаке (раздел 12, «Переход в облако»).
+- [ ] 10.7 Pulumi-стек и staging в облаке (раздел 12, «Переход в облако»); webhook Telegram-бота вместо polling (раздел 16).
 
 ### Этап 11 — Фронтенд (раздел 13)
 
@@ -1749,7 +1840,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Хранилище файлов (S3) | RustFS вместо MinIO: официальные образы MinIO больше не публикуются; код работает только через S3 API, поэтому хранилище заменяемо |
 | Роутеры FastAPI | полный префикс у роутера (`/api/v1`, `/api/v1/admin`), эндпоинты прямо на нём, подключение только в `app`; вложенные роутеры не используем — у них `scope["route"].path` теряет внешний префикс (FastAPI 0.151) |
 | Ключи JWT | приватный RS256-ключ — файл `JWT_PRIVATE_KEY_FILE` (в dev — `make keys` в `backend/secrets/`, в Kubernetes — Secret файлом); `kid` — отпечаток ключа (RFC 7638); при ротации старый публичный ключ остаётся в JWKS на 1 час |
-| Письма до этапа 5 | `BackgroundTasks` после коммита и ответа: ответ не ждёт SMTP; ошибка SMTP — в лог; на этапе 5 заменяется outbox и очередью |
+| Письма | до этапа 5 — `BackgroundTasks` после коммита (ошибка SMTP — в лог, письмо терялось); с этапа 5 — команда `email.send` в outbox в той же транзакции → relay → `notifications.send_email(event_id)`; токен не попадает в Redis и стирается из payload после отправки |
 | Выдача и отзыв токенов | сначала блокировка строки пользователя, потом токены — refresh не обгоняет logout-all, смену и сброс пароля |
 | Rate limit | `INCR` до проверки, успех обнуляет счётчик; Redis недоступен → 503 |
 | Смена пароля | отзыв остальных сессий + `token_version += 1`, в ответе новая пара токенов для текущей сессии |
@@ -1758,7 +1849,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Кто создаёт организации | только супер-админ; дальше всё через приглашения |
 | Приглашение на занятый email | 202 и письмо «вы уже состоите в организации» — по ответу нельзя проверить, есть ли email в системе |
 | Пользователи этапа 2 без организации | удаляются миграцией этапа 3 (dev-данные, `downgrade` их не возвращает) |
-| Блокировки при управлении людьми | организация → пользователь → его токены; отдел — `FOR UPDATE` при удалении и `FOR KEY SHARE`, когда в него кладут человека: гонки дают 409/422, а не 500. С этапа 4 ответственный записи читается с `FOR SHARE`: перевод человека в другой отдел ждёт создания его записи и видит её (409 `member.has_records`). Организацию сервис людей блокирует `FOR NO KEY UPDATE`, а не `FOR UPDATE`: вставка CRM-записи проверяет FK на организацию с `FOR KEY SHARE`, и с `FOR UPDATE` создание записи и перевод её ответственного ждали бы друг друга (deadlock) |
+| Блокировки при управлении людьми | организация → пользователь → его токены; отдел — `FOR UPDATE` при удалении и `FOR KEY SHARE`, когда в него кладут человека: гонки дают 409/422, а не 500. С этапа 4 ответственный записи читается с `FOR SHARE`: перевод человека в другой отдел ждёт создания его записи и видит её (на этапе 4 — 409 `member.has_records`, с этапа 5 запись догоняет `move_team`: plan её видит). Организацию сервис людей блокирует `FOR NO KEY UPDATE`, а не `FOR UPDATE`: вставка CRM-записи проверяет FK на организацию с `FOR KEY SHARE`, и с `FOR UPDATE` создание записи и перевод её ответственного ждали бы друг друга (deadlock) |
 | Версия OPA | 1.21.3: образ `openpolicyagent/opa:1.21.3` в compose и testcontainers, `opa test` в CI — та же версия |
 | Удаление | мягкое (корзина 30 дней) для компаний, контактов, сделок; жёсткое для остального |
 | 2FA | не делаем |
@@ -1789,22 +1880,31 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Файл прав | `policies/saleshub/data.yaml`: действия роли и уровень видимости; один файл читают OPA и бэкенд |
 | id CRM-таблиц | `bigint` identity у всех CRM-таблиц; uuid — у организаций, отделов, пользователей |
 | Пагинация | keyset везде: `?limit=` (до 100) и непрозрачный `?cursor=`, ответ `{items, next_cursor}`; битый курсор — 422 `pagination.invalid_cursor` |
-| Ответственный записи | по умолчанию — я; проверяется при создании и смене `owner_id` (активный `team_lead` / `sales_rep`), `team_id` — его отдел; до `move_team` смена отдела человека с записями — 409 `member.has_records` |
+| Ответственный записи | по умолчанию — я; проверяется при создании и смене `owner_id` (активный `team_lead` / `sales_rep`), `team_id` — его отдел; с этапа 5 смена отдела человека с записями сразу меняет `users.team_id` и запускает `move_team`, смена роли на `org_admin` / `viewer` при записях — 409 `member.has_records` |
 | Чтение перед изменением | старая версия ищется по уровню чтения: не видна — 404, видна, но вне уровня действия — 403 |
 | Оптимистическая блокировка | `version` в теле `PATCH`, 409 `version.conflict`; `version_id_col` SQLAlchemy ловит гонку |
 | FK на больших таблицах | на `org_id`, `owner_id` и ссылки между сущностями — да, на `team_id` — нет (раздел 3) |
 | Курс в сделке | `fx_rate` — единиц исходной валюты за 1 USD; курсы НБУ подтягиваются по первому запросу дня, при недоступности — последний известный и `fx.stale` |
-| Партиции | `activities`, `audit_log` по месяцам, идемпотентная `ensure_monthly_partitions` на 2 месяца вперёд, без DEFAULT |
+| Партиции | `activities`, `audit_log` по месяцам, идемпотентная `ensure_monthly_partitions` на 2 месяца вперёд, без DEFAULT; с этапа 5 — ещё и ежедневная задача beat |
 | Открытые активности | запланированная — с `due_at` и пустым `done_at`; без `due_at` — уже состоялась (`done_at = created_at`) |
-| Отчёты | MV `deal_stats` по месяцам, `REFRESH CONCURRENTLY`; активности в отчёты не входят |
+| Отчёты | MV `deal_stats` по месяцам, `REFRESH CONCURRENTLY`; активности в отчёты не входят; с этапа 5 — beat каждые 5 минут под advisory lock |
 | Проверка планов | `make explain` на seed-данных, в том числе generic-план; предикаты частичных индексов и шаблон `?q=` — литералами |
 | Поиск по подстроке | pg\_trgm до этапа 9: быстрый для редких подстрок, медленный (≈ 1 с) для частых — ограничение триграмм, его закрывает Elasticsearch |
+| Версии этапа 5 | `celery[redis]==5.6.3` + `redis>=6.4,<6.5` (и `testcontainers[postgres]` без экстра `redis`), `aiogram==3.31.0` + `pydantic>=2.13.5,<2.14`, `aiobotocore` (aiohttp 3.14); ограничения снимаются после Celery 5.7 и aiogram с pydantic 2.14 (раздел 1) |
+| Завершение bulk job | без chord: обычная group чанков, учёт в `bulk_job_chunks`, `finalize_if_complete` — условный `UPDATE … WHERE NOT EXISTS pending`; result backend не нужен |
+| Постановка задач | bulk и импорт — best-effort `send_task` после коммита, потерю подбирает `bulk.reap_stuck` (job — сама себе outbox); письма, сообщения, доменные события — через `outbox_events`, relay передаёт только `event_id` |
+| Надёжность Celery | `visibility_timeout` 20 мин, `acks_late`, prefetch 1, повтор по SQLSTATE и сетевым ошибкам с паузой до 60 с, reaper переотправляет чанки через 5 мин без прогресса (3 попытки) |
+| Передача клиентов | компании, контакты, открытые сделки и открытые активности; закрытые сделки остаются у того, кто их закрыл |
+| Импорт CSV | UTF-8, `,` или `;`; строки проверяются теми же типами, что API; существующий контакт: непустая ячейка перезаписывает, пустая не трогает, теги объединяются (до 20), статус — только если указан, ответственный не меняется; вне уровня — `duplicate_outside_scope` |
+| Аудит массовых операций | одна строка на job (`bulk.<kind>`); по строкам — нет |
+| Выгрузка | потоковый CSV до 1 млн строк; файл в S3 по ссылке — этап 10 |
+| Telegram | aiogram только в боте (polling, профиль compose); отправка из воркера — httpx в Bot API; токен привязки — `email_tokens` (`telegram_link`); тихие часы — этап 10 |
 
 ### Открытые вопросы
 
 - [x] Уведомления — email и Telegram-бот (раздел 16).
 - [x] Поиск — Elasticsearch (раздел 17).
-- [ ] Новых открытых вопросов нет; этапы 1–4 закрыты, следующий шаг — этап 5 дорожной карты.
+- [ ] Новых открытых вопросов нет; этапы 1–4 закрыты, идёт этап 5 (ветка `stage-5`).
 
 ## 15. Модуль: система воркеров
 
@@ -1814,33 +1914,52 @@ CI растёт с этапа 1; здесь он доводится до пол�
 
 | Процесс | Команда | Реплики локально | Назначение |
 | --- | --- | --- | --- |
-| `worker-default` | `celery worker -Q default -c 2` | 1 | короткие задачи: пересчёты, реакция на события |
+| `worker-default` | `celery worker -Q default -c 2` | 1 | короткие задачи: notifier, Telegram, beat-задачи, reaper |
 | `worker-bulk` | `-Q bulk -c 4` | 1–4 (KEDA по длине очереди) | чанки массовых операций |
 | `worker-imports` | `-Q imports -c 2` | 1–2 | разбор и загрузка CSV |
-| `worker-notifications` | `-Q notifications -c 2` | 1 | письма, лимит 50 в минуту |
+| `worker-notifications` | `-Q notifications -c 2` | **ровно 1** | только письма: `rate_limit` Celery действует на экземпляр воркера, поэтому один экземпляр = общий лимит 50 в минуту |
 | `beat` | `celery beat` | **ровно 1**, стратегия `Recreate` | расписание; две копии продублируют задачи |
 | `outbox-relay` | `python -m app.events.relay` | 1 (можно 2+) | публикация outbox: в Celery, позже в Kafka |
 | `flower` | `celery flower` | 1 | UI |
 
-Outbox relay — не задача beat, а долгоживущий цикл: `LISTEN outbox_new` (триггер шлёт `NOTIFY` при вставке) плюс опрос раз в 2 секунды на случай пропуска. Несколько копий не мешают друг другу благодаря `FOR UPDATE SKIP LOCKED`. Так задержка события — миллисекунды, а очередь не засоряется задачами «проверь outbox».
+Это раскладка для Kubernetes (этап 7). В compose очередей две пары: `worker` (`default,notifications`) и `worker-bulk` (`bulk,imports`) — раздел 11.
+
+Outbox relay — не задача beat, а долгоживущий цикл: `LISTEN outbox_new` (триггер шлёт `NOTIFY` при вставке, уведомление доставляется только после коммита) плюс опрос раз в 2 секунды на случай пропуска. Несколько копий не мешают друг другу благодаря `FOR UPDATE SKIP LOCKED`. Так задержка события — миллисекунды, а очередь не засоряется задачами «проверь outbox».
+
+**Как работает relay.** Для `LISTEN` — отдельное соединение `asyncpg.connect()` (DSN — `make_url(database_url).set(drivername="postgresql")`: asyncpg не понимает схему `postgresql+asyncpg`), не из пула SQLAlchemy (иначе соединение с подпиской вернулось бы в пул); `add_listener('outbox_new', …)` будит цикл, обрыв соединения — переподключение, а пока соединения нет, работает только опрос. Цикл: батч → если строк ровно 100, сразу следующий, иначе ждать `NOTIFY` не дольше 2 секунд. Батч — одна транзакция: `SELECT id, event_type, request_id FROM outbox_events WHERE published_at IS NULL ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED` → для каждой строки `request_id_var.set(row.request_id)` и `celery_app.send_task(ROUTES[event_type], args=[row.id])` → `UPDATE … SET published_at = now()` → коммит. Сначала публикация, потом отметка: «как минимум один раз», дубли гасит `sent_notifications`. Ошибка брокера → откат батча, пауза 2 → 4 → … → 30 с. В задачу уходит только `event_id`: payload потребитель читает из базы, поэтому токенов из писем в Redis нет. Порядок событий не гарантируется (несколько воркеров его всё равно теряют), потребители от него не зависят. Ядро — `publish_batch(session, publisher)` с протоколом `Publisher`: в проде `CeleryPublisher`, в тестах — встроенный (раздел 10).
+
+Маршруты событий (`app/events/routes.py`, тест: у каждого `EventType` есть маршрут):
+
+| Тип в outbox | Задача | Что делает |
+| --- | --- | --- |
+| `email.send` | `notifications.send_email` | письмо по шаблону из payload |
+| `telegram.send` | `notifications.send_telegram` | сообщение с готовым текстом из payload |
+| `record.assigned`, `deal.closed`, `bulk_job.completed` | `notifications.notify` | notifier: кому и в какой канал (раздел 16) |
 
 ### Структура модуля
 
 ```text
+app/core/resources.py    # Resources: engine, session_factory, redis, http, nbu, roles, storage,
+                         #   email_sender и telegram (только у воркеров) — для API, воркеров и бота
 app/workers/
-├── celery_app.py        # Celery(), конфиг, маршрутизация очередей
-├── runtime.py           # event loop и engine на процесс, run_async()
-├── context.py           # request_id / user_id / org_id через заголовки задачи
-├── base.py              # BaseTask: ретраи, логи, метрики, запись в failed_tasks
+├── celery_app.py        # Celery(), конфиг, task_routes
+├── runtime.py           # event loop и Resources на процесс, run_async()
+├── context.py           # request_id / user_id через заголовки задачи, настройка логов
+├── base.py              # BaseTask: какие ошибки повторять, backoff, replayable
+├── queue.py             # TaskQueue: постановка задачи из API после коммита (порт, в тестах — фейк)
 ├── schedule.py          # расписание beat
 └── tasks/
-    ├── bulk.py          # plan, chunk, finalize, reap_stuck
+    ├── bulk.py          # plan, chunk, reap_stuck (finalize_if_complete — метод BulkService)
     ├── imports.py       # import_contacts: parse → stage → merge
-    ├── notifications.py # send_email
+    ├── notifications.py # send_email, send_telegram, notify, send_reminders, morning_digest
     ├── fx.py            # fetch_nbu_rates
-    └── maintenance.py   # trash.purge, партиции, reports.refresh, очистка токенов
+    └── maintenance.py   # trash.purge, create_partitions, reports.refresh, cleanup, heartbeat
+app/events/types.py      # EventType и схемы payload
+app/events/routes.py     # тип события → имя задачи
 app/events/relay.py      # outbox relay
 ```
+
+У каждой задачи явное стабильное `name=` (`bulk.chunk`, `fx.fetch_nbu_rates`). Очередь в декораторе не пишется: маршруты — одна таблица `task_routes` по полным именам (`bulk.chunk` → `bulk`; `imports.import_contacts` → `imports`; `notifications.send_email` → `notifications`; всё остальное, включая `bulk.plan` и `bulk.reap_stuck`, → `default`). Шаблон `bulk.*` отправил бы короткие plan и reaper в очередь за тысячей чужих чанков. `finalize_if_complete` — метод сервиса, а не задача Celery. API модули задач не импортирует: ставит их по имени (`send_task`).
 
 ### Async внутри Celery
 
@@ -1849,57 +1968,81 @@ Celery вызывает обычные функции, а сервисы и ре
 | Вариант | Как | Минусы |
 | --- | --- | --- |
 | `asyncio.run()` в каждой задаче | новый event loop на задачу | пул соединений не переживает задачу: нужен `NullPool`, каждое подключение заново |
-| **Один loop на процесс (выбрано)** | loop и engine создаются в `worker_process_init`; `run_async(coro)` = `loop.run_until_complete(coro)` | только prefork-пул (не gevent/eventlet); одна задача на процесс одновременно — это нормально |
+| **Один loop на процесс (выбрано)** | loop и `Resources` создаются лениво, один раз на процесс; `run_async(coro)` = `loop.run_until_complete(coro)` | только prefork-пул (не gevent/eventlet); одна задача на процесс одновременно — это нормально |
 | Sync SQLAlchemy в воркерах | psycopg без async | дублирование репозиториев |
 | Taskiq вместо Celery | async-нативные очереди | меньше экосистема; эксперимент этапа 10 |
 
 ```python
 # workers/runtime.py
-_loop: asyncio.AbstractEventLoop | None = None
+_runtime: Runtime | None = None      # loop + Resources этого процесса
+_settings: Settings | None = None    # configure() — для тестов; иначе get_settings()
 
-@worker_process_init.connect
-def init_process(**_):
-    global _loop
-    _loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_loop)
-    db.init_engine(settings.database_url, pool_size=2)    # engine на процесс, не на задачу
+def configure(settings: Settings) -> None: ...
+
+def get_runtime() -> Runtime:
+    # Лениво и по pid: worker_process_init срабатывает только в дочерних процессах prefork,
+    # а не в тестовом воркере (pool=solo) и не в родительском процессе, где обрабатываются
+    # сигналы. После fork ресурсы родителя не годятся — создаём свои.
+    global _runtime
+    if _runtime is None or _runtime.pid != os.getpid():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _runtime = Runtime(os.getpid(), loop, Resources.create(settings, for_worker=True, pool_size=2))
+    return _runtime
 
 @worker_process_shutdown.connect
 def shutdown_process(**_):
-    _loop.run_until_complete(db.dispose_engine())
-    _loop.close()
+    if _runtime is not None:
+        _runtime.loop.run_until_complete(_runtime.resources.aclose())
+        _runtime.loop.close()
 
 def run_async(coro):
-    return _loop.run_until_complete(coro)
+    loop = get_runtime().loop
+    task = loop.create_task(coro)
+    try:
+        return loop.run_until_complete(task)
+    except BaseException:            # SoftTimeLimitExceeded прерывает run_until_complete:
+        task.cancel()                # без отмены корутина проснулась бы во время следующей задачи
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        raise
 
 # workers/tasks/bulk.py
-@app.task(base=BaseTask, name="bulk.chunk", queue="bulk", bind=True)
-def chunk(self, job_id: str, table: str, lo: int, hi: int) -> int:
-    return run_async(BulkService.run_chunk(job_id, table, lo, hi))   # своя сессия и UoW
+@celery_app.task(base=BaseTask, name="bulk.chunk", bind=True, replayable=False,
+                 soft_time_limit=60, time_limit=90)
+def chunk(self, job_id: str, no: int) -> None:
+    run_async(bulk_service().run_chunk(UUID(job_id), no))   # своя сессия и UoW
 ```
 
-Бюджет соединений к Postgres: API 2 пода × 10 + воркеры 10 процессов × 2 + relay 2 ≈ 42 при `max_connections = 100`. При росте — PgBouncer в режиме transaction.
+`Resources` собирает и lifespan API (кладёт в `app.state` те же атрибуты, что раньше, поэтому `api/deps.py` не меняется), и воркер, и бот — с одними таймаутами; отличаются размер пула и то, что `EmailSender` и клиент Telegram создаются только у воркеров. Бюджет соединений к Postgres: API 2 пода × (5 + 10 overflow) + воркеры 10 процессов × 2 + relay 2 + бот 5 ≈ 57 при `max_connections = 100`. При росте — PgBouncer в режиме transaction.
 
 ### Настройки надёжности
 
 | Настройка | Значение | Зачем |
 | --- | --- | --- |
+| Брокер | Redis db 1 (`CELERY_BROKER_URL`); кэш, rate limit и heartbeat — db 0 | очереди отдельно от кэша: `FLUSHDB` кэша не сотрёт задачи, KEDA читает длину списка `bulk` в известной базе |
+| Result backend | нет, `task_ignore_result=True` | результаты задач никто не читает; завершение bulk видно по базе |
+| Сериализация | `json`, `accept_content=["json"]` | аргументы — только id и простые значения |
 | `task_acks_late` | `True` | сообщение подтверждается после выполнения: упал воркер — задачу возьмёт другой |
-| `task_reject_on_worker_lost` | `True` | то же при OOM и `kill -9` |
+| `task_reject_on_worker_lost` | `True` | то же при OOM и `kill -9` процесса пула |
 | `worker_prefetch_multiplier` | 1 | воркер не забирает лишние длинные задачи |
-| `visibility_timeout` (Redis) | 1 час | должен быть больше самой долгой задачи, иначе Redis выдаст её повторно |
-| `soft_time_limit` / `time_limit` | чанк 60 / 90 с; шаг импорта 10 / 12 мин | зависшая задача не держит воркер |
-| Ретраи | `autoretry_for=(OperationalError, httpx.TransportError, SMTPException)`, `retry_backoff`, `retry_jitter`, `max_retries=5` | временные сбои БД, SMTP, НБУ |
-| Аргументы | только JSON и только id / простые значения | задачи из очереди переживают деплой новой версии |
-| `task_track_started` | `True` | видно в Flower, что задача выполняется |
+| `visibility_timeout` (Redis) | **20 минут**, одинаковый у всех сервисов (`broker_transport_options`, `visibility_timeout`) | больше самой долгой задачи (запуск импорта — 12 минут), иначе Redis выдаст её повторно; сообщение воркера, убитого целиком (`docker kill`), вернётся через это время, а `bulk.reap_stuck` переотправит чанк раньше — через 5 минут без прогресса |
+| `worker_cancel_long_running_tasks_on_connection_loss` | `True` | при потере брокера задача отменяется, а не выполняется второй раз параллельно с повторной доставкой |
+| `soft_time_limit` / `time_limit` | по умолчанию 240 / 300 с; чанк 60 / 90 с; запуск `imports.import_contacts` 10 / 12 мин | зависшая задача не держит воркер. Жёсткий `time_limit` убивает процесс пула: нет ни `task_failure`, ни `on_failure`, а сообщение подтверждается — такой чанк остаётся `pending`, его переотправит `bulk.reap_stuck`; в `failed_tasks` строки нет, это видно в логе (`Hard time limit exceeded`) и во Flower |
+| Ретраи | `BaseTask`: функция `is_retryable(exc)` + `self.retry(countdown=backoff)`, `max_retries=5`, пауза экспоненциальная с jitter, не больше 60 с | повторяем только временные сбои (ниже); countdown всегда меньше `visibility_timeout`. Задержки больше 60 с (ETA) в задачах не используются — напоминания делает опрос beat |
+| `worker_send_task_events`, `task_send_sent_event` | `True` | Flower видит задачи по событиям воркера (`task_track_started` не нужен: без result backend состояние STARTED некуда писать) |
+| Время | `timezone="Europe/Kyiv"`, `enable_utc=True` | расписание beat — по Киеву, данные — в UTC |
+| Остановка | `stop_grace_period: 120s` (в k8s — `terminationGracePeriodSeconds: 120`) | больше лимита чанка: SIGTERM даёт warm shutdown, невзятые сообщения сразу возвращаются в очередь |
+
+**Что повторять.** У asyncpg ошибки Postgres приходят как `sqlalchemy.exc.DBAPIError`, а не `OperationalError`, поэтому повтор решается по SQLSTATE, а не по классу: класс `08` (соединение), `40001` (serialization failure), `40P01` (deadlock — два job разных видов могут обновлять одни строки в разном порядке), `57P01`–`57P03` (Postgres перезапускается), `53300` (нет свободных соединений); плюс `InterfaceError`, `OSError` (отказ подключения), `httpx.TransportError`, `aiosmtplib.SMTPException`, `redis.exceptions.ConnectionError` и `ServiceUnavailable` с кодами `unavailable` и `fx.unavailable`. `authz.policy_out_of_sync` — ошибка конфигурации, её не повторяем. Остальные `AppError` (404 / 409 / 422) — сразу провал. Unit-тест: настоящий deadlock двух сессий распознаётся как повторяемый.
 
 ### Идемпотентность и защита от дублей
 
-- **Чанк bulk:** set-based `UPDATE` с условием, которое после первого прогона ничего не находит (`owner_id = :from`).
-- **Импорт:** шаги `parse → stage → merge` с отметкой в `bulk_jobs.stage`; повтор начинается с последнего незавершённого шага; `merge` через `ON CONFLICT`.
-- **Письма:** таблица `sent_notifications(dedup_key UNIQUE)`, ключ вида `deal_reassigned:{job_id}:{user_id}` — повтор не отправит письмо второй раз.
-- **Запуск job:** заголовок `Idempotency-Key` → уникальный индекс `bulk_jobs(owner_id, idempotency_key)`.
-- **Одна тяжёлая job на организацию:** частичный уникальный индекс `bulk_jobs(org_id, kind) WHERE status IN ('pending', 'running')` — второй запуск получит 409. Для задач супер-админа (`org_id` NULL, а NULL-ы в уникальном индексе не совпадают) — отдельный `UNIQUE (kind) WHERE org_id IS NULL AND status IN ('pending', 'running')`.
+- **Чанк bulk:** строка `bulk_job_chunks` со статусом `pending` берётся `FOR UPDATE`; повтор выполненного чанка ничего не делает, а сам `UPDATE` с условием (`owner_id = :from`) после первого прогона ничего не находит.
+- **Импорт:** одна копия задачи на job (сессионный advisory lock по `job_id`); шаги `parse → stage → merge` с отметкой в `bulk_jobs.stage`; повтор начинается с последнего незавершённого шага; чанки merge отмечают строки staging `merged`; `merge` через `ON CONFLICT`.
+- **Письма и сообщения:** `sent_notifications(dedup_key PK)`. Отправитель в **одной** транзакции: `INSERT … ON CONFLICT (dedup_key) DO NOTHING RETURNING` — ничего не вернулось, значит уже отправлено, выход; параллельная копия задачи ждёт на уникальном индексе → отправка (SMTP и Telegram с таймаутом 10 с) → успех: коммит (для письма — заодно стереть токен из payload); ошибка: откат, ключ исчезает, Celery повторяет. Дубль возможен только при падении процесса между ответом SMTP и коммитом (миллисекунды) — осознанное «как минимум один раз».
+- **Ключи дедупа** строят функции `app/notifications/keys.py` (unit-тест на формат): письма сервисов — `email:{event_id}`, если команда не задаёт свой; события notifier — `{event_type}:{subject}:{user_id}:{channel}`, где `subject` — `event_id` для `record.assigned` и `deal.closed` (каждое изменение — отдельный факт) и `job:{job_id}` для `bulk_job.completed` (одно сообщение на job, сколько бы раз ни прошёл finalize); напоминание — `activity.reminder:{activity_id}:{unix due_at}:telegram` (перенос встречи — новое напоминание); дайджест — `digest.morning:{user_id}:{YYYY-MM-DD}:telegram`.
+- **Запуск job:** заголовок `Idempotency-Key` → уникальный индекс `bulk_jobs(owner_id, idempotency_key)` и `request_hash` (раздел 6).
+- **Одна тяжёлая job на организацию:** частичный уникальный индекс `bulk_jobs(org_id, kind) WHERE status IN ('pending', 'running', 'cancelling') AND kind <> 'move_team'` — второй запуск получит 409 `bulk.already_running`; `cancelling` тоже держит слот, иначе старые и новые чанки шли бы параллельно. Задачи супер-админа без организации (`reindex`, этап 9) добавят свой индекс вместе с колонкой.
 - **Курсы НБУ:** `INSERT … ON CONFLICT (rate_date, currency) DO UPDATE` — повторная загрузка безопасна.
 
 ### Жизненный цикл bulk job
@@ -1908,39 +2051,44 @@ def chunk(self, job_id: str, table: str, lo: int, hi: int) -> int:
 
 &#91;embedded content: статусы bulk job · 4 финальных, отмена из pending и running\]
 
-Отменить можно только незавершённую job. Куда перейдёт running — в done, partial\_failed или failed, — решают bulk.finalize и bulk.reap\_stuck.
+Отменить можно только незавершённую job. Куда перейдёт running — в done, partial\_failed или failed, — решают `finalize_if_complete` и `bulk.reap_stuck`.
 
-- `POST /api/v1/bulk-jobs/{id}/cancel` ставит `cancelling`; каждый чанк перед стартом проверяет статус и пропускает работу; `finalize` ставит `cancelled`. Уже изменённые строки остаются изменёнными — в ответе видно, сколько успели.
-- `bulk.reap_stuck` (раз в минуту): job в `running` без роста `processed` 15 минут → `failed` + алерт `BulkJobStuck`.
-- Прогресс: `processed / total` в `bulk_jobs`; изменение публикуется в Redis pub/sub, SSE-эндпоинт `/bulk-jobs/{id}/events` отдаёт его клиенту.
+- `POST /api/v1/bulk-jobs/{id}/cancel` (`bulk_job:cancel`; job ищется по уровню `bulk_job:read` — не видна → 404): `pending` → сразу `cancelled` (plan с условием `status = 'pending'` ничего не сделает); `running` → `cancelling`; `cancelling` / `cancelled` → 202 без изменений; финальные статусы и `move_team` → 409 `bulk.not_cancellable`. Чанк читает статус job без блокировки — один начатый чанк может доработать; следующие становятся `skipped`, `finalize_if_complete` ставит `cancelled`. Уже изменённые строки остаются изменёнными — в ответе видно, сколько успели.
+- `bulk.reap_stuck` (раз в минуту, очередь `default`). Правила (1)–(3) — для `kind <> 'import_contacts'`: (1) `pending` дольше 2 минут → снова `bulk.plan` (потерянная постановка из API); (2) `running` / `cancelling` без `pending`-чанков → `finalize_if_complete` (потерянный finalize); (3) `running` / `cancelling` без прогресса 5 минут (`updated_at`) **и пустая очередь `bulk`** (`LLEN bulk` в db 1: если там сообщения, чанки, скорее всего, ждут своей очереди за чужой job — не переотправлять и не считать попытку) → снова отправить `pending`-чанки, `reaps += 1`; при `reaps ≥ 3` → `error = bulk.stuck`, `pending` → `skipped`, job → `failed`, алерт `BulkJobStuck`. Для `kind = 'import_contacts'`: `pending` дольше 2 минут или `running` без прогресса 15 минут (больше лимита запуска) → снова `imports.import_contacts`, та же граница `reaps ≥ 3`. Повторная доставка того же чанка позже безопасна. Пороги — в `Settings`.
+- Прогресс: `processed / total` в `bulk_jobs`. SSE-эндпоинт `/bulk-jobs/{id}/events` опрашивает job раз в секунду короткой сессией и шлёт `event: progress`, когда что-то изменилось; на финальном статусе — `event: end`, и поток закрывается; поток живёт не дольше 5 минут (`retry: 3000` — клиент переподключится со свежим токеном). Сессия запроса возвращается в пул до начала потока (`uow.rollback()`): иначе каждая открытая вкладка держала бы соединение, и полтора десятка вкладок исчерпали бы пул (5 + 10). Аутентификация — обычный `Authorization: Bearer`: браузерный `EventSource` заголовков не шлёт, поэтому клиент читает поток через `fetch` (на этапе 11 — `@microsoft/fetch-event-source`), руками — `curl -N -H 'Authorization: Bearer …'`; токен в URL не кладём — он осел бы в логах прокси. Реализация — встроенный в FastAPI `EventSourceResponse`. Redis pub/sub ради десятка событий не нужен.
 
 ### Задачи, упавшие после всех ретраев
 
-У Celery с Redis нет dead-letter очереди, поэтому делаем свою: сигнал `task_failure` (после исчерпания ретраев) → строка в `failed_tasks` (имя, аргументы, ошибка, traceback, request\_id, время) + метрика `celery_task_failed_total` + алерт `CeleryTaskFailureRate`. Супер-админ видит их в `GET /api/v1/admin/failed-tasks` и может перезапустить `POST /api/v1/admin/failed-tasks/{id}/replay` — это безопасно, потому что задачи идемпотентны.
+У Celery с Redis нет dead-letter очереди, поэтому делаем свою (шаг 5.5): сигнал `task_failure` (после исчерпания ретраев; на `Retry` его нет) → строка в `failed_tasks` (`ON CONFLICT (task_id) DO NOTHING` — повторно доставленная задача не даёт дубля) своей сессией; ошибка записи только логируется. Плюс метрика `celery_task_failed_total` и алерт `CeleryTaskFailureRate` (этап 8). До шага 5.5 провалы видны во Flower и в логах.
+
+Супер-админ (`admin:system`): `GET /api/v1/admin/failed-tasks?task_name=&replayed=` — keyset-список без traceback, `GET …/{failed_task_id}` — со всеми полями, `POST …/{failed_task_id}/replay` → 202 `{task_id}`. Replay: строка `FOR UPDATE`; уже перезапущена → 409 `failed_task.already_replayed`; имени нет среди задач → 409 `failed_task.unknown_task`; задачи bulk и импорта (`replayable=False`: `bulk.plan`, `bulk.chunk`, `imports.import_contacts`) → 409 `failed_task.not_replayable` — их повторяют новой job, условия идемпотентны. Иначе `send_task` (через `asyncio.to_thread`; брокер недоступен → 503 и откат) → `replayed_at`, `replayed_by`, `replay_task_id`, строка журнала `failed_task.replayed` → коммит. Публикация идёт до коммита: упадёт коммит — задача выполнится лишний раз, это безопасно.
 
 ### Контекст и логи
 
-`before_task_publish` берёт `request_id`, `user_id`, `org_id` из contextvars API и кладёт в заголовки задачи; `task_prerun` восстанавливает их в structlog. В логах одна цепочка: HTTP-запрос → задача → событие outbox → потребитель Kafka.
+`before_task_publish` берёт `request_id` (из `request_id_var`) и `user_id` (из contextvars structlog) и кладёт в заголовки задачи `saleshub_request_id`, `saleshub_user_id`; организацию не переносим — она есть в аргументах или в job. `task_prerun` восстанавливает их в `request_id_var` (его читает `AuditRepository.record` — иначе в журнале был бы NULL) и в structlog вместе с `task_id` и `task_name`; у задач beat `request_id` = `task_id`. `task_postrun` всё очищает: процесс prefork выполняет много задач, и поля одной не должны попасть в логи следующей. Задачи, которые ставит сам воркер (plan → чанки), получают тот же `request_id` автоматически. Relay перед публикацией ставит `request_id` из колонки `outbox_events.request_id`. В логах одна цепочка: HTTP-запрос → задача → событие outbox → потребитель Kafka. Тест: `request_id` из HTTP-запроса появляется в строке `audit_log`, которую записала задача.
 
 ### Расписание beat (часовой пояс Europe/Kyiv)
 
+`app/workers/schedule.py` появляется в шаге 5.1 с одной записью (heartbeat), каждый шаг добавляет свои. У каждой записи `options={"expires": <интервал>}`: если воркер лежал, задачи не копятся в очереди. Все — в очереди `default`.
+
 | Задача | Когда | Что делает |
 | --- | --- | --- |
-| `fx.fetch_nbu_rates` | будни 18:30, повтор 19:30; при старте, если нет курса на завтра | курсы НБУ на следующий рабочий день → `fx_rates` |
-| `bulk.reap_stuck` | каждую минуту | зависшие job → `failed` |
-| `trash.purge` | ежедневно 03:00 | удаляет из корзины записи старше 30 дней, чанками |
-| `maintenance.create_partitions` | 1-го числа месяца | партиции `activities` и `audit_log` на 2 месяца вперёд — та же функция `ensure_monthly_partitions`, что вызывает `migrate` |
-| `reports.refresh` | каждые 5 минут | `REFRESH MATERIALIZED VIEW CONCURRENTLY` |
-| `auth.cleanup_tokens` | ежедневно 04:00 | удаляет истёкшие refresh- и email-токены |
-| `workers.heartbeat` | каждую минуту | пишет время в Redis; если старше 3 минут — алерт `CeleryBeatDown` |
-| notifications.morning\_digest | каждые 15 минут | отправляет дайджест тем, у кого по их часовому поясу наступило 09:00 и он ещё не отправлен сегодня (dedup\_key = user + локальная дата) |
+| `workers.heartbeat` | каждую минуту | `SET workers:heartbeat <unix ts> EX 600` в db 0; старше 3 минут — алерт `CeleryBeatDown` (этап 8) |
+| `bulk.reap_stuck` | каждую минуту | правила выше |
+| `notifications.send_reminders` | каждую минуту | напоминания за 15 минут (раздел 16) |
+| `notifications.morning_digest` | каждые 15 минут | дайджест тем, у кого по их часовому поясу 09:00–12:00 и он ещё не отправлен сегодня (раздел 16) |
+| `reports.refresh` | каждые 5 минут | `REFRESH MATERIALIZED VIEW CONCURRENTLY deal_stats` под `pg_try_advisory_xact_lock`: занято — пропуск, два REFRESH не встают друг за другом; `make refresh-reports` вызывает тот же метод |
+| `fx.fetch_nbu_rates` | ежедневно 18:30 и 19:30 | `FxService.load_rates`: курсы на сегодня и завтра по Киеву → `fx_rates`; ошибка НБУ — ретрай, пустой ответ на завтра — не ошибка. Курс по-прежнему подтягивается и по первому запросу дня (раздел 3) |
+| `maintenance.create_partitions` | ежедневно 01:00 | партиции `activities` и `audit_log` на 2 месяца вперёд — та же функция `ensure_partitions` (`app/db/partitions.py`), что вызывает `migrate`. Ежедневно, а не 1-го числа: если beat в тот день лежал, партиции всё равно появятся |
+| `trash.purge` | ежедневно 03:00 | корзина старше 30 дней, чанками (раздел 3) |
+| `maintenance.cleanup` | ежедневно 04:00 | по шагам, каждый в своих транзакциях, ошибка шага не останавливает остальные: истёкшие refresh- и email-токены; опубликованные `outbox_events` старше 7 дней; `sent_notifications` старше 30 дней (ключ живёт дольше строки outbox, которую можно доставить повторно); файлы S3 завершённых импортов старше 7 дней и сироты `imports/*` старше суток; `bulk_jobs` старше 90 дней (чанки, staging и ошибки — каскадом). Неопубликованные строки outbox не удаляются никогда — для них алерт `OutboxLag` |
 
-Beat хранит своё состояние в файле на `emptyDir`; после перезапуска пропущенный запуск просто выполнится в следующий раз — задачи идемпотентны. Для отказоустойчивого beat позже можно попробовать RedBeat (блокировка в Redis).
+Beat хранит своё состояние в файле на `emptyDir` (в compose — `/tmp`); после перезапуска пропущенный запуск просто выполнится в следующий раз — задачи идемпотентны. Переход на летнее и зимнее время: в Киеве час 03:00–04:00 в октябре повторяется, а в марте пропадает — для идемпотентных задач это допустимо. Для отказоустойчивого beat позже можно попробовать RedBeat (блокировка в Redis).
 
 ### Масштабирование и остановка
 
 - Каждая очередь — свой Deployment со своими ресурсами: `bulk` нагружает базу, поэтому `-c 4`; `imports` ест память, поэтому `-c 2` и лимит памяти выше.
-- KEDA `ScaledObject` масштабирует `worker-bulk` от 1 до 4 реплик по длине Redis-списка `bulk`.
+- KEDA `ScaledObject` масштабирует `worker-bulk` от 1 до 4 реплик по длине Redis-списка `bulk` (db 1).
 - SIGTERM → warm shutdown: воркер дорабатывает текущую задачу. `terminationGracePeriodSeconds: 120` больше лимита чанка (90 с). Длинный импорт разбит на шаги, поэтому рестарт теряет не больше одного шага.
 - Новая версия кода выполняет задачи, поставленные старой: аргументы совместимы, а переименованная задача на один релиз оставляет старое имя как алиас.
 
@@ -1954,62 +2102,77 @@ Beat хранит своё состояние в файле на `emptyDir`; п�
 ### Тесты воркеров
 
 - **Unit:** сервис вызывается напрямую; задача — обёртка, её логику не тестируем отдельно.
-- **Integration:** фикстура `celery_worker` с реальным Redis — группы задач с финальной задачей, ретраи, отмена job.
-- **Chaos:** bulk job на 1 млн контактов, посреди — `kubectl delete pod` у воркера → job всё равно завершается, число изменённых строк верное, письмо одно.
-- **Время и внешние API:** freezegun для расписания, respx для НБУ и SMTP.
+- **Integration:** фикстура `celery_worker` с реальным Redis (раздел 10) — группа чанков и завершение job, ретраи, отмена, reaper, relay → письмо.
+- **Chaos (5.10):** `make chaos` против стенда `make up`: менеджер со 100 тыс. контактов → `POST /bulk/reassign-owner` → дождаться `processed > 30%` → сценарий A: `kill -9` процесса пула (PID из `celery inspect stats`) — `task_reject_on_worker_lost` сразу возвращает задачу; сценарий B: `docker compose kill -s KILL worker-bulk` и `up -d` — сообщение вернёт Redis через `visibility_timeout`, а reaper переотправит чанк минут через 5. Проверки: job `done`, `processed == total`, у старого ответственного 0 записей, у нового — все, ни один чанк не посчитан дважды. В CI не запускается, результат — в `docs/experiments.md`; на этапе 7 тот же сценарий через `kubectl delete pod`.
+- **Приёмка этапа (5.15):** integration-тест `test_bulk_reassign_e2e.py` (настоящие воркер и relay, Telegram через respx): reassign → чанки → finalize → outbox → notify → у получателя и автора привязан Telegram; в Mailpit ровно одно письмо получателю и одно автору, ровно два вызова `sendMessage` — по одному каждому; повторный finalize и повторная публикация того же события ничего не добавляют. Плюс `make chaos` с проверкой писем (Telegram — если задан токен).
+- **Время и внешние API:** freezegun для расписания, respx для НБУ, Telegram и SMTP-ошибок.
 
 ## 16. Модуль: уведомления и Telegram-бот
 
-Пользователь получает уведомления CRM в Telegram и на почту — по своим настройкам. Бот на aiogram — отдельный процесс, который делает две вещи: привязывает Telegram-аккаунт к пользователю CRM и отвечает на пару команд. Отправка сообщений идёт не из бота, а из воркеров очереди `notifications`, тем же путём, что и письма.
+Пользователь получает уведомления CRM в Telegram и на почту — по своим настройкам. Бот на aiogram 3 — отдельный процесс, который делает две вещи: привязывает Telegram-аккаунт к пользователю CRM и отвечает на пару команд. Отправка сообщений идёт не из бота, а из воркеров, тем же путём, что и письма: всё, что отправляется, сначала записывается командой в `outbox_events` (`email.send` или `telegram.send`), relay ставит задачу, а отправитель дедуплицирует по `sent_notifications`.
 
 В проекте два разных бота: **пользовательский** (этот раздел) и **бот для алертов** Alertmanager (раздел 8). У них разные токены и разные получатели — пользователи CRM и команда разработки.
 
 ### События и каналы
 
-| Событие | Кому | Канал по умолчанию |
-| --- | --- | --- |
-| Вам назначили сделку или клиента (в том числе bulk-передача — одно сообщение «вам передано 120 клиентов») | новому ответственному | Telegram + email |
-| Сделка перешла в `won` / `lost` | ответственному и руководителю отдела | Telegram |
-| Напоминание: встреча или звонок через 15 минут | ответственному | Telegram |
-| Утренний дайджест в 09:00 по часовому поясу пользователя: задачи на сегодня, просроченные | каждому менеджеру | Telegram |
-| Импорт или массовая операция завершены (с числом ошибок) | автору job | Telegram + email |
-| Приглашение, сброс пароля | пользователю | только email |
+| Событие (`event_type`) | Когда пишется | Кому | Каналы по умолчанию (разрешённые) |
+| --- | --- | --- | --- |
+| `record.assigned` | создание контакта или сделки с чужим ответственным, смена ответственного (`CrmService`, хук `_events` перед коммитом; у компаний — нет, это общий справочник); bulk-передача — одно сообщение «вам передано 120 клиентов» через `bulk_job.completed` | новому ответственному | Telegram + email (Telegram, email) |
+| `deal.closed` | сделка перешла в `won` / `lost` через `PATCH` (`DealService`); создание сразу закрытой и массовое закрытие просроченных события не дают | ответственному и активным руководителям его отдела | Telegram (Telegram, email) |
+| `activity.reminder` | beat, за 15 минут до звонка или встречи | ответственному | Telegram (только Telegram) |
+| `digest.morning` | beat, 09:00–12:00 по часовому поясу пользователя | каждому `team_lead` и `sales_rep` с привязанным Telegram | Telegram (только Telegram) |
+| `bulk_job.completed` | финал job (одна строка на job) | автору — итог с числом ошибок; получателю `reassign_owner` — «вам передано N клиентов» (по его настройке `record.assigned`) | Telegram + email (Telegram, email) |
+| приглашение, сброс пароля | сервисы раздела 4 | пользователю | только email, вне настроек |
 
-Настройки: таблица `notification_settings(user_id, event_type, channel, enabled)` и эндпоинты `GET/PUT /api/v1/me/notifications`. Эндпоинты `/api/v1/me/*` — личные настройки: они стоят на роутере только с `current_user`, без OPA, и работают с записями самого пользователя. «Тихие часы» (например, 22:00–08:00) — несрочное откладывается до утра.
+Payload событий (`app/events/types.py`): `record.assigned` — `{entity_type, entity_id, title, owner_id, actor_id}`; `deal.closed` — `{deal_id, title, status, amount_original, currency_original, owner_id, team_id, actor_id}`; `bulk_job.completed` — `{job_id, kind, status, total, processed, failed_rows, failed_chunks, rows: {contacts: n, …} | null, author_id, to_user_id | null}`. Массовые операции по строкам событий не пишут — иначе 100 тыс. сообщений вместо одного.
+
+**Настройки.** Таблица `notification_settings(user_id, event_type, channel, enabled)` хранит только отличия от умолчаний; умолчания и разрешённые пары — в коде (`app/notifications/catalog.py`: `ALLOWED`, `DEFAULTS`). Итог = строка пользователя, иначе умолчание. Эндпоинты `GET/PUT /api/v1/me/notifications`: GET отдаёт `{telegram_linked, channels: [{event_type, channel, enabled, is_default}]}` по всем восьми разрешённым парам; PUT `{channels: [...]}` — полная замена (удалить строки пользователя, вставить только отличия от умолчаний); неизвестная или неразрешённая пара, повтор пары — 422 `validation`. Личные настройки в журнал не пишутся. Эндпоинты `/api/v1/me/*` стоят на отдельном роутере только с `current_member`, без OPA (раздел 5). «Тихие часы» (несрочное — до утра) перенесены на этап 10.
+
+### Как сообщение доходит до пользователя
+
+1. Сервис (например, `DealService.update`) пишет доменное событие в outbox в той же транзакции.
+2. Relay публикует `notifications.notify(event_id)`. Notifier (`NotificationService.notify`) выбирает получателей: у `record.assigned` и `deal.closed` исключает автора изменения (`actor_id` — себе не пишем); у `bulk_job.completed` автор job (`author_id`) — законный получатель итога; всегда исключает неактивных и пользователей без организации и схлопывает повторы (получатель передачи, он же автор, получает одно сообщение с итогом); для каждой пары «получатель × канал» с итоговым `enabled` пишет команду: email → `email.send` с шаблоном и контекстом, Telegram (только если есть `telegram_links`) → `telegram.send {user_id, text, dedup_key}` с текстом из того же шаблона `.txt`. Один коммит. Повтор notify создаёт команды с теми же `dedup_key` — отправитель их пропустит.
+3. `notifications.send_email(event_id)` (очередь `notifications`, `rate_limit='50/m'`) рендерит шаблон Jinja2 и отправляет; `notifications.send_telegram(event_id)` (очередь `default`, без rate limit) отправляет готовый текст. Шаблоны — `app/texts/emails/{record_assigned,deal_closed,bulk_job_completed,bulk_reassigned}.{txt,html}`.
+4. Дедупликация через `sent_notifications(dedup_key)` (раздел 15) — повтор задачи не отправит второе сообщение.
+5. Ответы Telegram: 429 → `retry(countdown = min(retry_after + 1, 60))`; 403 или 400 «chat not found» → откат, удалить привязку `WHERE user_id = :u AND chat_id = :c` (свежую перепривязку это не задевает), коммит, без ретрая — канал выключен, пользователь включит его снова через `/start`; 5xx и сетевые ошибки — обычный ретрай; прочие 4xx — провал в `failed_tasks`.
+
+Отправка в Telegram из воркера — не через aiogram, а одним HTTP-вызовом: `app/notifications/telegram.py: TelegramClient(http, token, base_url)` → `POST {TELEGRAM_API_URL}/bot{token}/sendMessage {chat_id, text, link_preview_options: {is_disabled: true}}`, таймаут 10 с. httpx уже есть, respx его подменяет; aiogram с его aiohttp-сессией нужен только процессу бота. Текст — простой, без `parse_mode`: не нужно экранировать названия сделок. Токен бота стоит в URL, поэтому: логгеры `httpx` и `httpcore` — на уровне WARNING (иначе каждая строка `HTTP Request: POST …/bot<token>/…` попала бы в Loki), а `TelegramClient` не вызывает `raise_for_status()` и бросает своё `TelegramApiError(status, error_code, description)` без URL — токена нет ни в логе, ни в `failed_tasks`. Unit-тест это проверяет.
 
 ### Привязка Telegram
 
-1. В профиле `POST /api/v1/me/telegram/link` → одноразовый токен (живёт 10 минут) и ссылка вида `https://t.me/<bot>?start=<token>`.
+1. В профиле `POST /api/v1/me/telegram/link` → 201 `{url: "https://t.me/<TELEGRAM_BOT_USERNAME>?start=<token>", expires_at}`. Токен — тот же механизм, что у писем: `email_tokens` с целью `telegram_link`, живёт 10 минут, хранится хэш, новый запрос гасит предыдущий. 43 символа `[A-Za-z0-9_-]` укладываются в лимит Telegram для параметра `start` (64). Бот не настроен (`TELEGRAM_BOT_USERNAME` или токен пусты) → 503 `telegram.disabled`. `GET /api/v1/me/telegram` → `{linked, username, linked_at}`, `DELETE /api/v1/me/telegram` → 204 всегда, даже без привязки.
 2. Пользователь открывает ссылку, Telegram отправляет боту `/start <token>`.
-3. Бот проверяет токен через сервис, сохраняет `telegram_links(user_id, chat_id, linked_at)` и отвечает «Аккаунт привязан».
-4. Отвязка — `/stop` в боте или `DELETE /api/v1/me/telegram`. Если пользователь заблокировал бота, Telegram вернёт 403 — канал отключается автоматически.
+3. Бот (`TelegramService.link`, одна транзакция): гасит токен (`use_email_token`, блокировка строки токена) → пользователь неактивен или без организации — «доступ закрыто» → `DELETE … WHERE chat_id = :chat AND user_id <> :user` (чат переходит к владельцу токена) → `INSERT … ON CONFLICT (user_id) DO UPDATE` (новый чат заменяет старый) → коммит → «Аккаунт привязан». Токен доказывает владение аккаунтом CRM, апдейт — владение чатом, поэтому молча перепривязать безопасно. Гонка двух `/start` из одного чата (`IntegrityError`) — откат, токен не погашен, «спробуйте ще раз».
+4. Отвязка — `/stop` в боте или `DELETE /api/v1/me/telegram`. Если пользователь заблокировал бота, Telegram вернёт 403 — привязка удаляется автоматически.
 
 ### Команды бота
 
 | Команда | Что делает |
 | --- | --- |
-| `/start <token>` | привязка аккаунта |
-| `/today` | мои задачи и встречи на сегодня |
-| `/deals` | мои открытые сделки с суммой (в валюте организации, через конвертер) |
-| `/stop` | отвязать и выключить уведомления |
+| `/start <token>` | привязка аккаунта; `/start` без токена — «вы подключены как …» или инструкция, как привязать |
+| `/today` | мои открытые задачи на сегодня (до 20) и просроченные с прошлых дней (до 10), без пересечения списков; время — `HH:MM` в моём часовом поясе |
+| `/deals` | мои открытые сделки (10 новых) и итог по всем открытым: число и сумма в валюте организации через конвертер; при `fx.stale` — «(курс на <дата>)» |
+| `/stop` | отвязать и выключить уведомления (работает и у отключённого пользователя) |
 
-Бот вызывает те же сервисы, что и API, от имени привязанного пользователя. Через HTTP-маршруты он не ходит, поэтому OPA ему не нужен. Перед каждой командой бот загружает пользователя (тот же кэш, что у `current_user`) и проверяет `is_active`; отключённому отвечает, что доступ закрыт, и удаляет `telegram_links`. Команды бота показывают только данные самого пользователя: бот строит `Access.for_user(user, "deal:read")` и сужает уровень до `own` («мои задачи», «мои сделки»); если у роли нет действия — отвечает «недоступно».
+Любой другой текст — список команд. Бот отвечает только в личных чатах (`F.chat.type == "private"`): в группе личные данные CRM попали бы в общий чат.
 
-### Как сообщение доходит до пользователя
+Бот вызывает те же сервисы, что и API, от имени привязанного пользователя. Через HTTP-маршруты он не ходит, поэтому OPA ему не нужен. Перед каждой командой middleware `LinkedUserMiddleware` находит привязку по `chat_id`, загружает пользователя (тот же кэш Redis, что у `current_user`) и проверяет `is_active`, подтверждённый email и организацию; отключённому отвечает, что доступ закрыт, и удаляет `telegram_links`. Команды бота показывают только данные самого пользователя: бот строит `Access.for_user(user, "activity:read" | "deal:read", roles)` и сужает уровень до `own()`; если у роли нет действия — отвечает «недоступно». `/today` и дайджест собирает один `AgendaService`. Ошибки: `AppError` → текст по коду из `app/texts/uk.py`, остальное — «Сталася помилка, спробуйте пізніше» и лог с `request_id` апдейта. Тексты бота — `BOT` и `BOT_COMMANDS` в `app/texts/uk.py`; текст сообщений пользователя в лог не пишется.
 
-1. Сервис (например, `DealService.reassign`) пишет доменное событие в outbox.
-2. Relay публикует событие; обработчик `notifier` по `notification_settings` решает, кому и в какой канал.
-3. Задача `notifications.send_telegram` (очередь `notifications`) отправляет через Bot API.
-4. Дедупликация через `sent_notifications(dedup_key)` — повтор задачи не отправит второе сообщение.
-5. Лимиты Telegram: rate limit задачи и ретрай с паузой из ответа 429 (`retry_after`).
+Структура: `app/bot/__main__.py` (`python -m app.bot`: `Resources`, `Bot`, `delete_webhook`, `set_my_commands`, `start_polling(allowed_updates=["message"], tasks_concurrency_limit=4)`), `dispatcher.py` (`create_dispatcher(...)` — её же вызывают тесты), `middlewares.py` (сессия БД на апдейт, как сессия на запрос в API; привязанный пользователь), `handlers.py`. FSM не используется, поэтому `aiogram` ставится без extras (у `aiogram[redis]` свой потолок redis-py).
+
+### Напоминания и дайджест
+
+- **Напоминание за 15 минут** — `notifications.send_reminders` каждую минуту. Один запрос от привязанных активных пользователей: `telegram_links ⨝ users ⨝ LATERAL (открытые звонки и встречи этого ответственного с due_at в (now, now + 15 минут], до 20)`, минус уже отправленные ключи `activity.reminder:{id}:{unix due_at}:telegram` и минус выключенные настройки (умолчание подставляется параметром из `DEFAULTS`, чтобы не было второго источника правды). На каждую строку — команда `telegram.send` с текстом «Через N хв (о HH:MM) — дзвінок: <тема>». Окно «до начала события» догоняет пропущенные тики beat и активности, созданные меньше чем за 15 минут; перенос встречи даёт новый ключ; выполненная или удалённая не попадает в выборку. Индекс — `activities (owner_id, due_at, id) WHERE done_at IS NULL` в каждой партиции (`make explain`).
+- **Утренний дайджест** — `notifications.morning_digest` каждые 15 минут: `team_lead` и `sales_rep` с привязанным Telegram, у которых локальное время (`coalesce(users.timezone, organizations.timezone)`) в окне 09:00–12:00 и ключа `digest.morning:{user_id}:{локальная дата}:telegram` ещё нет. Повестка (`AgendaService.day`) собирается в момент постановки — та же, что `/today`, с заголовком «Доброго ранку! План на <дата>». Пустая повестка — ничего не отправлять (следующий тик проверит снова). После 12:00 местного времени дайджест за этот день уже не уходит: окно переживает перезапуск beat, но «утренний» дайджест не придёт вечером.
 
 ### Запуск
 
-- Локально бот работает через **long polling** — внешний адрес не нужен.
-- В облаке — **webhook**: `POST /telegram/webhook` за Ingress с секретным заголовком; переключается настройкой.
+- Локально бот работает через **long polling** — внешний адрес не нужен. В compose — сервис `telegram-bot` с профилем `telegram` (`make bot`, `make bot-logs`): у пользователя может не быть токена, и `make up` без него работает. Без токена бот завершается с `telegram_bot_token_missing`, `send_telegram` пропускает сообщение (`skipped`), а логика бота и отправки полностью покрыта тестами без Telegram.
+- Настройки: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME` (для ссылки без запроса `getMe`), `TELEGRAM_API_URL` (по умолчанию `https://api.telegram.org`), `TELEGRAM_LINK_TTL_MINUTES` = 10.
+- В облаке — **webhook**: `POST /telegram/webhook` за Ingress с секретным заголовком `X-Telegram-Bot-Api-Secret-Token`; переключается настройкой. Появится при переходе в облако (этап 10.7): без внешнего адреса его не проверить.
 - Токен бота — в SealedSecret; для local и prod разные боты.
 - В Tilt и Kubernetes — отдельный Deployment `telegram-bot`, 1 реплика (при polling две копии конфликтуют).
-- Тесты: обработчики aiogram тестируются без Telegram (подмена `Bot`), отправка — через respx.
+- Тесты: обработчики aiogram тестируются без Telegram (`dp.feed_update` и ответ-метод), отправка — через respx, напоминания и дайджест — под freezegun.
 
 ## 17. Модуль: поиск на Elasticsearch
 

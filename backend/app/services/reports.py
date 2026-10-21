@@ -4,7 +4,7 @@
 """
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 
 from app.authz.access import Access
 from app.errors import NotFound, ValidationFailed
@@ -51,8 +51,9 @@ class ReportService:
         month_to: date | None,
         currency: str | None,
     ) -> ManagersReport:
-        """Период — месяцы; по умолчанию с января текущего года по текущий месяц."""
-        today = await self.fx.org_today(access.org_id)
+        """Период — месяцы по UTC, как в deal_stats; по умолчанию — с января текущего года
+        по текущий месяц."""
+        today = datetime.now(UTC).date()
         month_to = month_to or today.replace(day=1)
         month_from = month_from or month_to.replace(month=1)
         if month_from > month_to:

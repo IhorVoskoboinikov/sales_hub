@@ -24,7 +24,7 @@ from app.services.reports import ReportService
 
 Month = Annotated[
     str | None,
-    Query(pattern=r"^\d{4}-(0[1-9]|1[0-2])$", examples=["2026-01"], description="YYYY-MM"),
+    Query(pattern=r"^[1-9]\d{3}-(0[1-9]|1[0-2])$", examples=["2026-01"], description="YYYY-MM"),
 ]
 
 

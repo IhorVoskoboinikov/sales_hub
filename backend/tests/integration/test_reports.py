@@ -68,6 +68,10 @@ async def test_managers_period_and_foreign_pipeline(
     bad_month = await client.get(
         "/api/v1/reports/managers", params={"from": "2026-13"}, headers=admin
     )
+    year_zero = await client.get(
+        "/api/v1/reports/managers", params={"to": "0000-01"}, headers=admin
+    )
     hidden = await client.get(f"/api/v1/reports/pipeline?pipeline_id={foreign_id}", headers=admin)
 
     assert (bad_period.status_code, bad_month.status_code, hidden.status_code) == (422, 422, 404)
+    assert year_zero.status_code == 422  # года 0 в календаре Python нет — не 500

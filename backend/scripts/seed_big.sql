@@ -87,8 +87,11 @@ FROM seed_users u LEFT JOIN seed_teams t USING (org_idx, team_idx);
 
 -- Ответственные (руководители и менеджеры), пронумерованные внутри организации. Номер
 -- выбирается как 1 + floor(n * random()^4): первые номера получают в десятки раз больше.
+-- Первыми идут менеджеры, руководители — в конце: «тяжёлый» ответственный должен быть
+-- sales_rep — его список (уровень own) и проверяет make explain.
 CREATE TEMP TABLE seed_owners AS
-SELECT u.org_idx, row_number() OVER (PARTITION BY u.org_idx ORDER BY u.n)::int AS rn,
+SELECT u.org_idx,
+       row_number() OVER (PARTITION BY u.org_idx ORDER BY u.role = 'team_lead', u.n)::int AS rn,
        u.user_id, t.team_id
 FROM seed_users u JOIN seed_teams t USING (org_idx, team_idx);
 CREATE UNIQUE INDEX ON seed_owners (org_idx, rn);

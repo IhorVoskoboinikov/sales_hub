@@ -5,7 +5,7 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean
+.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean explain experiments
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -49,6 +49,12 @@ seed-big:  ## большие данные для замеров: 5 млн кон
 
 seed-big-clean:  ## удалить данные seed-big (быстрее — make clean && make up)
 	$(COMPOSE) exec -T postgres psql -U saleshub -d saleshub < backend/scripts/seed_big_clean.sql
+
+explain:  ## планы всех списков и отчётов на seed-данных: нет ли Seq Scan по большим таблицам
+	$(BACKEND) uv run python scripts/explain_lists.py
+
+experiments:  ## замеры индексов «без / с» на seed-данных (результаты — docs/experiments.md)
+	$(COMPOSE) exec -T postgres psql -U saleshub -d saleshub < backend/scripts/experiments.sql
 
 refresh-reports:  ## обновить отчёты (materialized view deal_stats) в compose
 	$(COMPOSE) exec api python -m app.cli refresh-reports

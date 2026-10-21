@@ -2,6 +2,8 @@
 
 generate-jwt-key   создать приватный RS256-ключ для JWT (make keys)
 create-superadmin  создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD
+ensure-partitions  месячные партиции activities и audit_log на 2 месяца вперёд
+refresh-reports    обновить отчёты (REFRESH MATERIALIZED VIEW CONCURRENTLY deal_stats)
 """
 
 import argparse
@@ -10,6 +12,7 @@ import sys
 from pathlib import Path
 
 from pydantic import EmailStr, TypeAdapter, ValidationError
+from sqlalchemy import text
 
 from app.core.config import Settings, get_settings
 from app.core.jwt import generate_private_key, private_key_to_pem
@@ -61,6 +64,48 @@ async def create_superadmin_command(settings: Settings) -> int:
     return 0
 
 
+# Партиционированные таблицы и на сколько месяцев вперёд готовить партиции (раздел 9).
+PARTITIONED = ("activities", "audit_log")
+MONTHS_AHEAD = 2
+
+
+async def ensure_partitions_command(settings: Settings) -> int:
+    """Идемпотентно: существующие партиции пропускаются. Запускается после миграций (сервис
+    migrate), с этапа 5 — ещё и задачей beat раз в месяц."""
+    engine = create_engine(settings.database_url)
+    try:
+        async with engine.begin() as connection:
+            for table in PARTITIONED:
+                created = await connection.scalar(
+                    text(
+                        # Месяцы — по UTC, как границы партиций (а не по часовому поясу сессии).
+                        "SELECT ensure_monthly_partitions(CAST(:table AS regclass),"
+                        " CAST(now() AT TIME ZONE 'UTC' AS date),"
+                        " CAST((now() + make_interval(months => :ahead)) AT TIME ZONE 'UTC'"
+                        " AS date))"
+                    ),
+                    {"table": table, "ahead": MONTHS_AHEAD},
+                )
+                print(f"{table}: создано партиций — {created}")
+    finally:
+        await engine.dispose()
+    return 0
+
+
+async def refresh_reports_command(settings: Settings) -> int:
+    """Отчёты читают materialized view — он обновляется этой командой (с этапа 5 — задачей
+    beat reports.refresh каждые 5 минут)."""
+    engine = create_engine(settings.database_url)
+    try:
+        async with create_session_factory(engine)() as session:
+            await UnitOfWork(session).reports.refresh()
+            await session.commit()
+    finally:
+        await engine.dispose()
+    print("отчёты обновлены")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -70,12 +115,18 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser(
         "create-superadmin", help="создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD"
     )
+    commands.add_parser("ensure-partitions", help="месячные партиции на 2 месяца вперёд")
+    commands.add_parser("refresh-reports", help="обновить materialized view отчётов")
 
     args = parser.parse_args(argv)
     settings = get_settings()
     if args.command == "generate-jwt-key":
         generate_jwt_key(args.out or settings.jwt_private_key_file)
         return 0
+    if args.command == "ensure-partitions":
+        return asyncio.run(ensure_partitions_command(settings))
+    if args.command == "refresh-reports":
+        return asyncio.run(refresh_reports_command(settings))
     return asyncio.run(create_superadmin_command(settings))
 
 

@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # Сколько раз при старте спросить у OPA маршруты для Swagger (раз в секунду).
     opa_startup_attempts: int = 5
 
+    # --- Курсы валют (раздел 3): открытый API НБУ.
+    nbu_url: str = "https://bank.gov.ua/NBUStatService/v1/statdirectory/exchange"
+
     # Первый пользователь — для команды create-superadmin (в Kubernetes — из Secret).
     superadmin_email: str | None = None
     superadmin_password: SecretStr | None = None

@@ -16,6 +16,15 @@ x-app-env: &app-env
 services:
   postgres:
     image: postgres:18.6
+    # pg_stat_statements — статистика запросов (раздел 3); остальное — под загрузку и
+    # замеры на десятках миллионов строк (make seed-big): больше кэша, реже чекпоинты.
+    command: ["postgres",
+              "-c", "shared_preload_libraries=pg_stat_statements",
+              "-c", "shared_buffers=1GB",
+              "-c", "max_wal_size=8GB",
+              "-c", "maintenance_work_mem=512MB",
+              "-c", "work_mem=32MB"]
+    shm_size: 1g  # параллельные запросы используют /dev/shm, по умолчанию в Docker 64 МБ
     environment:
       POSTGRES_USER: saleshub
       POSTGRES_PASSWORD: saleshub
@@ -40,11 +49,12 @@ services:
       timeout: 3s
       retries: 10
 
-  # Одноразовый: применяет миграции и завершается. api стартует только после него.
+  # Одноразовый: применяет миграции, готовит месячные партиции и завершается.
+  # api стартует только после него.
   migrate:
     build: ../../backend
     image: saleshub-api:dev
-    command: ["alembic", "upgrade", "head"]
+    command: ["sh", "-c", "alembic upgrade head && python -m app.cli ensure-partitions"]
     environment: *app-env
     depends_on:
       postgres: {condition: service_healthy}

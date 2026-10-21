@@ -22,6 +22,17 @@ class UserRepository:
             User, user_id, with_for_update=for_update, populate_existing=for_update
         )
 
+    async def get_for_share(self, user_id: uuid.UUID) -> User | None:
+        """FOR SHARE — человек становится ответственным за запись. Конфликтует с FOR UPDATE
+        в смене роли и отдела: перевод подождёт, пока запись создастся, и увидит её
+        (409 member.has_records), а не оставит запись в старом отделе."""
+        return await self.session.scalar(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+
     async def get_by_email(self, email: str) -> User | None:
         # email — citext, поэтому регистр не важен и индекс используется.
         return await self.session.scalar(select(User).where(User.email == email))

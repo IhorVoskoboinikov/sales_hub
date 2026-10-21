@@ -6,7 +6,8 @@ import pytest
 from fastapi import APIRouter, FastAPI, Query
 from httpx import AsyncClient
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 from structlog.testing import capture_logs
 
 from app.errors import AppError, Conflict, NotFound, RateLimited, Unauthorized
@@ -25,8 +26,9 @@ class TokenExpired(Unauthorized):
 
 
 class FakeDbError(Exception):
-    def __init__(self, sqlstate: str) -> None:
+    def __init__(self, sqlstate: str, constraint_name: str | None = None) -> None:
         self.sqlstate = sqlstate
+        self.constraint_name = constraint_name
 
 
 @router.get("/not-found")
@@ -67,6 +69,21 @@ async def post_body(payload: Payload) -> dict[str, str]:
 @router.get("/integrity/{sqlstate}")
 async def raise_integrity(sqlstate: str) -> None:
     raise IntegrityError("INSERT ...", None, FakeDbError(sqlstate))
+
+
+@router.get("/unique/{constraint}")
+async def raise_unique(constraint: str) -> None:
+    raise IntegrityError("INSERT ...", None, FakeDbError("23505", constraint))
+
+
+@router.get("/stale")
+async def raise_stale() -> None:
+    raise StaleDataError("UPDATE statement on table 'contacts' expected to update 1 row(s)")
+
+
+@router.get("/data/{sqlstate}")
+async def raise_data_error(sqlstate: str) -> None:
+    raise DBAPIError("SELECT ...", None, FakeDbError(sqlstate))
 
 
 @pytest.fixture
@@ -186,6 +203,27 @@ async def test_other_integrity_error_is_500(client: AsyncClient) -> None:
 
     assert resp.status_code == 500
     assert resp.json()["code"] == "internal"
+
+
+async def test_unique_constraint_with_own_code(client: AsyncClient) -> None:
+    # Гонка двух одновременных созданий отвечает тем же кодом, что и проверка в сервисе.
+    resp = await client.get("/test/unique/uq_contacts_org_id_email")
+
+    assert (resp.status_code, resp.json()["code"]) == (409, "contact.duplicate_email")
+
+
+async def test_stale_version_is_409(client: AsyncClient) -> None:
+    resp = await client.get("/test/stale")
+
+    assert (resp.status_code, resp.json()["code"]) == (409, "version.conflict")
+
+
+async def test_bad_value_from_database_is_422_other_db_errors_500(client: AsyncClient) -> None:
+    out_of_range = await client.get("/test/data/22003")  # число вне диапазона
+    broken = await client.get("/test/data/08006")  # обрыв соединения
+
+    assert (out_of_range.status_code, out_of_range.json()["code"]) == (422, "validation")
+    assert broken.status_code == 500
 
 
 def test_rate_limited_sets_retry_after_header() -> None:

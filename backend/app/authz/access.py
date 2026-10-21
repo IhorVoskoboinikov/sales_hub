@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 from sqlalchemy import ColumnElement, and_, false
 
-from app.authz.roles import Scope
+from app.authz.roles import RoleCatalog, Scope
 from app.errors import Forbidden
 
 
@@ -35,6 +35,15 @@ class Access:
     user_id: uuid.UUID
     org_id: uuid.UUID
     team_id: uuid.UUID | None  # у org_admin и viewer отдела нет — уровень team им и не выдаётся
+    role: str | None = None  # чтобы получить уровень другого действия: for_action()
+
+    def for_action(self, action: str, roles: RoleCatalog) -> "Access | None":
+        """Тот же человек, другое действие: сделку создают с deal:write, а привязанный к ней
+        контакт проверяют на contact:read. None — у роли такого действия нет."""
+        scope = roles.scope_or_none(self.role, action)
+        if scope is None:
+            return None
+        return Access(action, scope, self.user_id, self.org_id, self.team_id, self.role)
 
     def matches(self, obj: Scoped) -> bool:
         if obj.org_id != self.org_id:

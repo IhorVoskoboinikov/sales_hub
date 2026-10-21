@@ -187,12 +187,12 @@ sales_hub/
 
 | Таблица | Ключевые поля | Объём / заметки |
 | --- | --- | --- |
-| `companies` | id, org\_id, team\_id, owner\_id, name, domain, industry, size, created\_at, deleted\_at | 300 тыс.; компании-клиенты |
-| `contacts` | id (bigint), org\_id, team\_id, owner\_id, company\_id, first\_name, last\_name, email (citext), phone, status (`lead` / `customer` / `churned`), source, tags text\[\], created\_at, updated\_at, deleted\_at, version | **5 млн**; уникальность `(org_id, email)` для дедупликации при импорте |
-| `pipelines`, `pipeline_stages` | id, org\_id, name; stage: pipeline\_id, name, position, probability | воронки и этапы, настраивает org admin |
-| `deals` | id (bigint), org\_id, team\_id, owner\_id, contact\_id, company\_id, pipeline\_id, stage\_id, title, amount\_usd numeric(14,2), amount\_original numeric(14,2), currency\_original char(3), fx\_rate numeric(14,6), fx\_date, status (`open` / `won` / `lost`), expected\_close\_date, closed\_at, created\_at, updated\_at, deleted\_at, version | **1 млн** |
-| `activities` | id, org\_id, team\_id, owner\_id, deal\_id, contact\_id, type (`call` / `meeting` / `email` / `task`), subject, due\_at, done\_at, created\_at | **20 млн**, `PARTITION BY RANGE (created_at)` по месяцам |
-| `notes` | id, org\_id, entity\_type, entity\_id, author\_id, body, created\_at | заметки к контакту, компании, сделке |
+| `companies` | id, org\_id, team\_id, owner\_id, name, domain, industry, size, created\_at, updated\_at, deleted\_at, version | 300 тыс.; компании-клиенты — общий справочник: видны всей организации (`company:read` — org у всех ролей), меняются по уровню `company:write` |
+| `contacts` | id, org\_id, team\_id, owner\_id, company\_id, first\_name, last\_name, email (citext), phone, status (`lead` / `customer` / `churned`), source, tags text\[\], created\_at, updated\_at, deleted\_at, version | **5 млн**; уникальность `(org_id, email)` для дедупликации при импорте |
+| `pipelines`, `pipeline_stages` | pipeline: id, org\_id, name (UNIQUE в организации), created\_at; stage: id, pipeline\_id, name, position, probability (0–100); UNIQUE (id, pipeline\_id) — для составного FK из `deals` | воронки и этапы, настраивает org admin; новая организация создаётся без воронок |
+| `deals` | id, org\_id, team\_id, owner\_id, contact\_id, company\_id, pipeline\_id, stage\_id, title, amount\_usd numeric(14,2), amount\_original numeric(14,2), currency\_original char(3), fx\_rate numeric(14,6), fx\_date, status (`open` / `won` / `lost`), expected\_close\_date, closed\_at, created\_at, updated\_at, deleted\_at, version | **1 млн**; FK `(stage_id, pipeline_id)` → `pipeline_stages (id, pipeline_id)`: этап всегда из воронки сделки, `pipeline_id` берётся из этапа. `won` / `lost` ставят `closed_at`, возврат в `open` его снимает |
+| `activities` | id, org\_id, team\_id, owner\_id, deal\_id, contact\_id, type (`call` / `meeting` / `email` / `task`), subject, due\_at, done\_at, created\_at | **20 млн**, `PARTITION BY RANGE (created_at)` по месяцам, PK `(id, created_at)` (ключ партиционирования обязан входить в PK). Запланированная активность — с `due_at`, `done_at` пуст до отметки «выполнено»; без `due_at` — это запись о том, что уже было (звонок, письмо), `done_at = created_at` сразу. Поэтому «открытые» — ровно `done_at IS NULL` |
+| `notes` | id, org\_id, entity\_type (`contact` / `company` / `deal`), entity\_id, author\_id, body, created\_at | заметки к контакту, компании, сделке; на этапе 4 эндпоинты только у контакта |
 
 ### Служебные
 
@@ -201,20 +201,36 @@ sales_hub/
 | `bulk_jobs` | id, kind (`import_contacts`, `reassign_owner`, `move_team`, `close_stale_deals`, `add_tags`, `export`, `reindex`), status, stage (шаг импорта), params jsonb (фильтр + `Access` того, кто запустил), idempotency\_key, total, processed, failed, error, org\_id (NULL у задач супер-админа), team\_id, owner\_id (кто запустил — по этим полям работают `bulk_job:read` и `bulk_job:cancel`), timestamps |
 | `import_errors` | job\_id, row\_no, raw jsonb, error — строки CSV, которые не прошли валидацию |
 | `outbox_events` | transactional outbox: события и письма |
-| `audit_log` | кто что изменил: id, occurred\_at, org\_id, actor\_id (оба без FK — журнал переживает удаление), action (`member.updated`, `team.created`, `invite.created`…), entity\_type, entity\_id, changes jsonb (`{"role": ["viewer", "org_admin"]}` — было и стало), request\_id. Запись — в той же транзакции, что и изменение. Этап 3 — обычная таблица с индексом (org\_id, occurred\_at); `PARTITION BY RANGE (occurred_at)` и `GET /audit` — этап 4 |
+| `audit_log` | кто что изменил: id, occurred\_at, org\_id, actor\_id (оба без FK — журнал переживает удаление), action (`member.updated`, `team.created`, `invite.created`…), entity\_type, entity\_id, changes jsonb (`{"role": ["viewer", "org_admin"]}` — было и стало), request\_id. Запись — в той же транзакции, что и изменение. Этап 3 — обычная таблица; с этапа 4 — `PARTITION BY RANGE (occurred_at)` по месяцам, PK (id, occurred\_at), индексы (org\_id, occurred\_at, id) и (org\_id, entity\_type, entity\_id, occurred\_at, id), `GET /audit`. В журнал пишутся и CRM-изменения: создание, изменение (diff), удаление и восстановление компаний, контактов, сделок, воронок; активности и заметки — нет, их слишком много |
 | fx\_rates | rate\_date, currency, rate\_uah numeric(14,6) (гривен за 1 единицу валюты), source = NBU, fetched\_at; PK (rate\_date, currency) — курсы НБУ |
 | failed\_tasks | задачи Celery, упавшие после всех ретраев: имя, аргументы, ошибка, request\_id, replayed\_at (раздел 15) |
 | sent\_notifications | dedup\_key (unique), channel, user\_id, sent\_at — защита от повторной отправки писем и сообщений |
 | telegram\_links, notification\_settings | привязка chat\_id к пользователю; настройки «событие × канал» (раздел 16) |
 
-Таблиц `roles`, `permissions`, `role_permissions` и членств нет: права ролей живут в файле `policies/saleshub/data.yaml` (его читают OPA и бэкенд), в базе только `users.role` и `users.team_id`. `contacts.id` и `deals.id` — bigint: для чанков по диапазонам id и keyset-пагинации это проще и быстрее.
+Таблиц `roles`, `permissions`, `role_permissions` и членств нет: права ролей живут в файле `policies/saleshub/data.yaml` (его читают OPA и бэкенд), в базе только `users.role` и `users.team_id`. У всех CRM-таблиц (компании, контакты, воронки, этапы, сделки, активности, заметки) id — `bigint` identity: для чанков по диапазонам id, keyset-пагинации и `generate_series` в генераторе данных это проще и быстрее; организации, отделы и пользователи остаются на uuid.
+
+### Внешние ключи на больших таблицах
+
+Каждый FK — это проверка при вставке (поиск по PK родителя) и поиск дочерних строк при удалении родителя (нужен **полный**, не частичный индекс по колонке, иначе — проход по миллионам строк). Поэтому FK ставятся осознанно:
+
+| Колонка | FK | Почему |
+| --- | --- | --- |
+| `org_id`, `owner_id` у компаний, контактов, сделок | → `organizations`, `users` | родители не удаляются (пользователя отключают, а не удаляют) — нужна только дешёвая проверка при вставке |
+| `team_id` у всех CRM-таблиц | **нет** | это копия отдела ответственного, её ставит сервис; FK потребовал бы полного индекса по `team_id` на каждой таблице. Удалить отдел с живыми записями не даёт сервис: 409 `team.has_records` |
+| `contacts.company_id`, `deals.contact_id`, `deals.company_id` | `ON DELETE SET NULL` | окончательное удаление компании или контакта из корзины не трогает связанные записи; полные индексы — они же для фильтров `?company_id=`, `?contact_id=` |
+| `deals (stage_id, pipeline_id)` | → `pipeline_stages (id, pipeline_id)` | этап не может быть из чужой воронки; удалить этап можно, только если на нём нет сделок, **включая корзину** (409 `pipeline.stage_has_deals`), полный индекс `deals (stage_id)` |
+| `activities.deal_id` / `contact_id` | `ON DELETE CASCADE` / `SET NULL` | история уходит вместе со сделкой; удаление контакта не стирает историю его сделки |
+| `activities.org_id`, `team_id`, `owner_id`; `notes.entity_id` | **нет** | 20 млн строк; у заметки родитель полиморфный (`entity_type`), его удаляет `trash.purge` |
+
+Связь «запись — та же организация» (`company_id` из своей организации) проверяет сервис: ссылка загружается через `Access` (раздел 5).
 
 ### Удаление: в корзину, а не насовсем
 
 В реальных CRM удалённого клиента можно восстановить, поэтому `companies`, `contacts`, `deals` удаляются **мягко**: строка остаётся, ей ставится `deleted_at = now()`.
 
 - Все запросы по умолчанию добавляют `deleted_at IS NULL` (общий фильтр в репозитории, а не в каждом запросе руками).
-- Эндпоинты корзины: `GET /contacts/trash`, `POST /contacts/{id}/restore`.
+- Эндпоинты корзины: `DELETE` и `POST …/restore` у компаний, контактов и сделок; список удалённых — только `GET /contacts/trash` (уровень `contact:delete`, новые сначала).
+- Восстановление возвращает запись в **текущий** отдел её ответственного; если ответственный отключён или больше не может вести записи — 409 `owner.inactive`. У контакта ещё проверяется, что живого контакта с тем же email нет (409 `contact.duplicate_email`).
 - Через 30 дней задача beat `trash.purge` удаляет строки физически, чанками.
 - Индексы делаются частичными: `... WHERE deleted_at IS NULL` — удалённые строки не раздувают индекс.
 - Уникальность email тоже частичная: `UNIQUE (org_id, email) WHERE deleted_at IS NULL` — иначе нельзя завести контакт с email удалённого.
@@ -222,7 +238,7 @@ sales_hub/
 
 ### Деньги: храним в USD, вводим и показываем в любой валюте
 
-Все суммы хранятся в долларах, а пользователь вводит и видит их в гривне или другой валюте. Конвертер пересчитывает по официальному курсу НБУ на дату операции. Рядом с суммой в USD сохраняется то, что ввёл человек, и курс: тогда обратный пересчёт даёт ровно исходную цифру, а не 99 999,98 грн вместо 100 000.
+Все суммы хранятся в долларах, а пользователь вводит и видит их в гривне или другой валюте. Конвертер пересчитывает по официальному курсу НБУ на дату операции. Рядом с суммой в USD сохраняется то, что ввёл человек, и курс: карточка показывает сохранённую исходную сумму, а не результат обратного пересчёта (100 000,19 грн вместо 100 000 — из-за округления до центов).
 
 **Поля в `deals`:**
 
@@ -231,17 +247,17 @@ sales_hub/
 | `amount_usd` | 2 410.32 | основа всех отчётов и сумм, одна валюта на всю базу |
 | `amount_original` | 100 000.00 | ровно то, что ввёл пользователь |
 | `currency_original` | `UAH` | валюта ввода |
-| `fx_rate` | 41.4880 | курс НБУ (гривен за 1 USD), по которому пересчитали |
+| `fx_rate` | 41.4880 | сколько единиц исходной валюты стоит 1 USD по курсам НБУ на `fx_date` (для гривны — гривен за 1 USD, для евро — около 0.89) |
 | `fx_date` | 2026-10-19 | на какую дату взят курс |
 
-**Как считается.** НБУ публикует курс гривни к каждой валюте. В USD пересчитываем через гривну: `amount_usd = amount × курс(валюта→UAH) / курс(USD→UAH)`. Для гривны — просто делим на курс доллара. Считаем в `Decimal`, округляем до центов один раз в конце (банковское округление).
+**Как считается.** НБУ публикует курс гривни к каждой валюте (`rate_uah` — гривен за 1 единицу). Кросс-курс к доллару: `fx_rate = rate_uah(USD) / rate_uah(валюта)`, 6 знаков (для гривны `rate_uah = 1`, то есть `fx_rate` — просто курс доллара). Дальше `amount_usd = amount / fx_rate`, до центов, банковское округление; считаем в `Decimal`. Обе величины сохраняются, поэтому пересчёт воспроизводим из строки сделки без таблицы курсов.
 
-**Запись (создание и изменение сделки):** клиент присылает `{amount: 100000, currency: "UAH"}` → `FxService.to_usd(amount, "UAH", on_date)` → в базу пишутся все пять полей. Если сумма не менялась, курс не пересчитывается.
+**Запись (создание и изменение сделки):** клиент присылает `{amount: 100000, currency: "UAH"}` → `FxService.to_usd(amount, "UAH", on_date)` (дата — сегодня по часовому поясу организации) → в базу пишутся все пять полей. Если сумма и валюта не менялись, курс не пересчитывается. Валюты, которой нет у НБУ, — 422 `fx.unknown_currency`.
 
 **Чтение — «переводим обратно, если нужно»:**
 
 - Карточка сделки показывает исходную сумму (`amount_original` + `currency_original`) — без пересчёта, ровно как ввели.
-- Списки, канбан и отчёты принимают `?currency=UAH`: `amount_usd` пересчитывается по курсу на сегодня (или на дату отчёта). В ответе всегда есть `fx: {currency, rate, date}`, чтобы было видно, по какому курсу посчитано.
+- Списки, канбан и отчёты принимают `?currency=UAH`: `amount_usd` пересчитывается по курсу на сегодня. В ответе всегда есть `fx: {currency, rate, date, stale}`, чтобы было видно, по какому курсу посчитано.
 - У организации есть `display_currency` (по умолчанию `UAH`) — валюта ответа, если параметр не передан.
 - Агрегаты (сумма воронки, выручка менеджера) всегда считаются в USD в SQL и пересчитываются один раз в конце, а не по каждой строке.
 
@@ -253,35 +269,43 @@ sales_hub/
 Отсюда логика:
 
 1. Задача beat `fx.fetch_nbu_rates` в будни в 18:30 (повтор в 19:30) загружает курсы на следующий день в `fx_rates`.
-2. `FxService.get_rate(currency, date)`: Redis-кэш → `fx_rates` → если строки на эту дату нет, берём последнюю с `rate_date ≤ date` (выходные и праздники).
-3. Если НБУ недоступен и курса на сегодня нет — используем последний известный, в ответе флаг `fx_stale: true`, алерт `FxRatesStale` (раздел 8).
+2. `FxService.get_rate(currency, date)`: Redis-кэш (1 ч) → строка `fx_rates` на эту дату → запрос к НБУ за все валюты на эту дату (`exchange?date=YYYYMMDD&json`, таймаут 3 с) и upsert. НБУ отдаёт курс и на выходные (тот, что действует в этот день), а на будущую дату — пустой список. До этапа 5 (задача beat) курсы так подтягиваются по первому запросу дня.
+3. Если НБУ недоступен или пуст — последняя строка с `rate_date ≤ date`, в ответе `fx.stale: true` (такой курс не кэшируется, в лог — warning, алерт `FxRatesStale`, раздел 8); строк нет совсем — 503 `fx.unavailable`.
 4. При импорте сделок из CSV конвертация идёт в SQL одним `JOIN` на `fx_rates`, а не построчно в Python.
 
-**Тесты:** НБУ мокается (respx); проверяем выходные, праздник, недоступность НБУ, а также что `to_usd` → обратно по тому же курсу даёт исходную сумму с точностью до копейки.
+**Тесты:** НБУ мокается (respx); проверяем выходные, праздник, недоступность НБУ (резерв и `stale`), что карточка отдаёт исходную сумму без изменений, а обратный пересчёт `amount_usd × fx_rate` отличается от неё не больше чем на `0.005 × fx_rate` (поэтому исходную сумму и храним).
 
 Источники: [инструкция НБУ к API курсов](https://bank.gov.ua/admin_uploads/article/Instr_API_KURS_VAL_Full_eng.pdf), [порядок установления официального курса](https://news.dtkt.ua/finance/bank-system/33254-nacbank-zminiv-poriadok-vstanovlennia-oficiinogo-kursu-grivni).
 
 ### Индексы: базовые и экспериментальные
 
-Каждый индекс проверяется парой «без / с» через `EXPLAIN (ANALYZE, BUFFERS)`; результаты — в `docs/experiments.md`.
+Каждый список — keyset-пагинация (`?limit=` до 100 и непрозрачный `?cursor=`, ответ `{items, next_cursor}`; OFFSET не поддерживается — он только в замере), а у каждого уровня `Access` свой индекс, который начинается с колонки уровня. Тогда «первые 50 строк уровня в порядке сортировки» — это один проход по индексу без сортировки. Индексы по `(…, created_at, id)` обходятся и в обратную сторону, поэтому `DESC` в них не нужен.
 
 | Запрос | Индекс | Что изучаем |
 | --- | --- | --- |
-| «мои клиенты» менеджера | `contacts (org_id, owner_id) WHERE deleted_at IS NULL` | частичный составной индекс под scope `own` |
-| клиенты отдела, keyset | `contacts (team_id, created_at DESC, id DESC) WHERE deleted_at IS NULL` | keyset против OFFSET на глубокой странице |
-| дедупликация при импорте | `UNIQUE contacts (org_id, email) WHERE deleted_at IS NULL` | `ON CONFLICT` на частичном уникальном индексе |
-| канбан воронки | `deals (pipeline_id, stage_id) INCLUDE (title, amount_usd, owner_id) WHERE status = 'open'` | покрывающий индекс, index-only scan |
-| просроченные сделки | `deals (org_id, expected_close_date) WHERE status = 'open'` | частичный индекс для bulk «закрыть просроченные» |
-| поиск по имени / email | GIN `trgm` на `first_name, last_name, email` | pg\_trgm, `ILIKE '%ivan%'` |
+| списки контактов и сделок по уровням | `(org_id \| team_id \| owner_id, created_at, id) WHERE deleted_at IS NULL` — по три на `contacts` и `deals` | частичный составной индекс под каждый уровень; keyset против OFFSET на глубокой странице |
+| «мои клиенты» менеджера с 50× клиентов | `contacts (owner_id, created_at, id)` против `(org_id, owner_id)` из первой версии дизайна | почему колонка сортировки должна быть в индексе: иначе — сортировка всех клиентов менеджера ради 50 строк |
+| дедупликация при импорте и 409 | `UNIQUE contacts (org_id, email) WHERE deleted_at IS NULL` | `ON CONFLICT` на частичном уникальном индексе |
+| поиск по имени / email (`?q=`, от 3 символов) | GIN `gin_trgm_ops` на выражении `lower(first_name \|\| ' ' \|\| last_name \|\| ' ' \|\| coalesce(email::text, ''))` | pg\_trgm, `LIKE '%ivan%'`; запрос пишет **то же** выражение, иначе индекс не применится; частый и редкий `q` дают разные планы |
 | сегмент по тегам | GIN `contacts (tags)` | массивы, `@>` |
-| лента активностей | BRIN `activities (created_at)` + partition pruning | BRIN и партиции |
-| задачи менеджера на сегодня | `activities (owner_id, due_at) WHERE done_at IS NULL` | частичный индекс на партиционированной таблице |
+| компании по имени | `companies (org_id, name, id)` + GIN trgm на `name` | keyset по тексту |
+| канбан воронки | `deals (pipeline_id, stage_id, id) INCLUDE (title, amount_usd, owner_id, team_id, org_id) WHERE status = 'open' AND deleted_at IS NULL` | покрывающий индекс, index-only scan (после `VACUUM`: без visibility map index-only scan всё равно читает таблицу); `org_id`, `team_id` в INCLUDE — чтобы фильтр `Access` тоже читался из индекса |
+| просроченные сделки | `deals (org_id, expected_close_date, id) WHERE status = 'open' AND deleted_at IS NULL` | частичный индекс для списка `?overdue=true` и bulk «закрыть просроченные» |
+| история карточки (активности сделки / контакта) | `activities (deal_id, created_at, id)`, `activities (contact_id, created_at, id)` | индекс на партиционированной таблице; keyset плюс простое `created_at <= :c` — по сравнению строк `(created_at, id) < (…)` Postgres партиции не отсекает |
+| открытые задачи («на сегодня», просроченные) | `activities (owner_id \| team_id \| org_id, due_at, id) WHERE done_at IS NULL` | частичный индекс на партиционированной таблице: открытых задач несколько процентов от 20 млн |
+| лента за период (эксперимент) | BRIN `activities (created_at)` + partition pruning | BRIN полезен, только когда строки лежат на диске в порядке времени; в API не используется — только замер |
+| журнал организации | `audit_log (org_id, occurred_at, id)`, `(org_id, entity_type, entity_id, occurred_at, id)` | партиции по месяцам |
+| корзина | `contacts (org_id, deleted_at, id) WHERE deleted_at IS NOT NULL` | маленький частичный индекс «наоборот» |
 
-`pg_stat_statements` включён; индексы на больших таблицах создаются только `CONCURRENTLY` (раздел 9).
+Предикаты частичных индексов (`status = 'open'`, `done_at IS NULL`) в запросах пишутся литералами, а не параметрами: asyncpg готовит запросы, и в общем (generic) плане с `status = $1` Postgres не может доказать, что частичный индекс подходит.
+
+`pg_stat_statements` включён. Индексы новых, ещё пустых таблиц создаются в их миграции обычным `CREATE INDEX`; индекс, который добавляется к **уже заполненной** большой таблице, — только `CONCURRENTLY` (раздел 9). Замеры «без / с» — `make experiments` (`scripts/experiments.sql`): каждый в транзакции `BEGIN; DROP INDEX …; EXPLAIN (ANALYZE, BUFFERS) …; ROLLBACK` — DDL в Postgres транзакционен, база после замера та же. Результаты и выводы — `docs/experiments.md`. Главное из них: индекс уровня должен содержать колонку сортировки (у «лёгкого» менеджера 0,4 мс против 11 мс у `(org_id, owner_id)` и 95 мс без индекса); keyset на 100-тысячной строке — 0,2 мс против 15 мс у OFFSET; триграммы быстры для редкой подстроки (26 мс) и медленны для частой (≈ 1,2 с — pg\_trgm не умеет оценить её частоту), это закрывает Elasticsearch на этапе 9.
 
 ### Генерация данных
 
-`scripts/seed_big.sql` через `generate_series` создаёт 20 организаций, по 3–10 отделов, 2 000 пользователей, 300 тыс. компаний, **5 млн контактов**, 1 млн сделок и 20 млн активностей. Распределение неравномерное (у части менеджеров клиентов в 50 раз больше), чтобы планировщик запросов вёл себя как в жизни. Для импорта — отдельный генератор CSV на 500 тыс. строк с 5% дублей и 1% битых строк.
+`scripts/seed_big.sql` через `generate_series` создаёт 20 организаций, по 3–10 отделов, 2 000 пользователей (у всех один пароль, его argon2-хэш вписан в скрипт), по 1–2 воронки на 5 этапов, 300 тыс. компаний, **5 млн контактов**, 1 млн сделок, 20 млн активностей за 24 месяца и курсы НБУ за это время. Распределение неравномерное (у части менеджеров клиентов в 50 раз больше), чтобы планировщик запросов вёл себя как в жизни. Запуск — `make seed-big` (psql в контейнере postgres); повторный запуск отказывается, если seed-данные уже есть.
+
+Как загрузить десятки миллионов строк за минуты, а не за час: `SET session_replication_role = replica` (FK-триггеры не срабатывают — данные корректны по построению, так же делает `pg_restore --disable-triggers`), отдельный `INSERT … SELECT` на таблицу и на месяц активностей (строки внутри месяца по порядку `created_at`), GIN-индексы контактов удаляются перед загрузкой и строятся после, в конце — `setval` последовательностей id, `VACUUM (ANALYZE)` и обновление отчётов. Postgres в compose запускается с `shared_buffers=1GB`, `max_wal_size=8GB`, `maintenance_work_mem=512MB`. Для импорта (этап 5) — отдельный генератор CSV на 500 тыс. строк с 5% дублей и 1% битых строк.
 
 ## 4. Аутентификация (кто ты)
 
@@ -440,19 +464,25 @@ Refresh сделан непрозрачным и хранится в БД нам
 
 **Что значит уровень для изменения.** Изменение проверяется дважды. Старая версия должна быть видна (репозиторий ищет объект через `get_visible_or_404`, иначе 404 — не раскрываем, что объект существует). Новая версия должна попадать в уровень (`ensure_allowed`, иначе 403 — объект пользователь уже видел, скрывать нечего). При создании проверяется только новая версия. Поэтому `sales_rep` создаёт клиента только на себя и не может отдать свою сделку коллеге, а `team_lead` может переназначить сделку внутри отдела, но не отдать её в чужой отдел.
 
+Старая версия ищется по уровню **чтения** сущности, а затем проверяется уровнем действия: видна, но не моя — 403 (объект я уже видел), не видна — 404. Разница заметна у компаний: их читают все (`company:read` — org), а меняют по `company:write` — поэтому `PATCH` чужой компании от `sales_rep` даёт 403 `out_of_scope`, а не 404. У контактов и сделок уровни чтения и записи совпадают.
+
+**Версия записи.** У компаний, контактов и сделок есть `version`; `PATCH` обязан прислать версию, которую видел. Не совпала — 409 `version.conflict` с `current_version`: кто-то успел изменить запись (оптимистическая блокировка). Гонку между чтением и записью ловит сам `UPDATE … WHERE id = :id AND version = :v` (`version_id_col` в SQLAlchemy) — тоже 409.
+
 **Откуда берутся `org_id`, `owner_id` и `team_id` записи.** Клиент их не выбирает свободно:
 
 - `org_id` — всегда из `Access` (организация того, кто делает запрос);
-- `owner_id` — по умолчанию текущий пользователь; руководитель и админ могут указать другого, но ответственным может быть только активный `team_lead` или `sales_rep` той же организации;
+- `owner_id` — по умолчанию текущий пользователь; руководитель и админ могут указать другого, но ответственным может быть только активный `team_lead` или `sales_rep` той же организации (иначе 422 `owner.invalid`). `org_admin` и `viewer` сами записей не ведут: создавая запись, `org_admin` обязан указать ответственного (422 `owner.required`);
 - `team_id` — всегда отдел ответственного; его ставит сервис, из тела запроса он не берётся.
+- Ответственный проверяется и `team_id` пересчитывается только при создании и при смене `owner_id`; обычный `PATCH` их не трогает. Строка ответственного читается с `FOR SHARE`: перевод его в другой отдел (`FOR UPDATE` в сервисе пользователей) ждёт, пока запись создастся, и потом её видит.
+- Пока нет bulk job `move_team` (этап 5), сменить отдел или роль (на `org_admin` / `viewer`) человеку, у которого есть живые компании, контакты или сделки, нельзя: 409 `member.has_records` — иначе `team_id` его записей разошёлся бы с отделом. Отключать можно: записи остаются, их передадут bulk-ом.
 
 Так `team_id` и `owner_id` никогда не расходятся, и проверка «новая версия в моём уровне» у `team_lead` автоматически означает «новый ответственный — из моего отдела».
 
-**Ссылки на другие записи.** Каждый id в теле запроса (`company_id`, `contact_id`, `deal_id`, `stage_id`) сервис загружает и проверяет через `Access` на чтение этой сущности; невидимая ссылка → 422 `validation` с полем в `details`. Компании видны всей организации, поэтому к любой компании привязать можно, а к чужому контакту — нельзя.
+**Ссылки на другие записи.** Каждый id в теле запроса (`company_id`, `contact_id`, `deal_id`) сервис загружает и проверяет через `Access` на чтение этой сущности (`access.for_action("contact:read", roles)` — тот же человек, уровень другого действия; нет такого действия у роли — ссылка невидима); невидимая ссылка → 422 `validation` с полем в `details`. Компании видны всей организации, поэтому к любой компании привязать можно, а к чужому контакту — нельзя. `stage_id` проверяется по организации воронки (у этапов нет ответственного).
 
-**Дубль, которого не видно.** Email контакта уникален в организации (раздел 3), а видимость ограничена уровнем. Если менеджер создаёт контакт, меняет email или восстанавливает контакт из корзины, а такой email уже есть у записи вне его уровня, сервис возвращает 409 `contact.duplicate_email` и в `details` кладёт только имя ответственного: `{"owner": "Іван Петренко"}` — без id и данных контакта. Менеджер знает, к кому обратиться, а передать клиента может руководитель (так делают контроль дублей в Bitrix24 и amoCRM).
+**Дубль, которого не видно.** Email контакта уникален в организации (раздел 3), а видимость ограничена уровнем. Если менеджер создаёт контакт, меняет email или восстанавливает контакт из корзины, а такой email уже есть у записи вне его уровня, сервис возвращает 409 `contact.duplicate_email` и в `details` кладёт только ответственного: `{"owner": "ivan@acme.ua"}` — без id и данных контакта (имени у пользователей нет, поэтому это его рабочий email: внутри организации он не секрет). Менеджер знает, к кому обратиться, а передать клиента может руководитель (так делают контроль дублей в Bitrix24 и amoCRM). Дубль в моём уровне (`contact:read`) — тот же код и `{"contact_id": 123, "owner": …}`. Дублем считается только живой контакт; одновременное создание двух одинаковых ловит частичный UNIQUE — обработчик ошибок по имени ограничения отвечает тем же `contact.duplicate_email`.
 
-**Активности и заметки видны по родителю.** Карточка (`GET /contacts/{id}/notes`, активности сделки) загружает родителя через `get_visible_or_404` и дальше по `Access` не фильтрует: кто видит сделку, видит всю её историю. Уровень `activity:read` применяется к спискам вне карточки — например, «мои задачи на сегодня» (`GET /activities?due=today`). Заметку добавляет тот, кто может менять родителя; править и удалять её может только автор.
+**Активности и заметки видны по родителю.** Карточка (`GET /contacts/{id}/notes`, активности сделки) загружает родителя через `get_visible_or_404` и дальше по `Access` не фильтрует: кто видит сделку, видит всю её историю. Уровень `activity:read` применяется к спискам вне карточки — например, «мои задачи на сегодня» (`GET /activities?due=today`). Заметку добавляет тот, кто может менять родителя; править и удалять её может только автор (эндпоинты — позже). Задачи сделки или контакта из корзины остаются в списке задач, пока корзину не очистят.
 
 ### Как проходит запрос
 
@@ -859,6 +889,8 @@ protected = APIRouter(prefix="/api/v1", dependencies=[Depends(authorize)])      
 admin = APIRouter(prefix="/api/v1/admin", dependencies=[Depends(opa_decision)])     # супер-админ, без Access
 ```
 
+Статические пути (`/contacts/trash`, `/deals/kanban`) объявляются раньше путей с параметром (`/contacts/{contact_id}`), иначе Starlette сопоставит `trash` с `{contact_id}` и ответит 422. Конвертеры типов в пути (`{contact_id:int}`) не используются: они попадают в шаблон пути, и он перестаёт совпадать с ключом в `routes.rego`.
+
 `authorize` стоит и на роутере, и в параметрах эндпоинта (`access: Access = Depends(authorize)`), но FastAPI кэширует зависимость в пределах запроса — OPA спрашивается один раз.
 
 ```python
@@ -872,6 +904,7 @@ class Access:
     user_id: UUID
     org_id: UUID
     team_id: UUID | None         # у org_admin и viewer отдела нет — уровень team им и не выдаётся
+    role: str | None = None      # для for_action(): уровень другого действия того же человека
 
     @classmethod
     def for_user(cls, user: CurrentUser, action: str) -> "Access":
@@ -899,6 +932,11 @@ class Access:
 
     def es_filter(self) -> dict: ...                      # 3) поиск → фильтр Elasticsearch (раздел 17)
 
+    def for_action(self, action: str, roles: RoleCatalog) -> "Access | None":
+        # сделку пишут с deal:write, а привязанный контакт проверяют на contact:read
+        scope = roles.scope_or_none(self.role, action)
+        return None if scope is None else replace(self, action=action, scope=scope)
+
     def ensure_allowed(self, new_obj) -> None:            # создать или изменить за пределами своего уровня → 403
         if not self.matches(new_obj):
             raise Forbidden(reason="out_of_scope")
@@ -918,7 +956,7 @@ class Access:
    - `super_admin` нельзя назначить через API;
    - приглашение на email, который уже есть в базе, не создаётся, но ответ тот же 202, а человеку уходит письмо «у вас уже есть учётная запись в SalesHub» — админ чужой организации не узнаёт, что email занят (как в `password/forgot`). В журнал организации в обоих случаях пишется одно и то же `invite.created`: журнал читают её админы (`audit:read`), и отдельная запись выдала бы занятый email. При `invite/accept` сервис ещё раз проверяет, что email свободен и отдел существует (иначе 409 `invite.stale`).
    Причина отказа возвращается в теле ответа: 403 `member.cannot_change_self`, 409 `member.last_admin`, 422 `member.team_required` / `member.team_not_allowed` / `member.team_not_found`. Через обычный API `member.last_admin` недостижим (сам себе админ ничего не меняет, значит, пока он снимает другого, остаётся он сам) — правило срабатывает при гонке, и проверяет его тест на настоящих транзакциях.
-5. Перевод менеджера в другой отдел запускает bulk job `move_team`: `team_id` всех его записей переносится теми же чанками, что и при передаче клиентов (раздел 6), — клиенты переходят в новый отдел вместе с ним.
+5. Перевод менеджера в другой отдел запускает bulk job `move_team`: `team_id` всех его записей переносится теми же чанками, что и при передаче клиентов (раздел 6), — клиенты переходят в новый отдел вместе с ним. До этапа 5 такой перевод (и смена роли на `org_admin` / `viewer`) при живых записях запрещён: 409 `member.has_records`.
 6. Любое изменение `role`, `team_id`, `is_active` → **после** `commit` удалить пользователя из кэша Redis + запись в `audit_log`. Токен перевыпускать не нужно: роли нет в JWT, новая роль действует со следующего запроса (60 с — лишь страховка, если удаление ключа не прошло). Отключение пользователя дополнительно делает `token_version += 1` и отзывает все его refresh-токены — доступ пропадает сразу.
 7. Изменить права роли (что может `sales_rep`) — PR в `data.yaml` + `opa test` в CI + деплой.
 
@@ -985,7 +1023,7 @@ class Access:
 ### Остальное про объём
 
 - **Пагинация**: keyset (`WHERE (created_at, id) < (:c, :i)`) против OFFSET — замер на 100-й тысяче контактов.
-- **Отчёты**: сумма открытых сделок по менеджерам и этапам — materialized view, `REFRESH … CONCURRENTLY` задачей beat; сравнить с прямым запросом.
+- **Отчёты**: сумма сделок по менеджерам и этапам — materialized view `deal_stats` (живые сделки, группировка по организации, отделу, ответственному, воронке, этапу, статусу и месяцу), `REFRESH … CONCURRENTLY` задачей beat (до этапа 5 — `make refresh-reports`); сравнить с прямым запросом. Отчёт отстаёт от данных на интервал обновления — это нормально для аналитики.
 - **Партиции**: `activities` и `audit_log` по месяцам; старые месяцы — `DETACH PARTITION` + архив вместо `DELETE`.
 - **Конкурентность**: чанки упорядочены по id против дедлоков; оптимистическая блокировка через `version` для ручных правок карточки; очередь в таблице через `SELECT … FOR UPDATE SKIP LOCKED` — отдельный эксперимент.
 
@@ -1065,7 +1103,9 @@ raise Conflict("member.last_admin")        # → 409, code=member.last_admin, ti
 | `AppError` | его status + тело ниже | warning (4xx), error (5xx) |
 | `RequestValidationError` | 422, `code=validation`, в `details.errors` — `loc`, `type` и украинское `message`; введённое значение (`input`) не возвращается — там может быть пароль | info |
 | `HTTPException` Starlette (нет маршрута, не тот метод) | 404 `not_found`, 405 `method_not_allowed` с заголовком `Allow` | — |
-| `IntegrityError` (unique, SQLSTATE 23505) | 409 `conflict`; остальные нарушения (FK, CHECK) — ошибка в коде → 500 | warning |
+| `IntegrityError` (unique, SQLSTATE 23505) | 409 `conflict` (у ограничений со своим кодом — он: `uq_contacts_org_id_email` → `contact.duplicate_email`); остальные нарушения (FK, CHECK) — ошибка в коде → 500 | warning |
+| `DBAPIError` с SQLSTATE класса 22 (число вне диапазона, NUL в тексте) | 422 `validation` — ввод, который пропустила схема | info |
+| `StaleDataError` (версия записи изменилась между чтением и записью) | 409 `version.conflict` | warning |
 | любое другое | 500 `internal`, без стектрейса наружу (`UnhandledErrorMiddleware`) | error + traceback |
 
 Формат тела (по мотивам RFC 9457 problem+json):
@@ -1163,7 +1203,7 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 - Схема и данные — разные ревизии. Данные (backfill) на больших таблицах — не в миграции, а bulk job-ом из раздела 6.
 - Индексы на больших таблицах: `op.create_index(..., postgresql_concurrently=True)` внутри `with op.get_context().autocommit_block():` — `CONCURRENTLY` не работает в транзакции.
 - Каждая миграция имеет рабочий `downgrade` (проверяется в CI).
-- Партиции `audit_log`: родитель создаётся миграцией, месячные партиции — задачей beat заранее на 2 месяца вперёд.
+- Партиции `activities` и `audit_log`: родитель и SQL-функцию `ensure_monthly_partitions(таблица, с, по)` создаёт миграция; месячные партиции `<таблица>_pYYYY_MM` — заранее на 2 месяца вперёд. Функция идемпотентна (`CREATE TABLE IF NOT EXISTS … PARTITION OF`), её вызывают: сервис `migrate` после `alembic upgrade` (`python -m app.cli ensure-partitions`), `seed_big.sql` для своего окна в 24 месяца и, с этапа 5, задача beat. DEFAULT-партиции нет: строка вне диапазона — ошибка, а не тихо растущая «прочая» партиция. Партиции — не модели, поэтому `env.py` Alembic пропускает таблицы `*_pYYYY_MM` при сравнении схемы; materialized view отчётов тоже описан вне `Base.metadata`.
 
 ### Изменения без простоя (expand → contract)
 
@@ -1223,11 +1263,13 @@ async def test_access(role, route, target, route_actions, client, ...):
     assert resp.status_code == expected_status(role, route_actions[route], target, success)
 ```
 
-На этапе 3 цели — `same_org` и `other_org` (объекты организации); `own` и `same_team` добавятся с CRM-данными на этапе 4. Чтобы сотня кейсов шла за секунды, хэш пароля считается один раз на запуск, а access-токен выпускается напрямую через `KeySet` — без логина с argon2.
+На этапе 3 цели — `same_org` и `other_org` (объекты организации). С этапа 4 у CRM-маршрутов цели `own` (запись `sales_rep`-а из «мира»), `same_team` (коллеги из его отдела), `same_org` (другой отдел) и `other_org`; тело запроса зависит от роли (ответственный подставляется из «мира», `version` — текущая), а у `Case` есть query-параметры (канбан требует `?pipeline_id=`). Каждый шаг этапа 4, который добавляет маршруты, добавляет и их кейсы — иначе `test_every_route_has_a_case` падает. Чтобы сотня кейсов шла за секунды, хэш пароля считается один раз на запуск, а access-токен выпускается напрямую через `KeySet` — без логина с argon2.
 
-Ожидаемый ответ считается из `data.yaml`: действия нет у роли → 403; чтение или изменение одного объекта: объект в уровне роли → 2xx, вне уровня → 404; создание или изменение, после которого объект выходит из уровня (чужой ответственный или отдел) → 403 `out_of_scope`; список → 200, но без строк вне уровня. Супер-админ на обычных эндпоинтах → 403.
+Ожидаемый ответ считается из `data.yaml`: действия нет у роли → 403; чтение или изменение одного объекта: объект в уровне роли → 2xx, вне уровня чтения → 404, в уровне чтения, но вне уровня действия (чужая компания у `sales_rep`) → 403; создание или изменение, после которого объект выходит из уровня (чужой ответственный или отдел) → 403 `out_of_scope`; список → 200, но без строк вне уровня. Супер-админ на обычных эндпоинтах → 403.
 
 Плюс `test_routes_match_policy` и тест «список не возвращает чужого»: создать контакты в двух организациях, проверить, что `GET /contacts` от sales\_rep org A не содержит ничего из org B, а bulk-update не трогает чужие строки.
+
+**Планы запросов (этап 4).** `make explain` (`scripts/explain_lists.py`) на сгенерированных данных строит запросы всех списков и отчётов теми же методами `*_query()` репозиториев, что и API, для пользователей каждой роли из самых крупных организаций (и для менеджера с 50× клиентов), на первой и глубокой странице, с частым и редким `?q=`, и прогоняет `EXPLAIN (ANALYZE, BUFFERS)` — обычный и с `plan_cache_mode = force_generic_plan` (так выполняет asyncpg после пяти запусков). Ошибка — `Seq Scan` по `companies`, `contacts`, `deals`, `activities` (и её партициям) больше 1 000 страниц; запрос дольше 300 мс — предупреждение (индекс используется, но данных много — частая подстрока в `?q=`). Это автоматическая проверка «Готово, когда» этапа 4: на seed-данных 224 плана, Seq Scan — 0 (`docs/experiments.md`).
 
 ### Celery в тестах
 
@@ -1568,18 +1610,42 @@ deploy/
 
 ### Этап 4 — CRM-домен и объём (раздел 3)
 
-- [ ] 4.1 `companies` и `contacts` с мягким удалением и `version`; общий фильтр `deleted_at IS NULL` в репозитории.
-- [ ] 4.2 CRUD компаний и контактов с `Access` (`list`, `get_visible_or_404`, `ensure_allowed`), keyset-пагинация, ошибка `contact.duplicate_email` + строки в `routes.rego` и тест-матрица.
-- [ ] 4.3 Воронки, этапы, `deals`, эндпоинт канбана + строки в `routes.rego`.
-- [ ] 4.4 `fx_rates`, `FxService` (НБУ, кэш, резерв), суммы сделок в USD, параметр `?currency=`.
-- [ ] 4.5 `activities` с партициями по месяцам и `notes`.
-- [ ] 4.6 Корзина: удаление, восстановление, список удалённых + строки в `routes.rego`.
-- [ ] 4.7 Отчёты: materialized view и эндпоинт + строки в `routes.rego`.
-- [ ] 4.8 `seed_big.sql` (5 млн контактов, 1 млн сделок, 20 млн активностей), `make seed-big`.
-- [ ] 4.9 Индексы из раздела 3: замеры «без / с» → `docs/experiments.md`.
-- [ ] 4.10 Тесты: «список не возвращает чужого», конвертер валют, корзина.
+- [x] 4.1 `companies` и `contacts` с мягким удалением и `version`; общий фильтр `deleted_at IS NULL` в репозитории; keyset-пагинация; правила ответственного (`owner.*`) и `member.has_records`, `team.has_records`.
+- [x] 4.2 CRUD компаний и контактов с `Access` (`list`, `get_visible_or_404`, `ensure_allowed`), `?q=`, `?tag=`, ошибки `contact.duplicate_email`, `version.conflict` + строки в `routes.rego`, тесты в `authz_test.rego`, тест-матрица с целями own / same\_team / same\_org / other\_org.
+- [x] 4.3 Воронки, этапы, `deals` (пока только USD), эндпоинт канбана + строки в `routes.rego` и кейсы матрицы.
+- [x] 4.4 `fx_rates`, `FxService` (НБУ, кэш, резерв), суммы сделок в любой валюте, параметр `?currency=`.
+- [x] 4.5 `activities` с партициями по месяцам, `ensure_monthly_partitions`, `notes`; `audit_log` на партициях и `GET /audit` + строки в `routes.rego`.
+- [x] 4.6 Корзина: удаление, восстановление, список удалённых + строки в `routes.rego`.
+- [x] 4.7 Отчёты: materialized view `deal_stats` и эндпоинты + строки в `routes.rego`.
+- [x] 4.8 `seed_big.sql` (5 млн контактов, 1 млн сделок, 20 млн активностей), `make seed-big`.
+- [x] 4.9 Индексы из раздела 3: замеры «без / с» → `docs/experiments.md`; `make explain`.
+- [x] 4.10 Тесты: «список не возвращает чужого», конвертер валют, корзина, гонки (версия, ответственный).
 
-**Готово, когда:** на сгенерированных данных все списки и отчёты идут по индексам (в `EXPLAIN` нет Seq Scan по большим таблицам), замеры записаны.
+**Готово, когда:** на сгенерированных данных все списки и отчёты идут по индексам (в `EXPLAIN` нет Seq Scan по большим таблицам — проверяет `make explain`), замеры записаны.
+
+**Статус: ✅ этап выполнен и закрыт** (2026-10-21, ветка `stage-4`) — `make seed-big` загружает 5 млн контактов, 1 млн сделок и 20 млн активностей за 10 минут; `make explain`: 224 плана, Seq Scan по большим таблицам — 0 (предупреждение — частая подстрока в `?q=`, её закрывает Elasticsearch на этапе 9); замеры — `docs/experiments.md`; тест-матрица (496 кейсов «роль × эндпоинт × цель»), `opa test` (20 тестов, покрытие ≥ 90%) и 726 тестов pytest зелёные. Каждый шаг прошёл независимое ревью; подтверждённые находки исправлены отдельными коммитами `fix(…)`.
+
+**API этапа 4** (пути — из `routes.rego`, раздел 5; все списки — keyset `?limit=&cursor=`):
+
+| Эндпоинт | Что делает |
+| --- | --- |
+| `GET /companies?q=` | компании организации по имени; в `q` — хотя бы 3 буквы или цифры подряд (иначе у pg\_trgm нет триграмм и пришлось бы читать всю организацию), без управляющих символов — иначе 422 |
+| `GET /contacts?q=&status=&tag=&owner_id=&company_id=` | контакты в уровне `contact:read`, новые сначала |
+| `POST /companies`, `POST /contacts` | `owner_id` необязателен (по умолчанию — я); `org_id` и `team_id` в теле не принимаются |
+| `PATCH /companies/{id}`, `PATCH /contacts/{id}` | поля, которых нет в теле, не меняются; `version` обязателен |
+| `GET /pipelines`, `POST /pipelines {name, stages}` | воронки с этапами; `stages` — список `{name, probability}`, порядок в списке = `position` |
+| `PATCH /pipelines/{id} {name?, stages?}` | `stages` — целиком: элемент с `id` — изменить, без `id` — добавить, пропавший — удалить (если на этапе есть сделки, в том числе в корзине, — 409 `pipeline.stage_has_deals`) |
+| `GET /deals?status=&pipeline_id=&stage_id=&owner_id=&contact_id=&company_id=&overdue=&currency=` | сделки в уровне; `overdue=true` — открытые с прошедшей `expected_close_date`, сортировка по ней |
+| `POST /deals`, `PATCH /deals/{id}` | `{title, amount, currency, stage_id, contact_id?, company_id?, owner_id?, expected_close_date?, status?}`; `pipeline_id` — из этапа |
+| `GET /deals/kanban?pipeline_id=&currency=&per_stage=20` | по каждому этапу: число и сумма открытых сделок в уровне + первые `per_stage` (новые сначала); воронка чужой организации — 404 |
+| `GET /activities?deal_id= \| contact_id=` | история карточки: родитель по уровню чтения, дальше без фильтра `Access` |
+| `GET /activities?due=today\|overdue` | открытые задачи в уровне `activity:read`, по `due_at`; «сегодня» — по часовому поясу пользователя или организации |
+| `POST /activities`, `PATCH /activities/{id}` (`done: true` → `done_at`), `DELETE /activities/{id}` | ответственный — по общему правилу; удаление жёсткое |
+| `GET`, `POST /contacts/{id}/notes` | заметки контакта: читает тот, кто видит контакт, добавляет тот, кто может его менять |
+| `DELETE`, `POST …/restore` у компаний, контактов, сделок; `GET /contacts/trash` | корзина (раздел 3) |
+| `GET /reports/pipeline?pipeline_id=&currency=` | по этапам: число и сумма открытых сделок в уровне `report:read` |
+| `GET /reports/managers?from=&to=&currency=` | по ответственным: открытые сделки и выигранные / проигранные за месяцы `from`–`to` (`YYYY-MM`) |
+| `GET /audit?entity_type=&entity_id=&actor_id=&action=&from=&to=` | журнал своей организации (`audit:read` — только org), новые сначала |
 
 ### Этап 5 — Воркеры, bulk и Telegram-бот (разделы 6, 15, 16)
 
@@ -1692,7 +1758,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Кто создаёт организации | только супер-админ; дальше всё через приглашения |
 | Приглашение на занятый email | 202 и письмо «вы уже состоите в организации» — по ответу нельзя проверить, есть ли email в системе |
 | Пользователи этапа 2 без организации | удаляются миграцией этапа 3 (dev-данные, `downgrade` их не возвращает) |
-| Блокировки при управлении людьми | организация → пользователь → его токены; отдел — `FOR UPDATE` при удалении и `FOR KEY SHARE`, когда в него кладут человека: гонки дают 409/422, а не 500 |
+| Блокировки при управлении людьми | организация → пользователь → его токены; отдел — `FOR UPDATE` при удалении и `FOR KEY SHARE`, когда в него кладут человека: гонки дают 409/422, а не 500. С этапа 4 ответственный записи читается с `FOR SHARE`: перевод человека в другой отдел ждёт создания его записи и видит её (409 `member.has_records`). Организацию сервис людей блокирует `FOR NO KEY UPDATE`, а не `FOR UPDATE`: вставка CRM-записи проверяет FK на организацию с `FOR KEY SHARE`, и с `FOR UPDATE` создание записи и перевод её ответственного ждали бы друг друга (deadlock) |
 | Версия OPA | 1.21.3: образ `openpolicyagent/opa:1.21.3` в compose и testcontainers, `opa test` в CI — та же версия |
 | Удаление | мягкое (корзина 30 дней) для компаний, контактов, сделок; жёсткое для остального |
 | 2FA | не делаем |
@@ -1721,12 +1787,24 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Роли | `super_admin` (флаг) + `org_admin`, `team_lead`, `sales_rep`, `viewer` — простые, но как в настоящих CRM |
 | Членство | один человек — одна организация и одна роль; `org_id`, `team_id`, `role` прямо в `users`, таблиц членства нет |
 | Файл прав | `policies/saleshub/data.yaml`: действия роли и уровень видимости; один файл читают OPA и бэкенд |
+| id CRM-таблиц | `bigint` identity у всех CRM-таблиц; uuid — у организаций, отделов, пользователей |
+| Пагинация | keyset везде: `?limit=` (до 100) и непрозрачный `?cursor=`, ответ `{items, next_cursor}`; битый курсор — 422 `pagination.invalid_cursor` |
+| Ответственный записи | по умолчанию — я; проверяется при создании и смене `owner_id` (активный `team_lead` / `sales_rep`), `team_id` — его отдел; до `move_team` смена отдела человека с записями — 409 `member.has_records` |
+| Чтение перед изменением | старая версия ищется по уровню чтения: не видна — 404, видна, но вне уровня действия — 403 |
+| Оптимистическая блокировка | `version` в теле `PATCH`, 409 `version.conflict`; `version_id_col` SQLAlchemy ловит гонку |
+| FK на больших таблицах | на `org_id`, `owner_id` и ссылки между сущностями — да, на `team_id` — нет (раздел 3) |
+| Курс в сделке | `fx_rate` — единиц исходной валюты за 1 USD; курсы НБУ подтягиваются по первому запросу дня, при недоступности — последний известный и `fx.stale` |
+| Партиции | `activities`, `audit_log` по месяцам, идемпотентная `ensure_monthly_partitions` на 2 месяца вперёд, без DEFAULT |
+| Открытые активности | запланированная — с `due_at` и пустым `done_at`; без `due_at` — уже состоялась (`done_at = created_at`) |
+| Отчёты | MV `deal_stats` по месяцам, `REFRESH CONCURRENTLY`; активности в отчёты не входят |
+| Проверка планов | `make explain` на seed-данных, в том числе generic-план; предикаты частичных индексов и шаблон `?q=` — литералами |
+| Поиск по подстроке | pg\_trgm до этапа 9: быстрый для редких подстрок, медленный (≈ 1 с) для частых — ограничение триграмм, его закрывает Elasticsearch |
 
 ### Открытые вопросы
 
 - [x] Уведомления — email и Telegram-бот (раздел 16).
 - [x] Поиск — Elasticsearch (раздел 17).
-- [ ] Новых открытых вопросов нет; этапы 1–3 закрыты, следующий шаг — этап 4 дорожной карты.
+- [ ] Новых открытых вопросов нет; этапы 1–4 закрыты, следующий шаг — этап 5 дорожной карты.
 
 ## 15. Модуль: система воркеров
 
@@ -1851,7 +1929,7 @@ def chunk(self, job_id: str, table: str, lo: int, hi: int) -> int:
 | `fx.fetch_nbu_rates` | будни 18:30, повтор 19:30; при старте, если нет курса на завтра | курсы НБУ на следующий рабочий день → `fx_rates` |
 | `bulk.reap_stuck` | каждую минуту | зависшие job → `failed` |
 | `trash.purge` | ежедневно 03:00 | удаляет из корзины записи старше 30 дней, чанками |
-| `maintenance.create_partitions` | 1-го числа месяца | партиции `activities` и `audit_log` на 2 месяца вперёд |
+| `maintenance.create_partitions` | 1-го числа месяца | партиции `activities` и `audit_log` на 2 месяца вперёд — та же функция `ensure_monthly_partitions`, что вызывает `migrate` |
 | `reports.refresh` | каждые 5 минут | `REFRESH MATERIALIZED VIEW CONCURRENTLY` |
 | `auth.cleanup_tokens` | ежедневно 04:00 | удаляет истёкшие refresh- и email-токены |
 | `workers.heartbeat` | каждую минуту | пишет время в Redis; если старше 3 минут — алерт `CeleryBeatDown` |

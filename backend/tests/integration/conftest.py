@@ -6,16 +6,20 @@
 
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import pytest
+import respx
 from alembic import command
 from alembic.config import Config
 from fastapi import FastAPI
 from httpx import AsyncClient
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 from testcontainers.community.postgres import PostgresContainer
@@ -26,7 +30,17 @@ from testcontainers.core.wait_strategies import HttpWaitStrategy
 from app.api.deps import get_session
 from app.core.config import Settings
 from app.core.security import hash_password
-from app.models import Organization, Team, User
+from app.models import (
+    Activity,
+    Company,
+    Contact,
+    Deal,
+    Organization,
+    Pipeline,
+    PipelineStage,
+    Team,
+    User,
+)
 from app.uow import UnitOfWork
 from tests.conftest import POLICIES_DIR
 
@@ -109,6 +123,7 @@ def settings(
             "smtp_host": mailpit.smtp_host,
             "smtp_port": mailpit.smtp_port,
             "opa_url": opa_url,
+            "nbu_url": NBU_URL,
         }
     )
 
@@ -253,3 +268,132 @@ async def member(
 
 async def tokens_for(client: AsyncClient, user: User) -> dict[str, str]:
     return bearer(await login(client, user.email))
+
+
+MakeRecord = Callable[..., Awaitable[Any]]
+
+
+@pytest.fixture
+def make_contact(uow: UnitOfWork) -> MakeRecord:
+    """Контакт, который ведёт owner (team_lead или sales_rep): org_id и team_id — его."""
+
+    async def make(owner: User, **fields: Any) -> Contact:
+        fields.setdefault("first_name", "Іван")
+        fields.setdefault("email", f"client-{uuid.uuid4().hex[:8]}@example.com")
+        contact = Contact(org_id=owner.org_id, team_id=owner.team_id, owner_id=owner.id, **fields)
+        uow.contacts.add(contact)
+        await uow.commit()
+        return contact
+
+    return make
+
+
+@pytest.fixture
+def make_company(uow: UnitOfWork) -> MakeRecord:
+    async def make(owner: User, **fields: Any) -> Company:
+        fields.setdefault("name", f"Acme {uuid.uuid4().hex[:6]}")
+        company = Company(org_id=owner.org_id, team_id=owner.team_id, owner_id=owner.id, **fields)
+        uow.companies.add(company)
+        await uow.commit()
+        return company
+
+    return make
+
+
+@pytest.fixture
+def make_pipeline(uow: UnitOfWork) -> Callable[..., Awaitable[Pipeline]]:
+    """Воронка организации с этапами «Новий» и «Пропозиція»."""
+
+    async def make(org_id: uuid.UUID, name: str | None = None) -> Pipeline:
+        pipeline = Pipeline(
+            org_id=org_id,
+            name=name or f"Продажі {uuid.uuid4().hex[:6]}",
+            stages=[
+                PipelineStage(name="Новий", position=0, probability=10),
+                PipelineStage(name="Пропозиція", position=1, probability=50),
+            ],
+        )
+        uow.pipelines.add(pipeline)
+        await uow.commit()
+        return pipeline
+
+    return make
+
+
+@pytest.fixture
+def make_deal(uow: UnitOfWork) -> MakeRecord:
+    """Открытая сделка на 1000 USD на первом этапе воронки (stage)."""
+
+    async def make(owner: User, stage: PipelineStage, **fields: Any) -> Deal:
+        fields.setdefault("title", f"Угода {uuid.uuid4().hex[:6]}")
+        fields.setdefault("amount_usd", Decimal("1000.00"))
+        deal = Deal(
+            org_id=owner.org_id,
+            team_id=owner.team_id,
+            owner_id=owner.id,
+            pipeline_id=stage.pipeline_id,
+            stage_id=stage.id,
+            amount_original=fields["amount_usd"],
+            currency_original="USD",
+            fx_rate=Decimal(1),
+            fx_date=date.today(),
+            **fields,
+        )
+        uow.deals.add(deal)
+        await uow.commit()
+        return deal
+
+    return make
+
+
+NBU_URL = "http://nbu.test/exchange"
+# Курсы НБУ в тестах: гривен за 1 единицу валюты.
+NBU_RATES = {"USD": Decimal("41.488"), "EUR": Decimal("46.5"), "PLN": Decimal("10.25")}
+
+
+@dataclass
+class FakeNbu:
+    """Подмена API НБУ (respx): тесты не ходят в интернет. rates — курсы на любую дату;
+    down — НБУ не отвечает; dates — за какие даты спрашивали."""
+
+    rates: dict[str, Decimal]
+    down: bool = False
+    dates: list[str] = field(default_factory=list)
+
+    def respond(self, request: httpx.Request) -> httpx.Response:
+        self.dates.append(request.url.params["date"])
+        if self.down:
+            return httpx.Response(503)
+        return httpx.Response(
+            200, json=[{"cc": cc, "rate": float(rate)} for cc, rate in self.rates.items()]
+        )
+
+
+@pytest.fixture(autouse=True)
+async def nbu(redis_url: str) -> AsyncIterator[FakeNbu]:
+    fake = FakeNbu(dict(NBU_RATES))
+    # Кэш курсов в Redis общий на весь запуск — каждый тест начинает с пустого.
+    redis = Redis.from_url(redis_url)
+    async for key in redis.scan_iter("fx:*"):
+        await redis.delete(key)
+    await redis.aclose()
+    with respx.mock(assert_all_called=False) as router:
+        router.get(NBU_URL).mock(side_effect=fake.respond)
+        router.route().pass_through()  # OPA, Mailpit — настоящие
+        yield fake
+
+
+@pytest.fixture
+def make_activity(uow: UnitOfWork) -> MakeRecord:
+    """Открытая задача со сроком через день, которую ведёт owner."""
+
+    async def make(owner: User, **fields: Any) -> Activity:
+        fields.setdefault("type", "task")
+        fields.setdefault("subject", "Подзвонити")
+        fields.setdefault("due_at", datetime.now(UTC) + timedelta(days=1))
+        activity = Activity(org_id=owner.org_id, team_id=owner.team_id, owner_id=owner.id, **fields)
+        uow.activities.add(activity)
+        await uow.commit()
+        return activity
+
+    return make

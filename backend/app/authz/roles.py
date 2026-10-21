@@ -45,6 +45,9 @@ class RoleCatalog:
             raise ServiceUnavailable("authz.policy_out_of_sync", action=action)
         return level
 
+    def scope_or_none(self, role: str | None, action: str) -> Scope | None:
+        return self._permissions.get(role or "", {}).get(action)
+
     def levels(self, action: str) -> dict[str, Scope]:
         """У каких ролей есть действие и с каким уровнем — для описаний в Swagger."""
         return {

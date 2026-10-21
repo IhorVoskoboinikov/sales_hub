@@ -53,6 +53,14 @@ class MemberService:
         team_id = await self._new_team(access, user, role, changes)
         is_active = user.is_active if changes.is_active is None else changes.is_active
 
+        moves_records = team_id != user.team_id or (
+            user.role in ROLES_WITH_TEAM and role not in ROLES_WITH_TEAM
+        )
+        if moves_records and await self.uow.live_records.exist(owner_id=user.id):
+            # Записи ведёт этот человек, и их team_id — его отдел. Пока нет bulk job move_team
+            # (этап 5), который перенесёт их вместе с ним, перевод запрещён.
+            raise Conflict("member.has_records")
+
         loses_admin = (
             user.role == Role.ORG_ADMIN
             and user.is_active

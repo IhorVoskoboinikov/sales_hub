@@ -12,8 +12,13 @@ class OrganizationRepository:
         self.session = session
 
     async def get(self, org_id: uuid.UUID, *, for_update: bool = False) -> Organization | None:
+        """for_update — FOR NO KEY UPDATE: сериализует изменения людей организации, но не мешает
+        вставке CRM-записей. Их FK на organizations берёт FOR KEY SHARE, а с ним конфликтует
+        только FOR UPDATE: запись, ждущая организацию, и смена роли, ждущая ответственного
+        этой записи, ждали бы друг друга (deadlock)."""
+        lock = {"key_share": True} if for_update else False
         return await self.session.get(
-            Organization, org_id, with_for_update=for_update, populate_existing=for_update
+            Organization, org_id, with_for_update=lock, populate_existing=for_update
         )
 
     async def get_by_slug(self, slug: str) -> Organization | None:

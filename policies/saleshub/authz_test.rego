@@ -54,6 +54,91 @@ test_only_super_admin_creates_orgs if {
 	not authz.allow with input as req(org_admin, "GET", "/api/v1/admin/orgs")
 }
 
+test_everyone_reads_companies_viewer_cannot_write if {
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		authz.allow with input as req(user, "GET", "/api/v1/companies")
+		authz.allow with input as req(user, "GET", "/api/v1/companies/{company_id}")
+	}
+	every user in [org_admin, team_lead, sales_rep] {
+		authz.allow with input as req(user, "POST", "/api/v1/companies")
+		authz.allow with input as req(user, "PATCH", "/api/v1/companies/{company_id}")
+	}
+	not authz.allow with input as req(viewer, "POST", "/api/v1/companies")
+	not authz.allow with input as req(viewer, "PATCH", "/api/v1/companies/{company_id}")
+}
+
+test_contacts_read_by_all_written_by_sellers if {
+	d := authz.decision with input as req(sales_rep, "PATCH", "/api/v1/contacts/{contact_id}")
+	d.allow
+	d.action == "contact:write"
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		authz.allow with input as req(user, "GET", "/api/v1/contacts")
+		authz.allow with input as req(user, "GET", "/api/v1/contacts/{contact_id}")
+	}
+	authz.allow with input as req(team_lead, "POST", "/api/v1/contacts")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/contacts")
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/contacts")
+}
+
+test_pipelines_read_by_all_managed_by_org_admin if {
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		authz.allow with input as req(user, "GET", "/api/v1/pipelines")
+		authz.allow with input as req(user, "GET", "/api/v1/deals/kanban")
+	}
+	authz.allow with input as req(org_admin, "PATCH", "/api/v1/pipelines/{pipeline_id}")
+	every user in [team_lead, sales_rep, viewer] {
+		not authz.allow with input as req(user, "POST", "/api/v1/pipelines")
+	}
+}
+
+test_sales_rep_can_edit_deal if {
+	d := authz.decision with input as req(sales_rep, "PATCH", "/api/v1/deals/{deal_id}")
+	d.allow
+	d.action == "deal:write"
+	authz.allow with input as req(sales_rep, "POST", "/api/v1/deals")
+	authz.allow with input as req(viewer, "GET", "/api/v1/deals/{deal_id}")
+	not authz.allow with input as req(viewer, "PATCH", "/api/v1/deals/{deal_id}")
+}
+
+test_activities_and_notes if {
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		authz.allow with input as req(user, "GET", "/api/v1/activities")
+		authz.allow with input as req(user, "GET", "/api/v1/contacts/{contact_id}/notes")
+	}
+	authz.allow with input as req(sales_rep, "DELETE", "/api/v1/activities/{activity_id}")
+	authz.allow with input as req(sales_rep, "POST", "/api/v1/contacts/{contact_id}/notes")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/activities")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/contacts/{contact_id}/notes")
+}
+
+test_only_org_admin_reads_audit if {
+	authz.allow with input as req(org_admin, "GET", "/api/v1/audit")
+	every user in [team_lead, sales_rep, viewer, super_admin] {
+		not authz.allow with input as req(user, "GET", "/api/v1/audit")
+	}
+}
+
+# Менеджер не удаляет даже свои записи — только руководитель и админ (раздел 5).
+test_sales_rep_cannot_delete_contact if {
+	not authz.allow with input as req(sales_rep, "DELETE", "/api/v1/contacts/{contact_id}")
+	not authz.allow with input as req(sales_rep, "GET", "/api/v1/contacts/trash")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/deals/{deal_id}/restore")
+	every user in [org_admin, team_lead] {
+		authz.allow with input as req(user, "DELETE", "/api/v1/companies/{company_id}")
+		authz.allow with input as req(user, "POST", "/api/v1/contacts/{contact_id}/restore")
+		authz.allow with input as req(user, "DELETE", "/api/v1/deals/{deal_id}")
+	}
+}
+
+test_everyone_in_org_reads_reports_in_own_level if {
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		d := authz.decision with input as req(user, "GET", "/api/v1/reports/managers")
+		d.allow
+		d.action == "report:read"
+	}
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/reports/pipeline")
+}
+
 # У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
 test_super_admin_only_admin_routes if {
 	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/orgs")

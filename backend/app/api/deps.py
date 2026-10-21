@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import cast
 
 import structlog
-from fastapi import BackgroundTasks, Depends, Request
+from fastapi import BackgroundTasks, Depends, Query, Request
 from fastapi.security import OAuth2PasswordBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -18,13 +18,19 @@ from app.core.jwt import KeySet
 from app.emails.mailer import BackgroundMailer
 from app.emails.sender import EmailSender, Mailer
 from app.errors import Unauthorized
+from app.repositories.pagination import DEFAULT_LIMIT, MAX_LIMIT, Page
 from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
+from app.services.activities import ActivityService, AuditService, NoteService
 from app.services.auth import AuthService, ClientInfo, CurrentUser
+from app.services.contacts import CompanyService, ContactService
+from app.services.deals import DealService, PipelineService
+from app.services.fx import FxService, NbuClient
 from app.services.invites import InviteService
 from app.services.members import MemberService
 from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
+from app.services.reports import ReportService
 from app.uow import UnitOfWork
 
 # Кнопка Authorize в Swagger: форма логина отправляется на tokenUrl.
@@ -138,6 +144,65 @@ def get_member_service(
     uow: UnitOfWork = Depends(get_uow), cache: UserCache = Depends(get_user_cache)
 ) -> MemberService:
     return MemberService(uow, cache)
+
+
+def get_company_service(
+    uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
+) -> CompanyService:
+    return CompanyService(uow, roles)
+
+
+def get_contact_service(
+    uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
+) -> ContactService:
+    return ContactService(uow, roles)
+
+
+def get_pipeline_service(uow: UnitOfWork = Depends(get_uow)) -> PipelineService:
+    return PipelineService(uow)
+
+
+def get_fx_service(
+    request: Request, uow: UnitOfWork = Depends(get_uow), redis: Redis = Depends(get_redis)
+) -> FxService:
+    return FxService(uow, redis, cast(NbuClient, request.app.state.nbu))
+
+
+def get_deal_service(
+    uow: UnitOfWork = Depends(get_uow),
+    roles: RoleCatalog = Depends(get_roles),
+    fx: FxService = Depends(get_fx_service),
+) -> DealService:
+    return DealService(uow, roles, fx)
+
+
+def get_activity_service(
+    uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
+) -> ActivityService:
+    return ActivityService(uow, roles)
+
+
+def get_note_service(
+    uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
+) -> NoteService:
+    return NoteService(uow, roles)
+
+
+def get_audit_service(uow: UnitOfWork = Depends(get_uow)) -> AuditService:
+    return AuditService(uow)
+
+
+def get_report_service(
+    uow: UnitOfWork = Depends(get_uow), fx: FxService = Depends(get_fx_service)
+) -> ReportService:
+    return ReportService(uow, fx)
+
+
+def get_page(
+    limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT, description="Строк на странице"),
+    cursor: str | None = Query(None, description="next_cursor из предыдущей страницы"),
+) -> Page:
+    return Page(limit=limit, cursor=cursor)
 
 
 def get_client_info(request: Request) -> ClientInfo:

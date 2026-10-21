@@ -44,6 +44,7 @@ ERRORS: dict[str, str] = {
     "pagination.invalid_cursor": "Некоректний курсор сторінки",
     "pipeline.name_taken": "Воронка з такою назвою вже є",
     "pipeline.stage_not_found": "У воронці немає такого етапу",
+    "pipeline.stage_duplicate": "Один етап указано двічі",
     "pipeline.stage_has_deals": "На етапі є угоди (зокрема в кошику) — спочатку перенесіть їх",
     # Валюти
     "fx.unknown_currency": "НБУ не встановлює курс для цієї валюти",

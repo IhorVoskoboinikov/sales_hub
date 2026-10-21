@@ -80,6 +80,10 @@ async def test_nbu_down_falls_back_to_last_known_rate(fx: FxService, nbu: FakeNb
     assert (rate.rate_uah, rate.date, rate.stale) == (Decimal("41.488"), FRIDAY, True)
     assert again.stale  # устаревший курс не кэшируется: следующий запрос снова спросит НБУ
     assert nbu.dates.count("20261017") == 2
+    # В сделку пишется дата курса, по которому реально посчитали, — пятница, а не суббота.
+    await fx.get_rate("EUR", FRIDAY)
+    converted = await fx.to_usd(Decimal("100"), "EUR", SATURDAY)
+    assert (converted.fx_date, converted.stale) == (FRIDAY, True)
 
 
 async def test_holiday_or_future_date_without_nbu_rate_uses_last_known(

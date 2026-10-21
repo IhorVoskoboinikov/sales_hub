@@ -57,6 +57,12 @@ async def test_pipeline_stages_are_replaced_as_a_list(
     assert stages[0]["id"] == second["id"]
     assert (duplicate.status_code, duplicate.json()["code"]) == (409, "pipeline.name_taken")
     assert (unknown.status_code, unknown.json()["code"]) == (422, "pipeline.stage_not_found")
+    twice = await client.patch(
+        f"/api/v1/pipelines/{pipeline['id']}",
+        json={"stages": [{"id": first["id"], "name": "A"}, {"id": first["id"], "name": "B"}]},
+        headers=admin,
+    )
+    assert (twice.status_code, twice.json()["code"]) == (422, "pipeline.stage_duplicate")
 
 
 async def test_stage_with_deals_cannot_be_removed_even_from_trash(

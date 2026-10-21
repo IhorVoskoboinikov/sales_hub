@@ -6,7 +6,6 @@ Starlette сопоставил бы «kanban» с {deal_id} (раздел 5, «�
 """
 
 import uuid
-from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Annotated
 
@@ -75,7 +74,7 @@ async def list_deals(
         owner_id=owner_id,
         contact_id=contact_id,
         company_id=company_id,
-        overdue_on=datetime.now(UTC).date() if overdue else None,
+        overdue_on=await deals.today(access) if overdue else None,  # «сегодня» организации
     )
     display = await deals.display(access, currency)
     result = await deals.list(access, filters, page)

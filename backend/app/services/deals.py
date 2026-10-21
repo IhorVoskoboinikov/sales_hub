@@ -77,11 +77,14 @@ class PipelineService:
         self, pipeline: Pipeline, stages: Sequence[StageIn]
     ) -> dict[str, Any]:
         current = {stage.id: stage for stage in pipeline.stages}
-        unknown = [s.id for s in stages if s.id is not None and s.id not in current]
+        ids = [s.id for s in stages if s.id is not None]
+        if len(ids) != len(set(ids)):
+            raise ValidationFailed("pipeline.stage_duplicate", field="stages")
+        unknown = [stage_id for stage_id in ids if stage_id not in current]
         if unknown:
             raise ValidationFailed("pipeline.stage_not_found", field="stages", ids=unknown)
-        kept = {s.id for s in stages if s.id is not None}
-        removed = [stage for stage_id, stage in current.items() if stage_id not in kept]
+        removed = [stage for stage_id, stage in current.items() if stage_id not in set(ids)]
+        await self.uow.pipelines.lock_stages([stage.id for stage in removed])
         for stage in removed:
             if await self.uow.pipelines.stage_has_deals(stage.id):
                 raise Conflict("pipeline.stage_has_deals", stage_id=stage.id)

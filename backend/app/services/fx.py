@@ -73,6 +73,12 @@ def cross_rate(currency: Rate, usd: Rate) -> Decimal:
     return (usd.rate_uah / currency.rate_uah).quantize(RATE_PLACES, ROUND_HALF_EVEN)
 
 
+def rate_date(*rates: Rate) -> date:
+    """Дата, на которую взят курс: при резервном (stale) курсе — его дата, а не сегодняшняя.
+    Если две валюты взяты за разные дни — более старая (раздел 3: fx_date — дата курса)."""
+    return min(rate.date for rate in rates)
+
+
 class NbuClient:
     def __init__(self, http: httpx.AsyncClient, url: str = NBU_URL) -> None:
         self.http = http
@@ -122,16 +128,17 @@ class FxService:
         if currency == "USD":
             return Display("USD", Decimal(1), on, False)
         rate, usd = await self.get_rate(currency, on), await self.get_rate("USD", on)
-        return Display(currency, cross_rate(rate, usd), on, rate.stale or usd.stale)
+        return Display(
+            currency, cross_rate(rate, usd), rate_date(rate, usd), rate.stale or usd.stale
+        )
 
     async def to_usd(self, amount: Decimal, currency: str, on: date) -> Converted:
         if currency == "USD":
             return Converted(amount, Decimal(1), on, False)
         rate, usd = await self.get_rate(currency, on), await self.get_rate("USD", on)
         fx_rate = cross_rate(rate, usd)
-        return Converted(
-            (amount / fx_rate).quantize(CENT, ROUND_HALF_EVEN), fx_rate, on, rate.stale or usd.stale
-        )
+        amount_usd = (amount / fx_rate).quantize(CENT, ROUND_HALF_EVEN)
+        return Converted(amount_usd, fx_rate, rate_date(rate, usd), rate.stale or usd.stale)
 
     async def _fetch(self, on: date) -> dict[str, Decimal]:
         """Курсы НБУ на дату → fx_rates. Пусто — НБУ недоступен или курса на дату ещё нет.

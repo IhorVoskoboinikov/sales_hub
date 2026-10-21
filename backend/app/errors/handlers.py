@@ -34,7 +34,10 @@ UNIQUE_VIOLATION = "23505"  # SQLSTATE Postgres: нарушение UNIQUE
 
 # Уникальные ограничения, у которых есть свой код ошибки. Сервис проверяет их заранее, а база
 # ловит гонку двух одновременных запросов — ответ должен быть тем же.
-UNIQUE_CODES = {"uq_contacts_org_id_email": "contact.duplicate_email"}
+UNIQUE_CODES = {
+    "uq_contacts_org_id_email": "contact.duplicate_email",
+    "uq_pipelines_org_id_name": "pipeline.name_taken",
+}
 
 
 def problem(

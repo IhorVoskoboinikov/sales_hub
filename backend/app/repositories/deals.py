@@ -54,12 +54,29 @@ class PipelineRepository:
         )
 
     async def get_stage(self, stage_id: int, org_id: uuid.UUID) -> PipelineStage | None:
-        """Этап своей организации (у этапа нет ответственного — проверяем воронку)."""
+        """Этап своей организации (у этапа нет ответственного — проверяем воронку).
+
+        FOR KEY SHARE — как у FK-проверки: если админ в этот момент удаляет этап (FOR UPDATE
+        в lock_stages), сделка дождётся его коммита и увидит, что этапа нет (422), а не упадёт
+        на внешнем ключе с 500."""
         return await self.session.scalar(
             select(PipelineStage)
             .join(Pipeline, Pipeline.id == PipelineStage.pipeline_id)
             .where(PipelineStage.id == stage_id, Pipeline.org_id == org_id)
+            .with_for_update(read=True, key_share=True, of=PipelineStage)
         )
+
+    async def lock_stages(self, stage_ids: builtins.list[int]) -> None:
+        """FOR UPDATE на удаляемые этапы до проверки «на этапе нет сделок»: сделка, которая
+        как раз ставится на этот этап, либо успеет раньше (и проверка её увидит — 409), либо
+        дождётся удаления (и получит 422)."""
+        if stage_ids:
+            await self.session.execute(
+                select(PipelineStage.id)
+                .where(PipelineStage.id.in_(stage_ids))
+                .order_by(PipelineStage.id)  # один порядок блокировок — без deadlock
+                .with_for_update()
+            )
 
     async def stage_has_deals(self, stage_id: int) -> bool:
         """Сделки на этапе, включая корзину: FK держат и удалённые строки."""

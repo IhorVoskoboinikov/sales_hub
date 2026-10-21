@@ -29,11 +29,11 @@ ps:  ## статус контейнеров
 logs:  ## логи API в реальном времени
 	$(COMPOSE) logs -f api
 
-logs-workers:  ## логи воркеров и beat в реальном времени
-	$(COMPOSE) logs -f worker worker-bulk beat
+logs-workers:  ## логи воркеров, beat и outbox relay в реальном времени
+	$(COMPOSE) logs -f worker worker-bulk beat outbox-relay
 
-restart-workers:  ## перезапустить воркеры и beat (beat перечитывает расписание только при старте)
-	$(COMPOSE) restart worker worker-bulk beat
+restart-workers:  ## перезапустить воркеры, beat и relay (beat перечитывает расписание только при старте)
+	$(COMPOSE) restart worker worker-bulk beat outbox-relay
 
 urls:  ## адреса веб-интерфейсов
 	@echo "Swagger      http://localhost:8000/docs   супер-админ admin@example.com / admin-password"

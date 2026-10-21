@@ -62,7 +62,8 @@ strict = true
 plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
-module = ["testcontainers.*"]
+# Без аннотаций. asyncpg напрямую нужен только relay — для LISTEN (app/events/relay.py).
+module = ["testcontainers.*", "asyncpg.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

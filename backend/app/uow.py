@@ -11,6 +11,7 @@ from app.repositories.deals import DealRepository, PipelineRepository
 from app.repositories.email_tokens import EmailTokenRepository
 from app.repositories.fx import FxRateRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
+from app.repositories.outbox import OutboxRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.reports import ReportRepository
 from app.repositories.users import UserRepository
@@ -35,6 +36,7 @@ class UnitOfWork:
         self.audit_log = AuditQueries(session)
         self.reports = ReportRepository(session)
         self.live_records = LiveRecords(session, (Company, Contact, Deal))
+        self.outbox = OutboxRepository(session)
 
     async def flush(self) -> None:
         """Отправить изменения в базу без коммита: проверить ограничения, получить значения

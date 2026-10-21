@@ -170,6 +170,14 @@ def test_routes_by_full_task_name() -> None:
     assert queue("workers.heartbeat") == "default"
 
 
+def test_broker_io_is_bounded() -> None:
+    # Зависший Redis не держит send_task (и батч relay) бесконечно, а BRPOP воркера (1 с)
+    # укладывается в таймаут чтения.
+    options = celery_app.conf.broker_transport_options
+    assert 1 < options["socket_timeout"] <= 10
+    assert 0 < options["socket_connect_timeout"] <= 10
+
+
 @pytest.fixture(autouse=True)
 def clean_context() -> Iterator[None]:
     # Обработчики сигналов меняют контекст потока — не оставляем его следующим тестам.

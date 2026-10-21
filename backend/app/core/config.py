@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     # Секунды. Больше самой долгой задачи (запуск импорта — 12 минут), иначе Redis выдаст
     # её повторно, пока она ещё выполняется.
     celery_visibility_timeout: int = 1200
+    # Outbox relay (раздел 15): строк за одну транзакцию и сколько ждать NOTIFY до опроса.
+    outbox_batch_size: int = 100
+    outbox_poll_seconds: float = 2.0
 
     # --- Вход по почте (раздел 4)
     # Путь относительно backend/ (в контейнере — /app). В dev файл создаёт make keys.

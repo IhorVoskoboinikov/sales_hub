@@ -8,6 +8,7 @@ from app.models.deals import Deal, DealStatus, Pipeline, PipelineStage
 from app.models.email_token import EmailToken, EmailTokenPurpose
 from app.models.fx import FxRate
 from app.models.organization import Organization, Team
+from app.models.outbox import OutboxEvent
 from app.models.refresh_token import RefreshToken
 from app.models.user import ROLES_WITH_TEAM, Role, User
 
@@ -27,6 +28,7 @@ __all__ = [
     "FxRate",
     "Note",
     "Organization",
+    "OutboxEvent",
     "Pipeline",
     "PipelineStage",
     "RefreshToken",

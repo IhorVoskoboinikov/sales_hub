@@ -153,6 +153,23 @@ services:
     environment: *app-env
     depends_on: *worker-depends-on
 
+  # Публикует outbox_events в Celery (раздел 15): LISTEN outbox_new + опрос раз в 2 с. Тоже через
+  # watchfiles: правка .py — SIGINT, relay дорабатывает текущий батч и стартует заново.
+  # Файл ролей и OPA ему не нужны. Без healthcheck: make up --wait ждёт только запуска.
+  outbox-relay:
+    image: saleshub-api:dev
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "25",
+              "python -m app.events.relay", "/app/app"]
+    volumes:
+      - ../../backend/app:/app/app:ro
+    environment: *app-env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    # Батч — доли секунды; дольше ждёт только подключение к недоступной базе.
+    stop_grace_period: 30s
+
   # Мониторинг задач по событиям воркеров. Без входа — порт только на localhost.
   flower:
     image: mher/flower:2.2.0

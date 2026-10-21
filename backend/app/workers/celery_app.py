@@ -25,8 +25,15 @@ celery_app = Celery("saleshub", include=["app.workers.tasks.maintenance"])
 celery_app.conf.update(
     broker_url=settings.celery_broker_url,  # db 1; кэш и rate limit — в db 0
     broker_connection_retry_on_startup=True,  # брокер ещё стартует — ждать, а не падать
-    # Одинаковый у всех процессов: больше самой долгой задачи, иначе Redis выдаст её повторно.
-    broker_transport_options={"visibility_timeout": settings.celery_visibility_timeout},
+    broker_transport_options={
+        # Одинаковый у всех процессов: больше самой долгой задачи, иначе Redis выдаст её повторно.
+        "visibility_timeout": settings.celery_visibility_timeout,
+        # Без них (у kombu None) зависший Redis — пауза контейнера, потерянные пакеты без RST —
+        # держит send_task бесконечно: relay стоит в открытой транзакции батча. С ними — ошибка
+        # через 5 с, как у отказа в соединении. BRPOP воркера ждёт 1 с, таймаут его не задевает.
+        "socket_timeout": 5,
+        "socket_connect_timeout": 5,
+    },
     # Аргументы — только id и простые значения.
     task_serializer="json",
     accept_content=["json"],

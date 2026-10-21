@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from app.models import ActivityType
 from app.schemas.crm import BigId, NotNullFields, OwnerId
@@ -15,7 +15,9 @@ Subject = Annotated[str, Field(min_length=1, max_length=300)]
 class ActivityIn(BaseModel):
     type: ActivityType
     subject: Subject
-    due_at: datetime | None = Field(
+    # AwareDatetime: время только с часовым поясом (…+03:00 или …Z). Без него «10:00»
+    # означало бы время часов сервера — у каждого стенда своё.
+    due_at: AwareDatetime | None = Field(
         None, description="Срок. Не указан — активность уже состоялась (звонок, письмо)"
     )
     deal_id: BigId | None = None
@@ -27,7 +29,7 @@ class ActivityUpdate(NotNullFields):
     not_null = frozenset({"subject", "due_at", "done", "owner_id"})
 
     subject: Subject | None = None
-    due_at: datetime | None = None
+    due_at: AwareDatetime | None = None
     done: bool | None = Field(None, description="true — выполнено сейчас, false — снова открыть")
     owner_id: OwnerId = None
 

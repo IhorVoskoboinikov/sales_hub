@@ -78,8 +78,11 @@ async def ensure_partitions_command(settings: Settings) -> int:
             for table in PARTITIONED:
                 created = await connection.scalar(
                     text(
-                        "SELECT ensure_monthly_partitions(CAST(:table AS regclass), CAST(now() AS"
-                        " date), CAST(now() + make_interval(months => :ahead) AS date))"
+                        # Месяцы — по UTC, как границы партиций (а не по часовому поясу сессии).
+                        "SELECT ensure_monthly_partitions(CAST(:table AS regclass),"
+                        " CAST(now() AT TIME ZONE 'UTC' AS date),"
+                        " CAST((now() + make_interval(months => :ahead)) AT TIME ZONE 'UTC'"
+                        " AS date))"
                     ),
                     {"table": table, "ahead": MONTHS_AHEAD},
                 )

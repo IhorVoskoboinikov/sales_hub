@@ -200,3 +200,21 @@ async def test_rows_land_in_monthly_partitions(
     )
 
     assert partition == f"activities_p{datetime.now(UTC):%Y_%m}"
+
+
+async def test_time_without_timezone_is_422(
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
+) -> None:
+    """«10:00» без часового пояса означало бы время часов сервера — такое не принимаем."""
+    org = await make_org()
+    rep = await tokens_for(client, await member(make_user, org, "sales_rep"))
+    admin = await tokens_for(client, await member(make_user, org, "org_admin"))
+
+    naive = await client.post(
+        "/api/v1/activities",
+        json={"type": "task", "subject": "X", "due_at": "2026-10-22T10:00:00"},
+        headers=rep,
+    )
+    audit = await client.get("/api/v1/audit", params={"from": "2026-10-01T00:00:00"}, headers=admin)
+
+    assert (naive.status_code, audit.status_code) == (422, 422)

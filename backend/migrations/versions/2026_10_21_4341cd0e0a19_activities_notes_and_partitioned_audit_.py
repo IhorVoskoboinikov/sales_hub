@@ -23,6 +23,8 @@ depends_on: str | Sequence[str] | None = None
 
 
 ENSURE_PARTITIONS = """
+-- from_day и to_day — даты по UTC: границы партиций — полночь UTC. Вызывающий переводит
+-- timestamptz в дату через AT TIME ZONE 'UTC', а не ::date (тот берёт часовой пояс сессии).
 CREATE OR REPLACE FUNCTION ensure_monthly_partitions(parent regclass, from_day date, to_day date)
 RETURNS integer LANGUAGE plpgsql AS $$
 DECLARE
@@ -100,8 +102,8 @@ def upgrade() -> None:
     op.create_index("ix_activities_deal_id", "activities", ["deal_id", "created_at", "id"])
     op.create_index("ix_activities_contact_id", "activities", ["contact_id", "created_at", "id"])
     op.execute(
-        "SELECT ensure_monthly_partitions("
-        "'activities', now()::date, (now() + interval '2 months')::date)"
+        "SELECT ensure_monthly_partitions('activities', (now() AT TIME ZONE 'UTC')::date,"
+        " ((now() + interval '2 months') AT TIME ZONE 'UTC')::date)"
     )
 
     op.create_table(
@@ -137,8 +139,8 @@ def upgrade() -> None:
     create_audit_log(partitioned=True)
     op.execute(
         "SELECT ensure_monthly_partitions('audit_log',"
-        " coalesce((SELECT min(occurred_at) FROM audit_log_old), now())::date,"
-        " (now() + interval '2 months')::date)"
+        " (coalesce((SELECT min(occurred_at) FROM audit_log_old), now()) AT TIME ZONE 'UTC')::date,"
+        " ((now() + interval '2 months') AT TIME ZONE 'UTC')::date)"
     )
     copy_audit_rows()
 

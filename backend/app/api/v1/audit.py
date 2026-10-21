@@ -1,10 +1,10 @@
 """Журнал изменений организации (раздел 3): только org_admin (audit:read)."""
 
 import uuid
-from datetime import datetime
 from typing import Annotated
 
 from fastapi import Depends, Query
+from pydantic import AwareDatetime
 
 from app.api.deps import get_audit_service, get_page
 from app.api.v1 import protected_router
@@ -24,8 +24,8 @@ async def list_audit(
     entity_id: Annotated[str | None, Query(max_length=64)] = None,
     actor_id: uuid.UUID | None = None,
     action: Annotated[str | None, Query(max_length=64, examples=["member.updated"])] = None,
-    from_: Annotated[datetime | None, Query(alias="from")] = None,
-    to: datetime | None = None,
+    from_: Annotated[AwareDatetime | None, Query(alias="from")] = None,
+    to: AwareDatetime | None = None,
     page: Page = Depends(get_page),
     access: Access = Depends(authorize),
     audit: AuditService = Depends(get_audit_service),

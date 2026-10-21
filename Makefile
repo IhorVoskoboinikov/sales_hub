@@ -5,7 +5,7 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports
+.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -42,6 +42,13 @@ keys:  ## создать приватный ключ JWT в backend/secrets/ (е
 
 migrate:  ## применить миграции в compose
 	$(COMPOSE) run --rm --build migrate
+
+SCALE ?= 1
+seed-big:  ## большие данные для замеров: 5 млн контактов, 20 млн активностей (SCALE=0.01 — 1%)
+	$(COMPOSE) exec -T postgres psql -U saleshub -d saleshub -v scale=$(SCALE) < backend/scripts/seed_big.sql
+
+seed-big-clean:  ## удалить данные seed-big (быстрее — make clean && make up)
+	$(COMPOSE) exec -T postgres psql -U saleshub -d saleshub < backend/scripts/seed_big_clean.sql
 
 refresh-reports:  ## обновить отчёты (materialized view deal_stats) в compose
 	$(COMPOSE) exec api python -m app.cli refresh-reports

@@ -2,6 +2,7 @@
 
 Изоляция (раздел 10): каждый тест работает во внешней транзакции, которая откатывается после
 него. Коммиты сервисов внутри теста становятся SAVEPOINT-ами — таблицы чистить не нужно.
+Задачи Celery выполняет настоящий воркер в потоке (фикстура celery_worker, маркер worker).
 """
 
 import uuid
@@ -17,6 +18,8 @@ import pytest
 import respx
 from alembic import command
 from alembic.config import Config
+from celery.contrib.testing.worker import start_worker
+from celery.worker import WorkController
 from fastapi import FastAPI
 from httpx import AsyncClient
 from redis.asyncio import Redis
@@ -42,6 +45,8 @@ from app.models import (
     User,
 )
 from app.uow import UnitOfWork
+from app.workers import runtime
+from app.workers.celery_app import celery_app
 from tests.conftest import POLICIES_DIR
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -72,6 +77,23 @@ def postgres_url() -> Iterator[str]:
 def redis_url() -> Iterator[str]:
     with RedisContainer(REDIS_IMAGE) as redis:
         yield f"redis://{redis.get_container_host_ip()}:{redis.get_exposed_port(6379)}/0"
+
+
+@pytest.fixture(scope="session")
+def celery_broker_url(redis_url: str) -> str:
+    # Как в compose: кэш и rate limit — db 0, очереди Celery — db 1 того же Redis.
+    return redis_url.removesuffix("/0") + "/1"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def celery_broker(celery_broker_url: str) -> None:
+    """Брокер celery_app — Redis контейнера, для всех integration-тестов, а не только с воркером.
+
+    celery_app читает адрес из get_settings() при импорте (localhost:6379), а не из фикстуры
+    settings: без этого .delay() из эндпоинта ушёл бы в чужой Redis на машине разработчика.
+    Autouse — чтобы адрес сменился до первой публикации: пул брокера запоминает адрес.
+    """
+    celery_app.conf.update(broker_url=celery_broker_url)
 
 
 @dataclass(frozen=True)
@@ -113,19 +135,64 @@ def opa_url() -> Iterator[str]:
 
 @pytest.fixture
 def settings(
-    settings: Settings, postgres_url: str, redis_url: str, mailpit: Mailpit, opa_url: str
+    settings: Settings,
+    postgres_url: str,
+    redis_url: str,
+    celery_broker_url: str,
+    mailpit: Mailpit,
+    opa_url: str,
 ) -> Settings:
     # Те же настройки, что у unit-тестов, но с адресами настоящих контейнеров.
     return settings.model_copy(
         update={
             "database_url": postgres_url,
             "redis_url": redis_url,
+            "celery_broker_url": celery_broker_url,
             "smtp_host": mailpit.smtp_host,
             "smtp_port": mailpit.smtp_port,
             "opa_url": opa_url,
             "nbu_url": NBU_URL,
         }
     )
+
+
+@pytest.fixture(scope="session")
+def celery_worker(
+    jwt_key_file: Path,
+    postgres_url: str,
+    redis_url: str,
+    celery_broker_url: str,
+    celery_broker: None,
+) -> Iterator[WorkController]:
+    """Настоящий воркер нашего celery_app в потоке этого процесса (раздел 10), один на запуск.
+
+    pool=solo: задачи выполняются в потоке воркера со своим event loop (runtime.py).
+    perform_ping_check=False: ping-задаче нужен result backend, а его нет. Тест ждёт результат
+    опросом — Redis, базы или очереди в памяти, — а не через AsyncResult.get().
+    """
+    runtime.configure(
+        Settings(
+            _env_file=None,
+            app_env="test",
+            database_url=postgres_url,
+            redis_url=redis_url,
+            celery_broker_url=celery_broker_url,
+            policies_dir=POLICIES_DIR,
+            jwt_private_key_file=jwt_key_file,
+            nbu_url=NBU_URL,
+        )
+    )
+    try:
+        with start_worker(
+            celery_app,
+            pool="solo",
+            perform_ping_check=False,
+            queues=["default", "bulk", "imports", "notifications"],
+        ) as worker:
+            yield worker
+    finally:
+        # Поток воркера остановлен — закрываем его пул Postgres, Redis и loop отсюда.
+        runtime.shutdown()
 
 
 @pytest.fixture

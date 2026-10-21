@@ -1333,7 +1333,7 @@ async def test_access(role, route, target, route_actions, client, ...):
 
 - `task_always_eager` не используем: тесты асинхронные, и eager-задача внутри async-теста вызвала бы `run_until_complete` при уже запущенном loop pytest (RuntimeError); к тому же eager пропускает сериализацию, заголовки, маршрутизацию и acks.
 - unit: сервисы и функции (`FxService.load_rates`, `ensure_partitions`, `finalize_if_complete`, правила получателей, ключи дедупа) вызываются напрямую; задача — тонкая обёртка, её отдельно не тестируем.
-- integration (маркеры `worker` и `committing`): сессионная фикстура `celery_worker` запускает **наше** приложение `celery.contrib.testing.worker.start_worker(celery_app, pool="solo", perform_ping_check=False)` (ping-задаче нужен result backend, а его нет) в отдельном потоке со своим event loop, брокер — db 1 Redis из testcontainers, `runtime.configure(settings)` с адресами контейнеров. Тест ждёт результат опросом базы; данные коммитятся, после теста — `TRUNCATE`. НБУ и Telegram подменяет respx — он работает и в потоке воркера.
+- integration (маркеры `worker` и `committing`): сессионная фикстура `celery_worker` запускает **наше** приложение `celery.contrib.testing.worker.start_worker(celery_app, pool="solo", perform_ping_check=False)` (ping-задаче нужен result backend, а его нет) в отдельном потоке со своим event loop, брокер — db 1 Redis из testcontainers (адрес брокера `celery_app` меняет сессионная autouse-фикстура `celery_broker` — для всех integration-тестов, не только с воркером: иначе `.delay()` из эндпоинта ушёл бы в `localhost:6379` из `get_settings()`), `runtime.configure(settings)` с адресами контейнеров; воркер слушает все четыре очереди, после сессии фикстура вызывает `runtime.shutdown()`. Тест ждёт результат опросом базы или Redis (тестовые задачи в самом модуле теста отдают его через `queue.Queue` — воркер в том же процессе); данные коммитятся, после теста — `TRUNCATE`. НБУ и Telegram подменяет respx — он работает и в потоке воркера.
 - Бот: `create_dispatcher(...)` и `dp.feed_update(bot, update)` без сети — обработчики возвращают метод (`return message.answer(...)`), тест сравнивает его текст.
 - Время: freezegun для расписания, напоминаний и дайджеста.
 
@@ -1363,10 +1363,10 @@ Tilt — не альтернатива Kubernetes, а dev-инструмент �
 | `mailpit` | 1025, 8025 | |
 | `rustfs` | 9000 (S3), 9001 (консоль `/rustfs/console/`) | S3-совместимое хранилище вместо MinIO: официальные образы MinIO больше не публикуются |
 | `worker` (этап 5) | — | `celery worker -Q default,notifications -c 4`: короткие задачи и письма; экземпляр один, поэтому лимит писем 50 в минуту общий |
-| `worker-bulk` (этап 5) | — | `-Q bulk,imports -c 4`: чанки и импорт — тяжёлая работа, её убивает chaos-тест, не трогая письма. Оба воркера в dev запускаются через `watchfiles` (у Celery нет `--reload`; на SIGINT он дорабатывает задачу), `stop_grace_period: 120s` — больше лимита чанка (90 с), healthcheck — `celery inspect ping -d <имя>@$HOSTNAME` (воркеры запускаются с `-n worker@%h` / `-n bulk@%h`; ping без адресата был бы зелёным, пока жив хоть один воркер). Четыре отдельных Deployment по очередям — на этапе 7 |
-| `beat` (этап 5) | — | `celery beat -s /tmp/celerybeat-schedule`, ровно один; правку расписания применяет `make restart-workers` |
+| `worker-bulk` (этап 5) | — | `-Q bulk,imports -c 4`: чанки и импорт — тяжёлая работа, её убивает chaos-тест, не трогая письма. Оба воркера в dev запускаются через `watchfiles` (у Celery нет `--reload`; на SIGINT он дорабатывает задачу; SIGTERM от `docker stop` watchfiles превращает в SIGINT, `--sigint-timeout 110`), смонтированы код и `policies/` (файл ролей), `stop_grace_period: 120s` — больше лимита чанка (90 с), healthcheck — `celery inspect ping -d <имя>@$HOSTNAME` (воркеры запускаются с `-n worker@%h` / `-n bulk@%h`; ping без адресата был бы зелёным, пока жив хоть один воркер). Четыре отдельных Deployment по очередям — на этапе 7 |
+| `beat` (этап 5) | — | `celery beat -s /tmp/celerybeat-schedule`, ровно один; правку расписания применяет `make restart-workers`. Без healthcheck: `make up --wait` для таких сервисов ждёт только запуска; что beat жив, видно по ключу `workers:heartbeat` |
 | `outbox-relay` (этап 5) | — | `python -m app.events.relay` через `watchfiles` |
-| `flower` (этап 5) | 5555 | образ `mher/flower:2.2.0`, без входа (порт только на localhost); в Kubernetes — basic auth из SealedSecret |
+| `flower` (этап 5) | 5555 | образ `mher/flower:2.2.0`, без входа (порт только на localhost), брокер — db 1, healthcheck — `/healthcheck`; в Kubernetes — basic auth из SealedSecret |
 | `telegram-bot` (этап 5) | — | `profiles: [telegram]`: `make up` его не запускает, `make bot` — запускает. Токен и имя бота — `TELEGRAM_BOT_TOKEN`, `TELEGRAM_BOT_USERNAME` в `deploy/compose/.env`; без токена бот завершается с понятной ошибкой, отправка в Telegram пропускается, а `POST /me/telegram/link` отвечает 503 `telegram.disabled` |
 
 Все порты открыты только на `127.0.0.1`: у pgAdmin нет входа, у Redis нет пароля, поэтому из сети стенд не виден. `make up` ждёт, пока все сервисы станут healthy (`--wait`), и печатает адреса UI. Для запуска API без Docker (`make run`, отладка в IDE) — `make infra`: только Postgres, Redis и Mailpit. `make up` и `make run` сначала вызывают `make keys`.
@@ -1716,7 +1716,7 @@ deploy/
 
 ### Этап 5 — Воркеры, bulk и Telegram-бот (разделы 6, 15, 16)
 
-- [ ] 5.1 Зависимости (Celery 5.6, раздел 1), `Resources` для API и воркеров, `celery_app` и маршруты очередей, event loop на процесс, `BaseTask` (что повторять), `request_id` в заголовках задачи; `schedule.py` с heartbeat; воркеры, beat и Flower в compose.
+- [x] 5.1 Зависимости (Celery 5.6, раздел 1), `Resources` для API и воркеров, `celery_app` и маршруты очередей, event loop на процесс, `BaseTask` (что повторять), `request_id` в заголовках задачи; `schedule.py` с heartbeat; воркеры, beat и Flower в compose.
 - [ ] 5.2 `outbox_events` с NOTIFY-триггером и процесс relay (`LISTEN/NOTIFY` + опрос), `outbox-relay` в compose.
 - [ ] 5.3 Письма через outbox → очередь `notifications` (`send_email`) + `sent_notifications`; удалить `Mailer` и `BackgroundMailer`, стирать токен после отправки.
 - [ ] 5.4 `bulk_jobs`, `bulk_job_chunks`, `plan` / `chunk` / `finalize_if_complete` (без chord), `TaskQueue`, `POST /bulk/reassign-owner` с `Idempotency-Key`, `move_team` при смене отдела, `GET /bulk-jobs/{id}` и SSE + строки в `routes.rego`, кейсы матрицы и тесты в `authz_test.rego` (множество пар «bulk не шире записи», sales\_rep без bulk и выгрузки, viewer выгружает, но не запускает bulk).
@@ -1985,9 +1985,14 @@ def get_runtime() -> Runtime:
     # сигналы. После fork ресурсы родителя не годятся — создаём свои.
     global _runtime
     if _runtime is None or _runtime.pid != os.getpid():
+        # Сначала ресурсы, потом loop: create бросает (нет файла ролей — его Resources.create
+        # читает первым, до пула и HTTP-клиента) — ничего не создано и не утекло.
+        # max_overflow=0: задача одна на процесс. С шага 5.3 — ещё for_worker=True (EmailSender и
+        # Telegram — только у воркеров); до него письма шлёт и API, поэтому EmailSender есть у всех.
+        resources = Resources.create(settings, pool_size=2, max_overflow=0)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        _runtime = Runtime(os.getpid(), loop, Resources.create(settings, for_worker=True, pool_size=2))
+        _runtime = Runtime(os.getpid(), loop, resources)
     return _runtime
 
 @worker_process_shutdown.connect
@@ -2013,7 +2018,7 @@ def chunk(self, job_id: str, no: int) -> None:
     run_async(bulk_service().run_chunk(UUID(job_id), no))   # своя сессия и UoW
 ```
 
-`Resources` собирает и lifespan API (кладёт в `app.state` те же атрибуты, что раньше, поэтому `api/deps.py` не меняется), и воркер, и бот — с одними таймаутами; отличаются размер пула и то, что `EmailSender` и клиент Telegram создаются только у воркеров. Бюджет соединений к Postgres: API 2 пода × (5 + 10 overflow) + воркеры 10 процессов × 2 + relay 2 + бот 5 ≈ 57 при `max_connections = 100`. При росте — PgBouncer в режиме transaction.
+`Resources` собирает и lifespan API (кладёт в `app.state` те же атрибуты, что раньше, поэтому `api/deps.py` не меняется), и воркер, и бот — с одними таймаутами; отличаются размер пула и то, что `EmailSender` и клиент Telegram создаются только у воркеров. Файл ролей API читает при сборке приложения (нет `data.yaml` — `create_app` падает сразу) и передаёт в `Resources.create(settings, roles=...)`; воркер и бот читают его в `create`. Воркеры закрывают ресурсы по `worker_process_shutdown` (`runtime.shutdown()`), тестовая фикстура — сама после остановки потока воркера. Бюджет соединений к Postgres: API 2 пода × (5 + 10 overflow) + воркеры 10 процессов × 2 + relay 2 + бот 5 ≈ 57 при `max_connections = 100`. При росте — PgBouncer в режиме transaction.
 
 ### Настройки надёжности
 
@@ -2033,7 +2038,7 @@ def chunk(self, job_id: str, no: int) -> None:
 | Время | `timezone="Europe/Kyiv"`, `enable_utc=True` | расписание beat — по Киеву, данные — в UTC |
 | Остановка | `stop_grace_period: 120s` (в k8s — `terminationGracePeriodSeconds: 120`) | больше лимита чанка: SIGTERM даёт warm shutdown, невзятые сообщения сразу возвращаются в очередь |
 
-**Что повторять.** У asyncpg ошибки Postgres приходят как `sqlalchemy.exc.DBAPIError`, а не `OperationalError`, поэтому повтор решается по SQLSTATE, а не по классу: класс `08` (соединение), `40001` (serialization failure), `40P01` (deadlock — два job разных видов могут обновлять одни строки в разном порядке), `57P01`–`57P03` (Postgres перезапускается), `53300` (нет свободных соединений); плюс `InterfaceError`, `OSError` (отказ подключения), `httpx.TransportError`, `aiosmtplib.SMTPException`, `redis.exceptions.ConnectionError` и `ServiceUnavailable` с кодами `unavailable` и `fx.unavailable`. `authz.policy_out_of_sync` — ошибка конфигурации, её не повторяем. Остальные `AppError` (404 / 409 / 422) — сразу провал. Unit-тест: настоящий deadlock двух сессий распознаётся как повторяемый.
+**Что повторять.** У asyncpg ошибки Postgres приходят как `sqlalchemy.exc.DBAPIError`, а не `OperationalError`, поэтому повтор решается по SQLSTATE, а не по классу: класс `08` (соединение), `40001` (serialization failure), `40P01` (deadlock — два job разных видов могут обновлять одни строки в разном порядке), `57P01`–`57P03` (Postgres перезапускается), `53300` (нет свободных соединений); плюс `InterfaceError`; из сети — встроенные `ConnectionError` и `TimeoutError` и `socket.gaierror` (имя хоста не разрешилось — сервис в compose ещё не поднялся), а не весь `OSError`: его наследники `FileNotFoundError`, `PermissionError` и `jinja2.TemplateNotFound` — ошибка в коде или настройке; `httpx.TransportError`; `redis.exceptions.ConnectionError` и `redis.exceptions.TimeoutError` (у redis-py свои классы, не встроенные; таймаут подключения — тоже он); SMTP — обрыв и таймаут (наследники `ConnectionError` и `TimeoutError`) и ответы 4xx, а 5xx (адрес отклонён, нет авторизации, `SMTPRecipientsRefused`) — нет; `ServiceUnavailable` с кодами `unavailable` и `fx.unavailable`. `authz.policy_out_of_sync` — ошибка конфигурации, её не повторяем. Остальные `AppError` (404 / 409 / 422) — сразу провал: в лог — warning `task_rejected` с кодом, а `BaseTask.throws = (AppError,)` — и Celery пишет провал как ожидаемый, строкой INFO без traceback (сигнал `task_failure` приходит всё равно). Перед повтором — warning `task_retry` с паузой; на последней попытке повтора уже не будет — вместо него error `task_retries_exhausted`. Unit-тесты — на поддельных `DBAPIError` с `orig.sqlstate`; integration-тест: настоящий deadlock двух соединений (`pg_advisory_xact_lock` крест-накрест) распознаётся как повторяемый.
 
 ### Идемпотентность и защита от дублей
 

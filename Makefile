@@ -5,12 +5,12 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean explain experiments
+.PHONY: help up infra down clean ps logs logs-workers restart-workers urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean explain experiments
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
 
-up: keys  ## поднять стенд: API, Postgres, Redis и все UI (ждёт, пока всё станет healthy)
+up: keys  ## поднять стенд: API, воркеры, Postgres, Redis и все UI (ждёт, пока всё станет healthy)
 	$(COMPOSE) up -d --build --wait
 	@$(MAKE) --no-print-directory urls
 
@@ -29,11 +29,18 @@ ps:  ## статус контейнеров
 logs:  ## логи API в реальном времени
 	$(COMPOSE) logs -f api
 
+logs-workers:  ## логи воркеров и beat в реальном времени
+	$(COMPOSE) logs -f worker worker-bulk beat
+
+restart-workers:  ## перезапустить воркеры и beat (beat перечитывает расписание только при старте)
+	$(COMPOSE) restart worker worker-bulk beat
+
 urls:  ## адреса веб-интерфейсов
 	@echo "Swagger      http://localhost:8000/docs   супер-админ admin@example.com / admin-password"
 	@echo "pgAdmin      http://localhost:5050"
 	@echo "RedisInsight http://localhost:5540"
 	@echo "Mailpit      http://localhost:8025"
+	@echo "Flower       http://localhost:5555   задачи и воркеры Celery"
 	@echo "OPA          http://localhost:8181/v1/data/saleshub/roles"
 	@echo "RustFS (S3)  http://localhost:9001/rustfs/console/   логин saleshub / saleshub-secret"
 

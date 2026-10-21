@@ -8,10 +8,13 @@ from sqlalchemy.ext.asyncio import (
 )
 
 
-def create_engine(database_url: str) -> AsyncEngine:
+def create_engine(database_url: str, *, pool_size: int = 5, max_overflow: int = 10) -> AsyncEngine:
     # pool_pre_ping: перед выдачей соединения из пула проверить, что оно живо
     # (после рестарта Postgres старые соединения в пуле мертвы).
-    return create_async_engine(database_url, pool_pre_ping=True)
+    # Размер пула: у API 5 + 10 сверху, у процесса воркера — 2 (раздел 15, бюджет соединений).
+    return create_async_engine(
+        database_url, pool_pre_ping=True, pool_size=pool_size, max_overflow=max_overflow
+    )
 
 
 def create_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

@@ -8,6 +8,7 @@ x-app-env: &app-env
   APP_ENV: dev
   DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@postgres:5432/saleshub
   REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1  # очереди Celery — отдельно от кэша (раздел 15)
   SMTP_HOST: mailpit  # письма видно на localhost:8025
   OPA_URL: http://opa:8181
   POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA
@@ -97,6 +98,76 @@ services:
       timeout: 5s
       retries: 6
       start_period: 10s
+
+  # --- Воркеры Celery (раздел 15). Код смонтирован, как у api. У Celery нет --reload, поэтому
+  # воркеры перезапускает watchfiles: при сохранении .py он шлёт SIGINT, Celery дорабатывает
+  # текущую задачу (warm shutdown) и стартует заново. SIGTERM от docker stop watchfiles
+  # превращает в тот же SIGINT; stop_grace_period больше лимита чанка (90 с).
+  # healthcheck — ping именно этого воркера: ping без адресата был бы зелёным, пока жив хоть один.
+
+  worker:  # короткие задачи и письма; экземпляр один — лимит писем 50 в минуту общий
+    image: saleshub-api:dev
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "110",
+              "celery -A app.workers.celery_app:celery_app worker -Q default,notifications -c 4 -n worker@%h",
+              "/app/app"]
+    volumes: &worker-volumes
+      - ../../backend/app:/app/app:ro
+      - ../../policies:/policies:ro  # файл ролей data.yaml: сервисы проверяют уровень доступа
+    environment: *app-env
+    depends_on: &worker-depends-on
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping -d worker@$$HOSTNAME"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+      start_interval: 5s
+
+  worker-bulk:  # чанки bulk и импорт: тяжёлая работа, её убивает chaos-тест, не трогая письма
+    image: saleshub-api:dev
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "110",
+              "celery -A app.workers.celery_app:celery_app worker -Q bulk,imports -c 4 -n bulk@%h",
+              "/app/app"]
+    volumes: *worker-volumes
+    environment: *app-env
+    depends_on: *worker-depends-on
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping -d bulk@$$HOSTNAME"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+      start_interval: 5s
+
+  # Расписание (app/workers/schedule.py), ровно один: две копии продублируют задачи.
+  # Без watchfiles: правку расписания применяет make restart-workers. Состояние — в /tmp.
+  beat:
+    image: saleshub-api:dev
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "beat",
+              "-s", "/tmp/celerybeat-schedule"]
+    volumes: *worker-volumes
+    environment: *app-env
+    depends_on: *worker-depends-on
+
+  # Мониторинг задач по событиям воркеров. Без входа — порт только на localhost.
+  flower:
+    image: mher/flower:2.2.0
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      FLOWER_PORT: "5555"
+    ports: ["127.0.0.1:5555:5555"]
+    depends_on:
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5555/healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   # Решения о доступе (раздел 5): «может ли роль вызвать эндпоинт». --watch — правка .rego и
   # data.yaml применяется сразу. Тесты политик (*_test.rego) серверу не нужны.

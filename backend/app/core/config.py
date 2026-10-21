@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://saleshub:saleshub@localhost:5432/saleshub"
     redis_url: str = "redis://localhost:6379/0"
 
+    # --- Воркеры (раздел 15): брокер — db 1 того же Redis, чтобы FLUSHDB кэша не стёр задачи.
+    celery_broker_url: str = "redis://localhost:6379/1"
+    # Секунды. Больше самой долгой задачи (запуск импорта — 12 минут), иначе Redis выдаст
+    # её повторно, пока она ещё выполняется.
+    celery_visibility_timeout: int = 1200
+
     # --- Вход по почте (раздел 4)
     # Путь относительно backend/ (в контейнере — /app). В dev файл создаёт make keys.
     jwt_private_key_file: Path = Path("secrets/jwt_private.pem")

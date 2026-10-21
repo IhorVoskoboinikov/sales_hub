@@ -191,12 +191,33 @@ ROLLBACK;
 
 \echo
 \echo ======== E10. Отчёт по ответственным: materialized view против прямого запроса
-\echo --- из deal_stats
-EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) SELECT owner_id, sum(deals), sum(amount_usd) FROM deal_stats
-WHERE org_id = :'org' AND status = 'open' GROUP BY owner_id;
-\echo --- прямо по deals
-EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) SELECT owner_id, count(*), sum(amount_usd) FROM deals
-WHERE org_id = :'org' AND status = 'open' AND deleted_at IS NULL GROUP BY owner_id;
+\echo --- из deal_stats — тот же запрос, что строит ReportRepository.managers_query
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT s.owner_id, u.email,
+       coalesce(sum(s.deals) FILTER (WHERE s.status = 'open'), 0),
+       coalesce(sum(s.amount_usd) FILTER (WHERE s.status = 'open'), 0),
+       coalesce(sum(s.deals) FILTER (WHERE s.status = 'won' AND s.month >= date_trunc('year', now())::date), 0),
+       coalesce(sum(s.amount_usd) FILTER (WHERE s.status = 'won' AND s.month >= date_trunc('year', now())::date), 0),
+       coalesce(sum(s.deals) FILTER (WHERE s.status = 'lost' AND s.month >= date_trunc('year', now())::date), 0),
+       coalesce(sum(s.amount_usd) FILTER (WHERE s.status = 'lost' AND s.month >= date_trunc('year', now())::date), 0)
+FROM deal_stats s JOIN users u ON u.id = s.owner_id
+WHERE s.org_id = :'org'
+GROUP BY s.owner_id, u.email ORDER BY u.email;
+\echo --- то же прямо по deals
+EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+SELECT d.owner_id, u.email,
+       count(*) FILTER (WHERE d.status = 'open'),
+       coalesce(sum(d.amount_usd) FILTER (WHERE d.status = 'open'), 0),
+       count(*) FILTER (WHERE d.status = 'won' AND d.closed_at >= date_trunc('year', now())),
+       coalesce(sum(d.amount_usd) FILTER (WHERE d.status = 'won' AND d.closed_at >= date_trunc('year', now())), 0),
+       count(*) FILTER (WHERE d.status = 'lost' AND d.closed_at >= date_trunc('year', now())),
+       coalesce(sum(d.amount_usd) FILTER (WHERE d.status = 'lost' AND d.closed_at >= date_trunc('year', now())), 0)
+FROM deals d JOIN users u ON u.id = d.owner_id
+WHERE d.org_id = :'org' AND d.deleted_at IS NULL
+GROUP BY d.owner_id, u.email ORDER BY u.email;
+SELECT count(*) AS mv_rows FROM deal_stats WHERE org_id = :'org' \gset
+SELECT count(*) AS org_deals FROM deals WHERE org_id = :'org' AND deleted_at IS NULL \gset
+\echo строк агрегата организации: :mv_rows, её живых сделок: :org_deals
 \echo --- сколько стоит обновить view
 \timing on
 REFRESH MATERIALIZED VIEW CONCURRENTLY deal_stats;

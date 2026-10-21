@@ -5,6 +5,7 @@ config.attributes["database_url"], чтобы не трогать перемен
 """
 
 import asyncio
+import re
 from logging.config import fileConfig
 
 from alembic import context
@@ -21,6 +22,16 @@ if config.config_file_name is not None and config.attributes.get("configure_logg
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata
+
+# Месячные партиции (activities_p2026_10, audit_log_p2026_10) создаёт функция
+# ensure_monthly_partitions, а не миграции: в моделях их нет, и сравнивать их не нужно.
+PARTITION = re.compile(r"_p\d{4}_\d{2}$")
+
+
+def include_name(name: str | None, type_: str, parent_names: object) -> bool:
+    return not (type_ == "table" and name is not None and PARTITION.search(name))
+
+
 database_url: str = config.attributes.get("database_url") or get_settings().database_url
 
 
@@ -37,7 +48,9 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection, target_metadata=target_metadata, include_name=include_name
+    )
     with context.begin_transaction():
         context.run_migrations()
 

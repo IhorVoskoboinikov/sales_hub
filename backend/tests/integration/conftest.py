@@ -7,7 +7,7 @@
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
@@ -31,6 +31,7 @@ from app.api.deps import get_session
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.models import (
+    Activity,
     Company,
     Contact,
     Deal,
@@ -380,3 +381,19 @@ async def nbu(redis_url: str) -> AsyncIterator[FakeNbu]:
         router.get(NBU_URL).mock(side_effect=fake.respond)
         router.route().pass_through()  # OPA, Mailpit — настоящие
         yield fake
+
+
+@pytest.fixture
+def make_activity(uow: UnitOfWork) -> MakeRecord:
+    """Открытая задача со сроком через день, которую ведёт owner."""
+
+    async def make(owner: User, **fields: Any) -> Activity:
+        fields.setdefault("type", "task")
+        fields.setdefault("subject", "Подзвонити")
+        fields.setdefault("due_at", datetime.now(UTC) + timedelta(days=1))
+        activity = Activity(org_id=owner.org_id, team_id=owner.team_id, owner_id=owner.id, **fields)
+        uow.activities.add(activity)
+        await uow.commit()
+        return activity
+
+    return make

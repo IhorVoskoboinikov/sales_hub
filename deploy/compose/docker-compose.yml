@@ -40,11 +40,12 @@ services:
       timeout: 3s
       retries: 10
 
-  # Одноразовый: применяет миграции и завершается. api стартует только после него.
+  # Одноразовый: применяет миграции, готовит месячные партиции и завершается.
+  # api стартует только после него.
   migrate:
     build: ../../backend
     image: saleshub-api:dev
-    command: ["alembic", "upgrade", "head"]
+    command: ["sh", "-c", "alembic upgrade head && python -m app.cli ensure-partitions"]
     environment: *app-env
     depends_on:
       postgres: {condition: service_healthy}

@@ -1,6 +1,7 @@
 """Все модели импортируются здесь — так Alembic видит их через Base.metadata."""
 
 from app.db.base import Base
+from app.models.activities import Activity, ActivityType, Note
 from app.models.audit import AuditEntry
 from app.models.crm import Company, Contact, ContactStatus
 from app.models.deals import Deal, DealStatus, Pipeline, PipelineStage
@@ -12,6 +13,8 @@ from app.models.user import ROLES_WITH_TEAM, Role, User
 
 __all__ = [
     "ROLES_WITH_TEAM",
+    "Activity",
+    "ActivityType",
     "AuditEntry",
     "Base",
     "Company",
@@ -22,6 +25,7 @@ __all__ = [
     "EmailToken",
     "EmailTokenPurpose",
     "FxRate",
+    "Note",
     "Organization",
     "Pipeline",
     "PipelineStage",

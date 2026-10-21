@@ -3,6 +3,7 @@
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Company, Contact, Deal
+from app.repositories.activities import ActivityRepository, AuditQueries, NoteRepository
 from app.repositories.audit import AuditRepository
 from app.repositories.contacts import CompanyRepository, ContactRepository
 from app.repositories.crm import LiveRecords
@@ -28,6 +29,9 @@ class UnitOfWork:
         self.pipelines = PipelineRepository(session)
         self.deals = DealRepository(session)
         self.fx_rates = FxRateRepository(session)
+        self.activities = ActivityRepository(session)
+        self.notes = NoteRepository(session)
+        self.audit_log = AuditQueries(session)
         self.live_records = LiveRecords(session, (Company, Contact, Deal))
 
     async def flush(self) -> None:

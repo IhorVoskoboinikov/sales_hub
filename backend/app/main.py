@@ -9,7 +9,9 @@ from redis.asyncio import Redis
 
 from app.api import health, well_known
 from app.api.v1 import (  # noqa: F401 — модули с эндпоинтами регистрируют маршруты
+    activities,
     admin_router,
+    audit,
     auth,
     companies,
     contacts,

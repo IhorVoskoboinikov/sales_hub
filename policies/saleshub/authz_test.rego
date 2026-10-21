@@ -100,6 +100,24 @@ test_sales_rep_can_edit_deal if {
 	not authz.allow with input as req(viewer, "PATCH", "/api/v1/deals/{deal_id}")
 }
 
+test_activities_and_notes if {
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		authz.allow with input as req(user, "GET", "/api/v1/activities")
+		authz.allow with input as req(user, "GET", "/api/v1/contacts/{contact_id}/notes")
+	}
+	authz.allow with input as req(sales_rep, "DELETE", "/api/v1/activities/{activity_id}")
+	authz.allow with input as req(sales_rep, "POST", "/api/v1/contacts/{contact_id}/notes")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/activities")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/contacts/{contact_id}/notes")
+}
+
+test_only_org_admin_reads_audit if {
+	authz.allow with input as req(org_admin, "GET", "/api/v1/audit")
+	every user in [team_lead, sales_rep, viewer, super_admin] {
+		not authz.allow with input as req(user, "GET", "/api/v1/audit")
+	}
+}
+
 # У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
 test_super_admin_only_admin_routes if {
 	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/orgs")

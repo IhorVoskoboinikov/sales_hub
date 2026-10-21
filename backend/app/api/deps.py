@@ -21,6 +21,7 @@ from app.errors import Unauthorized
 from app.repositories.pagination import DEFAULT_LIMIT, MAX_LIMIT, Page
 from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
+from app.services.activities import ActivityService, AuditService, NoteService
 from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.contacts import CompanyService, ContactService
 from app.services.deals import DealService, PipelineService
@@ -172,6 +173,22 @@ def get_deal_service(
     fx: FxService = Depends(get_fx_service),
 ) -> DealService:
     return DealService(uow, roles, fx)
+
+
+def get_activity_service(
+    uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
+) -> ActivityService:
+    return ActivityService(uow, roles)
+
+
+def get_note_service(
+    uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
+) -> NoteService:
+    return NoteService(uow, roles)
+
+
+def get_audit_service(uow: UnitOfWork = Depends(get_uow)) -> AuditService:
+    return AuditService(uow)
 
 
 def get_page(

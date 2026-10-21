@@ -2,6 +2,7 @@
 
 generate-jwt-key   создать приватный RS256-ключ для JWT (make keys)
 create-superadmin  создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD
+ensure-partitions  месячные партиции activities и audit_log на 2 месяца вперёд
 """
 
 import argparse
@@ -10,6 +11,7 @@ import sys
 from pathlib import Path
 
 from pydantic import EmailStr, TypeAdapter, ValidationError
+from sqlalchemy import text
 
 from app.core.config import Settings, get_settings
 from app.core.jwt import generate_private_key, private_key_to_pem
@@ -61,6 +63,31 @@ async def create_superadmin_command(settings: Settings) -> int:
     return 0
 
 
+# Партиционированные таблицы и на сколько месяцев вперёд готовить партиции (раздел 9).
+PARTITIONED = ("activities", "audit_log")
+MONTHS_AHEAD = 2
+
+
+async def ensure_partitions_command(settings: Settings) -> int:
+    """Идемпотентно: существующие партиции пропускаются. Запускается после миграций (сервис
+    migrate), с этапа 5 — ещё и задачей beat раз в месяц."""
+    engine = create_engine(settings.database_url)
+    try:
+        async with engine.begin() as connection:
+            for table in PARTITIONED:
+                created = await connection.scalar(
+                    text(
+                        "SELECT ensure_monthly_partitions(CAST(:table AS regclass), CAST(now() AS"
+                        " date), CAST(now() + make_interval(months => :ahead) AS date))"
+                    ),
+                    {"table": table, "ahead": MONTHS_AHEAD},
+                )
+                print(f"{table}: создано партиций — {created}")
+    finally:
+        await engine.dispose()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -70,12 +97,15 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser(
         "create-superadmin", help="создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD"
     )
+    commands.add_parser("ensure-partitions", help="месячные партиции на 2 месяца вперёд")
 
     args = parser.parse_args(argv)
     settings = get_settings()
     if args.command == "generate-jwt-key":
         generate_jwt_key(args.out or settings.jwt_private_key_file)
         return 0
+    if args.command == "ensure-partitions":
+        return asyncio.run(ensure_partitions_command(settings))
     return asyncio.run(create_superadmin_command(settings))
 
 

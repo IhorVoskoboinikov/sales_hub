@@ -36,4 +36,12 @@ actions := {
 	"GET /api/v1/deals/{deal_id}": "deal:read",
 	"POST /api/v1/deals": "deal:write",
 	"PATCH /api/v1/deals/{deal_id}": "deal:write",
+	# --- этап 4: активности, заметки, журнал
+	"GET /api/v1/activities": "activity:read",
+	"POST /api/v1/activities": "activity:write",
+	"PATCH /api/v1/activities/{activity_id}": "activity:write",
+	"DELETE /api/v1/activities/{activity_id}": "activity:write",
+	"GET /api/v1/contacts/{contact_id}/notes": "contact:read",
+	"POST /api/v1/contacts/{contact_id}/notes": "contact:write",
+	"GET /api/v1/audit": "audit:read",
 }

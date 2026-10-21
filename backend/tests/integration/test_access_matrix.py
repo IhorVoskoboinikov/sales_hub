@@ -159,6 +159,25 @@ CASES: dict[str, Case] = {
     "PATCH /api/v1/deals/{deal_id}": Case(
         "deal:write", lambda w, r: {"version": 1, "title": "Нова"}, CRM_TARGETS, "deal:read"
     ),
+    "GET /api/v1/activities": Case("activity:read", lists="activity"),
+    "POST /api/v1/activities": Case(
+        "activity:write",
+        lambda w, r: {"type": "call", "subject": "Дзвінок", **w.owner_for(r)},
+    ),
+    "PATCH /api/v1/activities/{activity_id}": Case(
+        "activity:write", lambda w, r: {"subject": "Інша тема"}, CRM_TARGETS, "activity:read"
+    ),
+    "DELETE /api/v1/activities/{activity_id}": Case(
+        "activity:write", None, CRM_TARGETS, "activity:read"
+    ),
+    "GET /api/v1/contacts/{contact_id}/notes": Case("contact:read", None, CRM_TARGETS),
+    "POST /api/v1/contacts/{contact_id}/notes": Case(
+        "contact:write",
+        lambda w, r: {"body": "Зателефонувати в понеділок"},
+        CRM_TARGETS,
+        "contact:read",
+    ),
+    "GET /api/v1/audit": Case("audit:read"),
 }
 
 
@@ -223,6 +242,7 @@ async def build_world(
     make_contact: MakeRecord,
     make_pipeline: MakeRecord,
     make_deal: MakeRecord,
+    make_activity: MakeRecord,
 ) -> World:
     mine, other = await make_org(), await make_org()
     users = {role: await member(make_user, mine, role) for role in ROLES[:4]}
@@ -258,6 +278,7 @@ async def build_world(
         ).id
         for t, o in owners.items()
     }
+    world.ids["activity"] = {t: (await make_activity(o)).id for t, o in owners.items()}
     return world
 
 
@@ -273,6 +294,7 @@ def url_for(route: str, target: str | None, world: World) -> str:
         "{company_id}": lambda: str(world.ids["company"][target]),
         "{contact_id}": lambda: str(world.ids["contact"][target]),
         "{deal_id}": lambda: str(world.ids["deal"][target]),
+        "{activity_id}": lambda: str(world.ids["activity"][target]),
         "{pipeline_id}": lambda: str(world.ids["pipeline"][target]),
     }
     for placeholder, value in replacements.items():
@@ -298,11 +320,19 @@ async def test_access(
     make_contact: MakeRecord,
     make_pipeline: MakeRecord,
     make_deal: MakeRecord,
+    make_activity: MakeRecord,
     uow: UnitOfWork,
     settings: Settings,
 ) -> None:
     world = await build_world(
-        make_org, make_user, uow, make_company, make_contact, make_pipeline, make_deal
+        make_org,
+        make_user,
+        uow,
+        make_company,
+        make_contact,
+        make_pipeline,
+        make_deal,
+        make_activity,
     )
     user = world.users[role]
     # Access-токен выпускаем напрямую: логин с argon2 на сотни кейсов был бы медленным.

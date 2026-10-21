@@ -7,7 +7,8 @@
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
@@ -26,7 +27,16 @@ from testcontainers.core.wait_strategies import HttpWaitStrategy
 from app.api.deps import get_session
 from app.core.config import Settings
 from app.core.security import hash_password
-from app.models import Company, Contact, Organization, Team, User
+from app.models import (
+    Company,
+    Contact,
+    Deal,
+    Organization,
+    Pipeline,
+    PipelineStage,
+    Team,
+    User,
+)
 from app.uow import UnitOfWork
 from tests.conftest import POLICIES_DIR
 
@@ -281,5 +291,51 @@ def make_company(uow: UnitOfWork) -> MakeRecord:
         uow.companies.add(company)
         await uow.commit()
         return company
+
+    return make
+
+
+@pytest.fixture
+def make_pipeline(uow: UnitOfWork) -> Callable[..., Awaitable[Pipeline]]:
+    """Воронка организации с этапами «Новий» и «Пропозиція»."""
+
+    async def make(org_id: uuid.UUID, name: str | None = None) -> Pipeline:
+        pipeline = Pipeline(
+            org_id=org_id,
+            name=name or f"Продажі {uuid.uuid4().hex[:6]}",
+            stages=[
+                PipelineStage(name="Новий", position=0, probability=10),
+                PipelineStage(name="Пропозиція", position=1, probability=50),
+            ],
+        )
+        uow.pipelines.add(pipeline)
+        await uow.commit()
+        return pipeline
+
+    return make
+
+
+@pytest.fixture
+def make_deal(uow: UnitOfWork) -> MakeRecord:
+    """Открытая сделка на 1000 USD на первом этапе воронки (stage)."""
+
+    async def make(owner: User, stage: PipelineStage, **fields: Any) -> Deal:
+        fields.setdefault("title", f"Угода {uuid.uuid4().hex[:6]}")
+        fields.setdefault("amount_usd", Decimal("1000.00"))
+        deal = Deal(
+            org_id=owner.org_id,
+            team_id=owner.team_id,
+            owner_id=owner.id,
+            pipeline_id=stage.pipeline_id,
+            stage_id=stage.id,
+            amount_original=fields["amount_usd"],
+            currency_original="USD",
+            fx_rate=Decimal(1),
+            fx_date=date.today(),
+            **fields,
+        )
+        uow.deals.add(deal)
+        await uow.commit()
+        return deal
 
     return make

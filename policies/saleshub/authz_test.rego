@@ -80,6 +80,26 @@ test_contacts_read_by_all_written_by_sellers if {
 	not authz.allow with input as req(super_admin, "GET", "/api/v1/contacts")
 }
 
+test_pipelines_read_by_all_managed_by_org_admin if {
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		authz.allow with input as req(user, "GET", "/api/v1/pipelines")
+		authz.allow with input as req(user, "GET", "/api/v1/deals/kanban")
+	}
+	authz.allow with input as req(org_admin, "PATCH", "/api/v1/pipelines/{pipeline_id}")
+	every user in [team_lead, sales_rep, viewer] {
+		not authz.allow with input as req(user, "POST", "/api/v1/pipelines")
+	}
+}
+
+test_sales_rep_can_edit_deal if {
+	d := authz.decision with input as req(sales_rep, "PATCH", "/api/v1/deals/{deal_id}")
+	d.allow
+	d.action == "deal:write"
+	authz.allow with input as req(sales_rep, "POST", "/api/v1/deals")
+	authz.allow with input as req(viewer, "GET", "/api/v1/deals/{deal_id}")
+	not authz.allow with input as req(viewer, "PATCH", "/api/v1/deals/{deal_id}")
+}
+
 # У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
 test_super_admin_only_admin_routes if {
 	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/orgs")

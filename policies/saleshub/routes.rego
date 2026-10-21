@@ -27,4 +27,13 @@ actions := {
 	"GET /api/v1/contacts/{contact_id}": "contact:read",
 	"POST /api/v1/contacts": "contact:write",
 	"PATCH /api/v1/contacts/{contact_id}": "contact:write",
+	# --- этап 4: воронки и сделки
+	"GET /api/v1/pipelines": "org:read",
+	"POST /api/v1/pipelines": "org:manage",
+	"PATCH /api/v1/pipelines/{pipeline_id}": "org:manage",
+	"GET /api/v1/deals": "deal:read",
+	"GET /api/v1/deals/kanban": "deal:read",
+	"GET /api/v1/deals/{deal_id}": "deal:read",
+	"POST /api/v1/deals": "deal:write",
+	"PATCH /api/v1/deals/{deal_id}": "deal:write",
 }

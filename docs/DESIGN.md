@@ -1612,7 +1612,7 @@ deploy/
 
 - [x] 4.1 `companies` и `contacts` с мягким удалением и `version`; общий фильтр `deleted_at IS NULL` в репозитории; keyset-пагинация; правила ответственного (`owner.*`) и `member.has_records`, `team.has_records`.
 - [x] 4.2 CRUD компаний и контактов с `Access` (`list`, `get_visible_or_404`, `ensure_allowed`), `?q=`, `?tag=`, ошибки `contact.duplicate_email`, `version.conflict` + строки в `routes.rego`, тесты в `authz_test.rego`, тест-матрица с целями own / same\_team / same\_org / other\_org.
-- [ ] 4.3 Воронки, этапы, `deals` (пока только USD), эндпоинт канбана + строки в `routes.rego` и кейсы матрицы.
+- [x] 4.3 Воронки, этапы, `deals` (пока только USD), эндпоинт канбана + строки в `routes.rego` и кейсы матрицы.
 - [ ] 4.4 `fx_rates`, `FxService` (НБУ, кэш, резерв), суммы сделок в любой валюте, параметр `?currency=`.
 - [ ] 4.5 `activities` с партициями по месяцам, `ensure_monthly_partitions`, `notes`; `audit_log` на партициях и `GET /audit` + строки в `routes.rego`.
 - [ ] 4.6 Корзина: удаление, восстановление, список удалённых + строки в `routes.rego`.

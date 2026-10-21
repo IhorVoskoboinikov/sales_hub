@@ -1,3 +1,4 @@
+import json
 import uuid
 from typing import Any
 
@@ -30,7 +31,8 @@ class AuditRepository:
                 action=action,
                 entity_type=entity_type,
                 entity_id=str(entity_id),
-                changes=changes or {},
+                # Decimal, date, UUID — в строки: jsonb принимает только JSON-типы.
+                changes=json.loads(json.dumps(changes or {}, default=str)),
                 request_id=get_request_id(),
             )
         )

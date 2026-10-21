@@ -23,6 +23,7 @@ from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.contacts import CompanyService, ContactService
+from app.services.deals import DealService, PipelineService
 from app.services.invites import InviteService
 from app.services.members import MemberService
 from app.services.organizations import OrganizationService, TeamService
@@ -152,6 +153,16 @@ def get_contact_service(
     uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
 ) -> ContactService:
     return ContactService(uow, roles)
+
+
+def get_pipeline_service(uow: UnitOfWork = Depends(get_uow)) -> PipelineService:
+    return PipelineService(uow)
+
+
+def get_deal_service(
+    uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
+) -> DealService:
+    return DealService(uow, roles)
 
 
 def get_page(

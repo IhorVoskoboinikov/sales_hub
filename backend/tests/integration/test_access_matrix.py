@@ -81,10 +81,21 @@ class Case:
     targets: tuple[str | None, ...] = (None,)
     read: str | None = None
     lists: str | None = None  # сущность списка: проверить, что в нём ровно записи уровня
+    query: Body | None = None  # query-параметры (канбану нужен ?pipeline_id=)
+    org_object: bool = False  # объект организации (воронка): чужая — 404, своя видна всем
 
 
 def company_body(world: World, role: str) -> dict[str, Any]:
     return {"name": unique("Acme"), **world.owner_for(role)}
+
+
+def deal_body(world: World, role: str) -> dict[str, Any]:
+    return {
+        "title": unique("Угода"),
+        "amount": "100.00",
+        "stage_id": world.ids["stage"]["same_org"],
+        **world.owner_for(role),
+    }
 
 
 def contact_body(world: World, role: str) -> dict[str, Any]:
@@ -128,6 +139,25 @@ CASES: dict[str, Case] = {
     "POST /api/v1/contacts": Case("contact:write", contact_body),
     "PATCH /api/v1/contacts/{contact_id}": Case(
         "contact:write", lambda w, r: {"version": 1, "phone": "+380"}, CRM_TARGETS, "contact:read"
+    ),
+    "GET /api/v1/pipelines": Case("org:read"),
+    "POST /api/v1/pipelines": Case(
+        "org:manage", lambda w, r: {"name": unique("Воронка"), "stages": [{"name": "Новий"}]}
+    ),
+    "PATCH /api/v1/pipelines/{pipeline_id}": Case(
+        "org:manage", lambda w, r: {"name": unique("Воронка")}, ORG_TARGETS, org_object=True
+    ),
+    "GET /api/v1/deals": Case("deal:read", lists="deal"),
+    "GET /api/v1/deals/kanban": Case(
+        "deal:read",
+        targets=ORG_TARGETS,
+        query=lambda w, t: {"pipeline_id": w.ids["pipeline"][t]},
+        org_object=True,
+    ),
+    "GET /api/v1/deals/{deal_id}": Case("deal:read", None, CRM_TARGETS),
+    "POST /api/v1/deals": Case("deal:write", deal_body),
+    "PATCH /api/v1/deals/{deal_id}": Case(
+        "deal:write", lambda w, r: {"version": 1, "title": "Нова"}, CRM_TARGETS, "deal:read"
     ),
 }
 
@@ -176,6 +206,8 @@ def expected_status(role: str, case: Case, target: str | None, success: int) -> 
     levels = CATALOG.permissions(role)
     if case.action not in levels:
         return 403
+    if case.org_object:
+        return 404 if target == "other_org" else success
     if not in_scope(target, levels.get(case.read or case.action)):
         return 404  # вне уровня чтения — как несуществующий
     if not in_scope(target, levels[case.action]):
@@ -189,6 +221,8 @@ async def build_world(
     uow: UnitOfWork,
     make_company: MakeRecord,
     make_contact: MakeRecord,
+    make_pipeline: MakeRecord,
+    make_deal: MakeRecord,
 ) -> World:
     mine, other = await make_org(), await make_org()
     users = {role: await member(make_user, mine, role) for role in ROLES[:4]}
@@ -212,6 +246,18 @@ async def build_world(
     }
     world.ids["company"] = {t: (await make_company(o)).id for t, o in owners.items()}
     world.ids["contact"] = {t: (await make_contact(o)).id for t, o in owners.items()}
+    pipelines = {
+        "same_org": await make_pipeline(mine.id),
+        "other_org": await make_pipeline(other.id),
+    }
+    world.ids["pipeline"] = {t: p.id for t, p in pipelines.items()}
+    world.ids["stage"] = {t: p.stages[0].id for t, p in pipelines.items()}
+    world.ids["deal"] = {
+        t: (
+            await make_deal(o, pipelines["other_org" if t == "other_org" else "same_org"].stages[0])
+        ).id
+        for t, o in owners.items()
+    }
     return world
 
 
@@ -226,6 +272,8 @@ def url_for(route: str, target: str | None, world: World) -> str:
         "{org_id}": lambda: str(org.id),
         "{company_id}": lambda: str(world.ids["company"][target]),
         "{contact_id}": lambda: str(world.ids["contact"][target]),
+        "{deal_id}": lambda: str(world.ids["deal"][target]),
+        "{pipeline_id}": lambda: str(world.ids["pipeline"][target]),
     }
     for placeholder, value in replacements.items():
         if placeholder in path:
@@ -248,10 +296,14 @@ async def test_access(
     make_user: MakeUser,
     make_company: MakeRecord,
     make_contact: MakeRecord,
+    make_pipeline: MakeRecord,
+    make_deal: MakeRecord,
     uow: UnitOfWork,
     settings: Settings,
 ) -> None:
-    world = await build_world(make_org, make_user, uow, make_company, make_contact)
+    world = await build_world(
+        make_org, make_user, uow, make_company, make_contact, make_pipeline, make_deal
+    )
     user = world.users[role]
     # Access-токен выпускаем напрямую: логин с argon2 на сотни кейсов был бы медленным.
     token = KeySet.from_settings(settings).issue_access_token(user.id, uuid.uuid4(), 0)
@@ -259,9 +311,11 @@ async def test_access(
     case = CASES[route]
     success = 202 if route in ACCEPTED else SUCCESS[method]
 
+    path = url_for(route, target, world) if case.query is None else route.split(" ", 1)[1]
     resp = await client.request(
         method,
-        url_for(route, target, world),
+        path,
+        params=case.query(world, target) if case.query else None,
         json=case.body(world, role) if case.body else None,
         headers={"Authorization": f"Bearer {token}"},
     )

@@ -16,7 +16,7 @@ from typing import Any
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.errors import Conflict
-from app.models import Company, Contact
+from app.models import Company, Contact, Deal
 from app.repositories.audit import diff
 from app.repositories.contacts import ContactFilters
 from app.repositories.crm import SoftDeleteRepository
@@ -30,7 +30,7 @@ from app.services.crm import (
 )
 from app.uow import UnitOfWork
 
-Record = Company | Contact
+Record = Company | Contact | Deal
 
 
 def check_version(obj: Record, version: int) -> None:

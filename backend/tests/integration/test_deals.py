@@ -94,7 +94,7 @@ async def test_deal_takes_pipeline_from_stage_and_status_sets_closed_at(
 
     created = await client.post(
         "/api/v1/deals",
-        json={"title": "Ліцензії", "amount": "2500.50", "stage_id": stage_id},
+        json={"title": "Ліцензії", "amount": "2500.50", "currency": "USD", "stage_id": stage_id},
         headers=rep,
     )
     deal = created.json()

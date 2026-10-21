@@ -3,16 +3,17 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.models import DealStatus
-from app.schemas.crm import NotNullFields, OwnerId, RecordOut, Text200, Version
+from app.schemas.crm import BigId, NotNullFields, OwnerId, RecordOut, Text200, Version
 
 Amount = Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=2, examples=["100000.00"])]
-# Этап 4.3: суммы только в долларах; любая валюта по курсу НБУ — шаг 4.4.
-Currency = Annotated[Literal["USD"], Field(description="ISO 4217")]
+Currency = Annotated[
+    str, Field(pattern=r"^[A-Z]{3}$", examples=["UAH"], description="ISO 4217, курс — НБУ")
+]
 
 
 class StageIn(BaseModel):
@@ -60,11 +61,11 @@ class PipelineOut(BaseModel):
 class DealIn(BaseModel):
     title: Text200
     amount: Amount
-    currency: Currency = "USD"
-    stage_id: int
+    currency: Currency = "UAH"
+    stage_id: BigId
     status: DealStatus = DealStatus.OPEN
-    contact_id: int | None = None
-    company_id: int | None = None
+    contact_id: BigId | None = None
+    company_id: BigId | None = None
     expected_close_date: date | None = None
     owner_id: OwnerId = None
 
@@ -76,10 +77,10 @@ class DealUpdate(NotNullFields):
     title: Text200 | None = None
     amount: Amount | None = None
     currency: Currency | None = None
-    stage_id: int | None = None
+    stage_id: BigId | None = None
     status: DealStatus | None = None
-    contact_id: int | None = None
-    company_id: int | None = None
+    contact_id: BigId | None = None
+    company_id: BigId | None = None
     expected_close_date: date | None = None
     owner_id: OwnerId = None
 
@@ -100,19 +101,41 @@ class DealOut(RecordOut):
     closed_at: datetime | None
 
 
+class FxOut(BaseModel):
+    """По какому курсу посчитаны суммы ответа (поле amount)."""
+
+    currency: str
+    rate: Decimal = Field(description="Единиц валюты за 1 USD по курсу НБУ")
+    date: date
+    stale: bool = Field(description="true — НБУ недоступен, взят последний известный курс")
+
+
+class DealListItem(DealOut):
+    amount: Decimal = Field(description="amount_usd в валюте ответа (см. fx)")
+
+
+class DealPageOut(BaseModel):
+    items: list[DealListItem]
+    next_cursor: str | None
+    fx: FxOut
+
+
 class KanbanCard(BaseModel):
     id: int
     title: str
     amount_usd: Decimal
+    amount: Decimal
     owner_id: uuid.UUID
 
 
 class KanbanStage(StageOut):
     deals_count: int
     amount_usd: Decimal
+    amount: Decimal
     deals: list[KanbanCard]
 
 
 class KanbanOut(BaseModel):
     pipeline_id: int
     stages: list[KanbanStage]
+    fx: FxOut

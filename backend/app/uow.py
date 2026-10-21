@@ -8,6 +8,7 @@ from app.repositories.contacts import CompanyRepository, ContactRepository
 from app.repositories.crm import LiveRecords
 from app.repositories.deals import DealRepository, PipelineRepository
 from app.repositories.email_tokens import EmailTokenRepository
+from app.repositories.fx import FxRateRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.users import UserRepository
@@ -26,6 +27,7 @@ class UnitOfWork:
         self.contacts = ContactRepository(session)
         self.pipelines = PipelineRepository(session)
         self.deals = DealRepository(session)
+        self.fx_rates = FxRateRepository(session)
         self.live_records = LiveRecords(session, (Company, Contact, Deal))
 
     async def flush(self) -> None:

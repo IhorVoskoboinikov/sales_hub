@@ -24,6 +24,7 @@ from app.repositories.user_cache import UserCache
 from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.contacts import CompanyService, ContactService
 from app.services.deals import DealService, PipelineService
+from app.services.fx import FxService, NbuClient
 from app.services.invites import InviteService
 from app.services.members import MemberService
 from app.services.organizations import OrganizationService, TeamService
@@ -159,10 +160,18 @@ def get_pipeline_service(uow: UnitOfWork = Depends(get_uow)) -> PipelineService:
     return PipelineService(uow)
 
 
+def get_fx_service(
+    request: Request, uow: UnitOfWork = Depends(get_uow), redis: Redis = Depends(get_redis)
+) -> FxService:
+    return FxService(uow, redis, cast(NbuClient, request.app.state.nbu))
+
+
 def get_deal_service(
-    uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
+    uow: UnitOfWork = Depends(get_uow),
+    roles: RoleCatalog = Depends(get_roles),
+    fx: FxService = Depends(get_fx_service),
 ) -> DealService:
-    return DealService(uow, roles)
+    return DealService(uow, roles, fx)
 
 
 def get_page(

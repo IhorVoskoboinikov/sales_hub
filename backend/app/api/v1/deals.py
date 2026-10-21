@@ -7,6 +7,7 @@ Starlette сопоставил бы «kanban» с {deal_id} (раздел 5, «�
 
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import Depends, Query, status
@@ -19,11 +20,35 @@ from app.authz.deps import authorize
 from app.models import DealStatus
 from app.repositories.deals import DealFilters
 from app.repositories.pagination import Page
-from app.schemas.common import MAX_ID, PageOut, RecordId
-from app.schemas.deals import DealIn, DealOut, DealUpdate, KanbanCard, KanbanOut, KanbanStage
+from app.schemas.common import MAX_ID, RecordId
+from app.schemas.deals import (
+    DealIn,
+    DealListItem,
+    DealOut,
+    DealPageOut,
+    DealUpdate,
+    FxOut,
+    KanbanCard,
+    KanbanOut,
+    KanbanStage,
+)
 from app.services.deals import DealService
+from app.services.fx import Display
 
 OptionalId = Annotated[int | None, Query(ge=1, le=MAX_ID)]
+CurrencyParam = Annotated[
+    str | None,
+    Query(
+        pattern=r"^[A-Z]{3}$",
+        description="Валюта сумм в ответе (ISO 4217); по умолчанию — валюта организации",
+    ),
+]
+
+
+def fx_out(display: Display) -> FxOut:
+    return FxOut(
+        currency=display.currency, rate=display.rate, date=display.date, stale=display.stale
+    )
 
 
 @protected_router.get("/deals", tags=["deals"], responses={**PROTECTED, **VALIDATION})
@@ -37,10 +62,11 @@ async def list_deals(
     overdue: Annotated[
         bool, Query(description="Только открытые с прошедшей датой закрытия, по этой дате")
     ] = False,
+    currency: CurrencyParam = None,
     page: Page = Depends(get_page),
     access: Access = Depends(authorize),
     deals: DealService = Depends(get_deal_service),
-) -> PageOut[DealOut]:
+) -> DealPageOut:
     """Сделки в моём уровне, новые сначала (с overdue=true — самые просроченные сначала)."""
     filters = DealFilters(
         status=status_,
@@ -51,10 +77,13 @@ async def list_deals(
         company_id=company_id,
         overdue_on=datetime.now(UTC).date() if overdue else None,
     )
+    display = await deals.display(access, currency)
     result = await deals.list(access, filters, page)
-    return PageOut(
-        items=[DealOut.model_validate(d) for d in result.items], next_cursor=result.next_cursor
-    )
+    items = [
+        DealListItem(**DealOut.model_validate(d).model_dump(), amount=display.amount(d.amount_usd))
+        for d in result.items
+    ]
+    return DealPageOut(items=items, next_cursor=result.next_cursor, fx=fx_out(display))
 
 
 @protected_router.get(
@@ -63,16 +92,19 @@ async def list_deals(
 async def kanban(
     pipeline_id: Annotated[int, Query(ge=1, le=MAX_ID)],
     per_stage: Annotated[int, Query(ge=1, le=50, description="Карточек на этап")] = 20,
+    currency: CurrencyParam = None,
     access: Access = Depends(authorize),
     deals: DealService = Depends(get_deal_service),
 ) -> KanbanOut:
     """Канбан воронки: по каждому этапу — число и сумма открытых сделок в моём уровне и первые
     per_stage карточек (новые сначала)."""
+    display = await deals.display(access, currency)
     pipeline, totals, cards = await deals.kanban(access, pipeline_id, per_stage)
     by_stage = {t.stage_id: t for t in totals}
     stages = []
     for stage in pipeline.stages:
         total = by_stage.get(stage.id)
+        amount_usd = total.amount_usd if total else Decimal(0)
         stages.append(
             KanbanStage(
                 id=stage.id,
@@ -80,15 +112,22 @@ async def kanban(
                 position=stage.position,
                 probability=stage.probability,
                 deals_count=total.deals if total else 0,
-                amount_usd=total.amount_usd if total else 0,
+                amount_usd=amount_usd,
+                amount=display.amount(amount_usd),
                 deals=[
-                    KanbanCard(id=c.id, title=c.title, amount_usd=c.amount_usd, owner_id=c.owner_id)
+                    KanbanCard(
+                        id=c.id,
+                        title=c.title,
+                        amount_usd=c.amount_usd,
+                        amount=display.amount(c.amount_usd),
+                        owner_id=c.owner_id,
+                    )
                     for c in cards
                     if c.stage_id == stage.id
                 ],
             )
         )
-    return KanbanOut(pipeline_id=pipeline.id, stages=stages)
+    return KanbanOut(pipeline_id=pipeline.id, stages=stages, fx=fx_out(display))
 
 
 @protected_router.get("/deals/{deal_id}", tags=["deals"], responses={**PROTECTED, **NOT_FOUND})
@@ -111,8 +150,9 @@ async def create_deal(
     access: Access = Depends(authorize),
     deals: DealService = Depends(get_deal_service),
 ) -> DealOut:
-    """Создать сделку на этапе воронки (воронка берётся из этапа). Контакт и компания должны
-    быть видны вам, иначе 422."""
+    """Создать сделку на этапе воронки (воронка берётся из этапа). Сумма — в любой валюте
+    НБУ: в базе сохраняются она сама, курс и сумма в USD. Контакт и компания должны быть видны
+    вам, иначе 422."""
     return DealOut.model_validate(await deals.create(access, body.model_dump()))
 
 

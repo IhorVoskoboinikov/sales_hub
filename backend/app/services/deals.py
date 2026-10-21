@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.authz.access import Access
+from app.authz.roles import RoleCatalog
 from app.errors import Conflict, NotFound, ValidationFailed
 from app.models import Deal, DealStatus, Pipeline, PipelineStage
 from app.repositories.crm import SoftDeleteRepository
@@ -15,6 +17,7 @@ from app.repositories.deals import DealFilters, StageTotal
 from app.repositories.pagination import Page, PageResult
 from app.services.contacts import CrmService, check_version
 from app.services.crm import ensure_reference
+from app.services.fx import CENT, Display, FxService
 from app.uow import UnitOfWork
 
 
@@ -125,7 +128,15 @@ class Money:
 
 
 class DealService(CrmService[Deal]):
+    """Суммы: клиент присылает {amount, currency}, в базу пишутся amount_usd, исходная сумма,
+    валюта, курс и дата курса (раздел 3, «Деньги»). Курс берётся до любых других проверок:
+    первая за день загрузка курса из НБУ коммитит транзакцию (FxService._fetch)."""
+
     entity = "deal"
+
+    def __init__(self, uow: UnitOfWork, roles: RoleCatalog, fx: FxService) -> None:
+        super().__init__(uow, roles)
+        self.fx = fx
 
     @property
     def repo(self) -> SoftDeleteRepository[Deal]:
@@ -135,9 +146,9 @@ class DealService(CrmService[Deal]):
         return await self.uow.deals.list(access, filters, page)
 
     async def create(self, access: Access, fields: dict[str, Any]) -> Deal:
+        money = await self._money(access, fields.pop("amount"), fields.pop("currency"))
         stage = await self._stage(access, fields.pop("stage_id"))
         await self._check_refs(access, fields)
-        money = await self._money(fields.pop("amount"), fields.pop("currency"))
         status = fields.pop("status", DealStatus.OPEN)
         deal = Deal(
             pipeline_id=stage.pipeline_id,
@@ -153,17 +164,18 @@ class DealService(CrmService[Deal]):
     ) -> Deal:
         deal = await self._for_change(access, deal_id)
         check_version(deal, version)
+        if "amount" in fields or "currency" in fields:
+            amount = fields.pop("amount", deal.amount_original)
+            currency = fields.pop("currency", deal.currency_original)
+            if (amount, currency) != (deal.amount_original, deal.currency_original):
+                # Курс пересчитывается, только если поменялись сумма или валюта.
+                fields.update(vars(await self._money(access, amount, currency)))
         if "stage_id" in fields:
             stage = await self._stage(access, fields["stage_id"])
             fields["pipeline_id"] = stage.pipeline_id
         await self._check_refs(
             access, {k: v for k, v in fields.items() if getattr(deal, k, None) != v}
         )
-        if "amount" in fields or "currency" in fields:
-            amount = fields.pop("amount", deal.amount_original)
-            currency = fields.pop("currency", deal.currency_original)
-            if (amount, currency) != (deal.amount_original, deal.currency_original):
-                fields.update(vars(await self._money(amount, currency)))
         if "status" in fields and fields["status"] != deal.status:
             closed = fields["status"] != DealStatus.OPEN
             fields["closed_at"] = datetime.now(UTC) if closed else None
@@ -200,7 +212,20 @@ class DealService(CrmService[Deal]):
             "company_id",
         )
 
-    async def _money(self, amount: Decimal, currency: str) -> Money:
-        """Этап 4.3: только доллары. Конвертер НБУ — шаг 4.4."""
-        today = datetime.now(UTC).date()
-        return Money(amount, amount, currency, Decimal("1"), today)
+    async def _money(self, access: Access, amount: Decimal, currency: str) -> Money:
+        amount = amount.quantize(CENT)  # 100000 → 100000.00, как в numeric(14,2)
+        converted = await self.fx.to_usd(amount, currency, await self.today(access))
+        return Money(converted.amount_usd, amount, currency, converted.fx_rate, converted.fx_date)
+
+    async def today(self, access: Access) -> date:
+        """Сегодня по часовому поясу организации: курс НБУ — на её календарную дату."""
+        org = await self.uow.organizations.get(access.org_id)
+        zone = ZoneInfo(org.timezone if org else "UTC")
+        return datetime.now(zone).date()
+
+    async def display(self, access: Access, currency: str | None) -> Display:
+        """Курс для ответа: ?currency= или валюта организации по умолчанию."""
+        if currency is None:
+            org = await self.uow.organizations.get(access.org_id)
+            currency = org.display_currency if org else "USD"
+        return await self.fx.display(currency, await self.today(access))

@@ -33,6 +33,7 @@ from app.errors.handlers import register_error_handlers
 from app.middleware.access_log import AccessLogMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.middleware.unhandled_errors import UnhandledErrorMiddleware
+from app.services.fx import NbuClient
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -52,6 +53,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         http = httpx.AsyncClient()  # один пул соединений к OPA на процесс
         app.state.opa = OpaClient(http, settings.opa_url)
+        app.state.nbu = NbuClient(http, settings.nbu_url)  # тот же пул: OPA и НБУ — разные хосты
         if settings.show_docs:
             app.state.route_actions = await fetch_route_actions(
                 app.state.opa, settings.opa_startup_attempts

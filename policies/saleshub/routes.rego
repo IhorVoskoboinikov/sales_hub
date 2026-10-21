@@ -18,4 +18,13 @@ actions := {
 	"GET /api/v1/users": "member:read",
 	"PATCH /api/v1/users/{user_id}": "member:manage",
 	"POST /api/v1/invites": "member:manage",
+	# --- этап 4: компании и контакты
+	"GET /api/v1/companies": "company:read",
+	"GET /api/v1/companies/{company_id}": "company:read",
+	"POST /api/v1/companies": "company:write",
+	"PATCH /api/v1/companies/{company_id}": "company:write",
+	"GET /api/v1/contacts": "contact:read",
+	"GET /api/v1/contacts/{contact_id}": "contact:read",
+	"POST /api/v1/contacts": "contact:write",
+	"PATCH /api/v1/contacts/{contact_id}": "contact:write",
 }

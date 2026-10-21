@@ -11,7 +11,7 @@ import structlog
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -101,6 +101,17 @@ async def integrity_error_handler(request: Request, exc: Exception) -> JSONRespo
     return problem(Conflict.status, UNIQUE_CODES.get(constraint or "", Conflict.code))
 
 
+async def data_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Postgres не принял значение (SQLSTATE класса 22: число вне диапазона, символ NUL в
+    тексте…). Это ввод клиента, который пропустила валидация схемы, — 422, а не 500."""
+    assert isinstance(exc, DBAPIError)
+    sqlstate = str(getattr(exc.orig, "sqlstate", "") or "")
+    if not sqlstate.startswith("22"):
+        raise exc  # остальное (соединение, синтаксис) — ошибка сервера: пусть станет 500
+    logger.info("data_error", sqlstate=sqlstate)
+    return problem(422, "validation")
+
+
 async def stale_data_handler(request: Request, exc: Exception) -> JSONResponse:
     """UPDATE … WHERE id = :id AND version = :v не нашёл строку: между чтением и записью её
     изменил другой запрос (оптимистическая блокировка, version_id_col у CRM-моделей)."""
@@ -113,4 +124,5 @@ def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RequestValidationError, validation_error_handler)
     app.add_exception_handler(StarletteHTTPException, http_error_handler)
     app.add_exception_handler(IntegrityError, integrity_error_handler)
+    app.add_exception_handler(DBAPIError, data_error_handler)
     app.add_exception_handler(StaleDataError, stale_data_handler)

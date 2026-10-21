@@ -18,11 +18,17 @@ from app.authz.access import Access
 from app.models import Company, Contact, User
 from app.models.crm import CONTACT_SEARCH
 from app.repositories.crm import SoftDeleteRepository
-from app.repositories.pagination import Key, Page, paginate
+from app.repositories.pagination import Key, Page, PageResult, fetch_page, paginate
 
 # Сортировка списков: новые сначала. Тот же порядок колонок — в индексах ix_contacts_*_created_at.
 CONTACT_ORDER = (Key(Contact.created_at, desc=True), Key(Contact.id, desc=True))
 COMPANY_ORDER = (Key(Company.name), Key(Company.id))
+
+
+# Поиск по подстроке идёт через триграммы pg_trgm: из запроса без трёх букв или цифр подряд
+# («---», «a b») триграмм не получится, и Postgres прочитал бы все строки организации.
+# Управляющие символы (NUL) запрещены: шаблон подставляется в текст запроса.
+SEARCH_PATTERN = r"^[^\x00-\x1f]*\w{3}[^\x00-\x1f]*$"
 
 
 def like_pattern(q: str) -> BindParameter[str]:
@@ -69,8 +75,11 @@ class ContactRepository(SoftDeleteRepository[Contact]):
             query = query.where(Contact.company_id == filters.company_id)
         return paginate(query, CONTACT_ORDER, page)
 
-    async def list(self, access: Access, filters: ContactFilters, page: Page) -> list[Contact]:
-        return list(await self.session.scalars(self.list_query(access, filters, page)))
+    async def list(
+        self, access: Access, filters: ContactFilters, page: Page
+    ) -> PageResult[Contact]:
+        query = self.list_query(access, filters, page)
+        return await fetch_page(self.session, query, CONTACT_ORDER, page)
 
     async def find_by_email(self, org_id: Any, email: str) -> tuple[Contact, str] | None:
         """Живой контакт организации с таким email и email его ответственного — без Access:
@@ -98,5 +107,6 @@ class CompanyRepository(SoftDeleteRepository[Company]):
             query = query.where(Company.name.ilike(like_pattern(q)))
         return paginate(query, COMPANY_ORDER, page)
 
-    async def list(self, access: Access, q: str | None, page: Page) -> list[Company]:
-        return list(await self.session.scalars(self.list_query(access, q, page)))
+    async def list(self, access: Access, q: str | None, page: Page) -> PageResult[Company]:
+        query = self.list_query(access, q, page)
+        return await fetch_page(self.session, query, COMPANY_ORDER, page)

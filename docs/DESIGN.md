@@ -1103,7 +1103,9 @@ raise Conflict("member.last_admin")        # → 409, code=member.last_admin, ti
 | `AppError` | его status + тело ниже | warning (4xx), error (5xx) |
 | `RequestValidationError` | 422, `code=validation`, в `details.errors` — `loc`, `type` и украинское `message`; введённое значение (`input`) не возвращается — там может быть пароль | info |
 | `HTTPException` Starlette (нет маршрута, не тот метод) | 404 `not_found`, 405 `method_not_allowed` с заголовком `Allow` | — |
-| `IntegrityError` (unique, SQLSTATE 23505) | 409 `conflict`; остальные нарушения (FK, CHECK) — ошибка в коде → 500 | warning |
+| `IntegrityError` (unique, SQLSTATE 23505) | 409 `conflict` (у ограничений со своим кодом — он: `uq_contacts_org_id_email` → `contact.duplicate_email`); остальные нарушения (FK, CHECK) — ошибка в коде → 500 | warning |
+| `DBAPIError` с SQLSTATE класса 22 (число вне диапазона, NUL в тексте) | 422 `validation` — ввод, который пропустила схема | info |
+| `StaleDataError` (версия записи изменилась между чтением и записью) | 409 `version.conflict` | warning |
 | любое другое | 500 `internal`, без стектрейса наружу (`UnhandledErrorMiddleware`) | error + traceback |
 
 Формат тела (по мотивам RFC 9457 problem+json):
@@ -1608,8 +1610,8 @@ deploy/
 
 ### Этап 4 — CRM-домен и объём (раздел 3)
 
-- [ ] 4.1 `companies` и `contacts` с мягким удалением и `version`; общий фильтр `deleted_at IS NULL` в репозитории; keyset-пагинация; правила ответственного (`owner.*`) и `member.has_records`, `team.has_records`.
-- [ ] 4.2 CRUD компаний и контактов с `Access` (`list`, `get_visible_or_404`, `ensure_allowed`), `?q=`, `?tag=`, ошибки `contact.duplicate_email`, `version.conflict` + строки в `routes.rego`, тесты в `authz_test.rego`, тест-матрица с целями own / same\_team / same\_org / other\_org.
+- [x] 4.1 `companies` и `contacts` с мягким удалением и `version`; общий фильтр `deleted_at IS NULL` в репозитории; keyset-пагинация; правила ответственного (`owner.*`) и `member.has_records`, `team.has_records`.
+- [x] 4.2 CRUD компаний и контактов с `Access` (`list`, `get_visible_or_404`, `ensure_allowed`), `?q=`, `?tag=`, ошибки `contact.duplicate_email`, `version.conflict` + строки в `routes.rego`, тесты в `authz_test.rego`, тест-матрица с целями own / same\_team / same\_org / other\_org.
 - [ ] 4.3 Воронки, этапы, `deals` (пока только USD), эндпоинт канбана + строки в `routes.rego` и кейсы матрицы.
 - [ ] 4.4 `fx_rates`, `FxService` (НБУ, кэш, резерв), суммы сделок в любой валюте, параметр `?currency=`.
 - [ ] 4.5 `activities` с партициями по месяцам, `ensure_monthly_partitions`, `notes`; `audit_log` на партициях и `GET /audit` + строки в `routes.rego`.
@@ -1625,7 +1627,7 @@ deploy/
 
 | Эндпоинт | Что делает |
 | --- | --- |
-| `GET /companies?q=` | компании организации по имени; `q` — от 3 символов |
+| `GET /companies?q=` | компании организации по имени; в `q` — хотя бы 3 буквы или цифры подряд (иначе у pg\_trgm нет триграмм и пришлось бы читать всю организацию), без управляющих символов — иначе 422 |
 | `GET /contacts?q=&status=&tag=&owner_id=&company_id=` | контакты в уровне `contact:read`, новые сначала |
 | `POST /companies`, `POST /contacts` | `owner_id` необязателен (по умолчанию — я); `org_id` и `team_id` в теле не принимаются |
 | `PATCH /companies/{id}`, `PATCH /contacts/{id}` | поля, которых нет в теле, не меняются; `version` обязателен |
@@ -1754,7 +1756,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Кто создаёт организации | только супер-админ; дальше всё через приглашения |
 | Приглашение на занятый email | 202 и письмо «вы уже состоите в организации» — по ответу нельзя проверить, есть ли email в системе |
 | Пользователи этапа 2 без организации | удаляются миграцией этапа 3 (dev-данные, `downgrade` их не возвращает) |
-| Блокировки при управлении людьми | организация → пользователь → его токены; отдел — `FOR UPDATE` при удалении и `FOR KEY SHARE`, когда в него кладут человека: гонки дают 409/422, а не 500. С этапа 4 ответственный записи читается с `FOR SHARE`: перевод человека в другой отдел ждёт создания его записи и видит её (409 `member.has_records`) |
+| Блокировки при управлении людьми | организация → пользователь → его токены; отдел — `FOR UPDATE` при удалении и `FOR KEY SHARE`, когда в него кладут человека: гонки дают 409/422, а не 500. С этапа 4 ответственный записи читается с `FOR SHARE`: перевод человека в другой отдел ждёт создания его записи и видит её (409 `member.has_records`). Организацию сервис людей блокирует `FOR NO KEY UPDATE`, а не `FOR UPDATE`: вставка CRM-записи проверяет FK на организацию с `FOR KEY SHARE`, и с `FOR UPDATE` создание записи и перевод её ответственного ждали бы друг друга (deadlock) |
 | Версия OPA | 1.21.3: образ `openpolicyagent/opa:1.21.3` в compose и testcontainers, `opa test` в CI — та же версия |
 | Удаление | мягкое (корзина 30 дней) для компаний, контактов, сделок; жёсткое для остального |
 | 2FA | не делаем |

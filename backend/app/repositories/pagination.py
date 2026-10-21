@@ -12,10 +12,11 @@ import binascii
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
-from sqlalchemy import ColumnElement, Select, and_, or_, tuple_
+from sqlalchemy import ColumnElement, Select, and_, literal, or_, tuple_
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.errors import ValidationFailed
 
@@ -45,28 +46,40 @@ def encode_cursor(values: Sequence[Any]) -> str:
 
 
 def decode_cursor(cursor: str, keys: Sequence[Key]) -> list[Any]:
-    """Значения курсора в типах колонок. Битый или чужой курсор — 422, а не 500."""
+    """Значения курсора в типах колонок. Битый или подделанный курсор — 422, а не 500."""
     try:
         raw = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
         if not isinstance(raw, list) or len(raw) != len(keys):
             raise ValueError("wrong length")
         return [_parse(value, key) for value, key in zip(raw, keys, strict=True)]
-    except (ValueError, TypeError, binascii.Error, UnicodeDecodeError):
+    except (
+        ValueError,
+        TypeError,
+        OverflowError,
+        RecursionError,
+        binascii.Error,
+        UnicodeDecodeError,
+    ):
         raise ValidationFailed("pagination.invalid_cursor", field="cursor") from None
 
 
 def _parse(value: Any, key: Key) -> Any:
+    """Ключи сортировки не бывают NULL (списки фильтруют такие строки), а bool в JSON
+    формально int — оба признак подделки."""
     python_type = key.column.type.python_type
-    if value is None:
-        return None
+    if value is None or isinstance(value, bool):
+        raise ValueError("bad value")
     if python_type is datetime:
-        return datetime.fromisoformat(value)
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None:
+            raise ValueError("naive datetime")
+        return moment.astimezone(UTC)  # OverflowError на краях диапазона — тоже 422
     if python_type is date:
         return date.fromisoformat(value)
-    if python_type is int and not isinstance(value, int):
-        raise ValueError("not an int")
-    if python_type is str and not isinstance(value, str):
-        raise ValueError("not a str")
+    if not isinstance(value, python_type):
+        raise ValueError(f"not a {python_type.__name__}")
+    if python_type is int and not -(2**63) <= value < 2**63:
+        raise ValueError("out of bigint range")
     return value
 
 
@@ -78,7 +91,8 @@ def after(keys: Sequence[Key], values: Sequence[Any]) -> ColumnElement[bool]:
     Разные направления — развёрнутое условие: a > :a OR (a = :a AND b < :b)."""
     if all(k.desc == keys[0].desc for k in keys):
         left = tuple_(*(k.column for k in keys))
-        right = tuple_(*values)
+        # Параметры с типами колонок: Postgres сравнивает timestamptz с timestamptz.
+        right = tuple_(*(literal(v, k.column.type) for k, v in zip(keys, values, strict=True)))
         return left < right if keys[0].desc else left > right
     conditions = []
     for i, key in enumerate(keys):
@@ -104,3 +118,18 @@ def next_cursor(rows: list[Any], keys: Sequence[Key], page: Page) -> str | None:
     del rows[page.limit :]
     last = rows[-1]
     return encode_cursor([getattr(last, k.column.key) for k in keys])
+
+
+@dataclass
+class PageResult[T]:
+    items: list[T]
+    next_cursor: str | None
+
+
+async def fetch_page[T](
+    session: AsyncSession, query: Select[Any], keys: Sequence[Key], page: Page
+) -> PageResult[T]:
+    """Выполнить запрос из paginate() и разрезать на страницу и курсор следующей."""
+    rows: list[T] = list(await session.scalars(query))
+    cursor = next_cursor(rows, keys, page)
+    return PageResult(rows, cursor)

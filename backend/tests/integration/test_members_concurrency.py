@@ -18,8 +18,9 @@ from app.authz.access import Access
 from app.core.config import Settings
 from app.db.session import create_engine, create_session_factory
 from app.errors import Conflict
-from app.models import Organization, Role, Team, User
+from app.models import Contact, Organization, Role, Team, User
 from app.repositories.user_cache import UserCache
+from app.services.crm import resolve_owner
 from app.services.members import MemberChanges, MemberService
 from app.services.organizations import TeamService
 from app.uow import UnitOfWork
@@ -128,3 +129,68 @@ async def test_team_delete_waits_for_member_moving_in(
             await s.execute(delete_(Team).where(Team.org_id == org_id))
             await s.execute(delete_(Organization).where(Organization.id == org_id))
             await s.commit()
+
+
+async def test_member_move_waits_for_record_being_created(
+    settings: Settings, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Менеджеру создают клиента, а админ одновременно переводит его в другой отдел.
+
+    Создание держит FOR SHARE на ответственном, перевод ждёт его и потом видит новую запись —
+    409 member.has_records, а не клиент, оставшийся в старом отделе. И без deadlock: проверка
+    FK контакта на организацию (FOR KEY SHARE) не конфликтует с FOR NO KEY UPDATE организации,
+    которую держит перевод."""
+    org_id, rep_id = uuid.uuid4(), uuid.uuid4()
+    teams = [uuid.uuid4(), uuid.uuid4()]
+    async with sessions() as s:
+        s.add(Organization(id=org_id, name="Race", slug=f"race-{org_id.hex[:8]}"))
+        await s.flush()
+        s.add_all(Team(id=t, org_id=org_id, name=f"Відділ {i}") for i, t in enumerate(teams))
+        await s.flush()
+        s.add(
+            User(
+                id=rep_id,
+                email=f"rep-{org_id.hex[:8]}@example.com",
+                password_hash="x",
+                org_id=org_id,
+                role=Role.SALES_REP,
+                team_id=teams[0],
+            )
+        )
+        await s.commit()
+    rep_access = Access("contact:write", "own", rep_id, org_id, teams[0], "sales_rep")
+    redis = Redis.from_url(settings.redis_url)
+    try:
+        async with sessions() as creating, sessions() as moving:
+            uow = UnitOfWork(creating)
+            owner = await resolve_owner(uow, rep_access, None)  # FOR SHARE на менеджере
+            move = asyncio.create_task(
+                MemberService(UnitOfWork(moving), UserCache(redis)).change(
+                    admin_access_for(org_id),
+                    rep_id,
+                    MemberChanges(team_given=True, team_id=teams[1]),
+                )
+            )
+            await asyncio.sleep(0.5)
+            assert not move.done()  # перевод ждёт, пока запись создастся
+
+            uow.contacts.add(
+                Contact(org_id=org_id, team_id=owner.team_id, owner_id=rep_id, first_name="Іван")
+            )
+            await uow.commit()
+
+            with pytest.raises(Conflict) as exc:
+                await move
+            assert exc.value.code == "member.has_records"
+    finally:
+        await redis.aclose()
+        async with sessions() as s:
+            await s.execute(delete_(Contact).where(Contact.org_id == org_id))
+            await s.execute(delete_(User).where(User.org_id == org_id))
+            await s.execute(delete_(Team).where(Team.org_id == org_id))
+            await s.execute(delete_(Organization).where(Organization.id == org_id))
+            await s.commit()
+
+
+def admin_access_for(org_id: uuid.UUID) -> Access:
+    return Access("member:manage", "org", uuid.uuid4(), org_id, None)

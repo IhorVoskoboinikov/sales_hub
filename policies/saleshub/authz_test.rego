@@ -54,6 +54,32 @@ test_only_super_admin_creates_orgs if {
 	not authz.allow with input as req(org_admin, "GET", "/api/v1/admin/orgs")
 }
 
+test_everyone_reads_companies_viewer_cannot_write if {
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		authz.allow with input as req(user, "GET", "/api/v1/companies")
+		authz.allow with input as req(user, "GET", "/api/v1/companies/{company_id}")
+	}
+	every user in [org_admin, team_lead, sales_rep] {
+		authz.allow with input as req(user, "POST", "/api/v1/companies")
+		authz.allow with input as req(user, "PATCH", "/api/v1/companies/{company_id}")
+	}
+	not authz.allow with input as req(viewer, "POST", "/api/v1/companies")
+	not authz.allow with input as req(viewer, "PATCH", "/api/v1/companies/{company_id}")
+}
+
+test_contacts_read_by_all_written_by_sellers if {
+	d := authz.decision with input as req(sales_rep, "PATCH", "/api/v1/contacts/{contact_id}")
+	d.allow
+	d.action == "contact:write"
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		authz.allow with input as req(user, "GET", "/api/v1/contacts")
+		authz.allow with input as req(user, "GET", "/api/v1/contacts/{contact_id}")
+	}
+	authz.allow with input as req(team_lead, "POST", "/api/v1/contacts")
+	not authz.allow with input as req(viewer, "POST", "/api/v1/contacts")
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/contacts")
+}
+
 # У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
 test_super_admin_only_admin_routes if {
 	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/orgs")

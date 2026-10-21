@@ -11,6 +11,8 @@ from app.api import health, well_known
 from app.api.v1 import (  # noqa: F401 — модули с эндпоинтами регистрируют маршруты
     admin_router,
     auth,
+    companies,
+    contacts,
     invites,
     organizations,
     protected_router,

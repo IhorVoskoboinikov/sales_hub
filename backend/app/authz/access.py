@@ -5,15 +5,18 @@
 
 Обе формы — это три ветки own / team / org; тест test_access_forms проверяет, что они
 отвечают одинаково на всех сочетаниях. Третья форма — es_filter() — появится с поиском (этап 9).
+
+Массовая операция (раздел 6) хранит Access автора в bulk_jobs.params (to_params), а воркер
+восстанавливает его в каждом чанке (from_params): чанк обновляет только строки в уровне автора.
 """
 
 import uuid
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from sqlalchemy import ColumnElement, and_, false
 
-from app.authz.roles import RoleCatalog, Scope
+from app.authz.roles import SCOPES, RoleCatalog, Scope
 from app.errors import Forbidden
 
 
@@ -44,6 +47,33 @@ class Access:
         if scope is None:
             return None
         return Access(action, scope, self.user_id, self.org_id, self.team_id, self.role)
+
+    def to_params(self) -> dict[str, Any]:
+        """Access автора для bulk_jobs.params: только JSON-типы (uuid → строка)."""
+        return {
+            "action": self.action,
+            "scope": self.scope,
+            "user_id": str(self.user_id),
+            "org_id": str(self.org_id),
+            "team_id": str(self.team_id) if self.team_id is not None else None,
+            "role": self.role,
+        }
+
+    @classmethod
+    def from_params(cls, params: dict[str, Any]) -> "Access":
+        """Обратно из to_params(): воркер восстанавливает Access автора в каждом чанке."""
+        scope = params["scope"]
+        if scope not in SCOPES:
+            raise ValueError(f"неизвестный уровень: {scope}")
+        team_id = params.get("team_id")
+        return cls(
+            action=params["action"],
+            scope=cast(Scope, scope),
+            user_id=uuid.UUID(params["user_id"]),
+            org_id=uuid.UUID(params["org_id"]),
+            team_id=uuid.UUID(team_id) if team_id is not None else None,
+            role=params.get("role"),
+        )
 
     def matches(self, obj: Scoped) -> bool:
         if obj.org_id != self.org_id:

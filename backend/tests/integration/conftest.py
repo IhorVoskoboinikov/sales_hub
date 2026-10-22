@@ -8,6 +8,7 @@ Outbox внутри транзакции теста доставляет фик�
 
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -31,13 +32,15 @@ from testcontainers.community.redis import RedisContainer
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import HttpWaitStrategy
 
-from app.api.deps import get_session
+from app.api.deps import SessionScope, get_session, get_session_scope, get_task_queue
+from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.core.resources import smtp_sender
 from app.core.security import hash_password
 from app.events.relay import publish_batch
 from app.models import (
     Activity,
+    BulkJob,
     Company,
     Contact,
     Deal,
@@ -47,6 +50,7 @@ from app.models import (
     Team,
     User,
 )
+from app.services.bulk import BulkService
 from app.services.notifications import NotificationService
 from app.uow import UnitOfWork
 from app.workers import runtime
@@ -225,8 +229,24 @@ def uow(db_session: AsyncSession) -> UnitOfWork:
     return UnitOfWork(db_session)
 
 
+class FakeTaskQueue:
+    """Подмена TaskQueue в тестах API (раздел 10): задачи не уходят в Redis, а запоминаются —
+    иначе их выполнил бы сессионный воркер других тестов, а данные транзакции теста он не видит."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def enqueue(self, name: str, *args: Any) -> None:
+        self.enqueued.append((name, args))
+
+
 @pytest.fixture
-def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
+def task_queue() -> FakeTaskQueue:
+    return FakeTaskQueue()
+
+
+@pytest.fixture
+def app(app: FastAPI, db_session: AsyncSession, task_queue: FakeTaskQueue) -> FastAPI:
     # Запросы API идут в ту же транзакцию теста: после теста всё откатится.
     async def test_session() -> AsyncIterator[AsyncSession]:
         try:
@@ -237,7 +257,16 @@ def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
             await db_session.rollback()
             raise
 
+    @asynccontextmanager
+    async def test_scope() -> AsyncIterator[AsyncSession]:
+        yield db_session  # короткие сессии SSE — та же транзакция теста, не закрываем её
+
+    def session_scope() -> SessionScope:
+        return test_scope
+
     app.dependency_overrides[get_session] = test_session
+    app.dependency_overrides[get_session_scope] = session_scope
+    app.dependency_overrides[get_task_queue] = lambda: task_queue
     return app
 
 
@@ -532,3 +561,41 @@ def make_activity(uow: UnitOfWork) -> MakeRecord:
         return activity
 
     return make
+
+
+MakeJob = Callable[..., Awaitable[BulkJob]]
+
+
+@pytest.fixture
+def make_job(uow: UnitOfWork) -> MakeJob:
+    """Bulk job, которую запустил author (owner_id — автор, team_id — его отдел). По умолчанию
+    уже завершённая (done): SSE отдаёт снимок и сразу закрывается."""
+
+    async def make(author: User, **fields: Any) -> BulkJob:
+        assert author.org_id is not None
+        fields.setdefault("kind", "reassign_owner")
+        fields.setdefault("status", "done")
+        fields.setdefault("params", {"include": ["contacts"]})
+        job = BulkJob(org_id=author.org_id, team_id=author.team_id, owner_id=author.id, **fields)
+        uow.bulk_jobs.add(job)
+        await uow.commit()
+        return job
+
+    return make
+
+
+RunJob = Callable[[uuid.UUID | str], Awaitable[None]]
+
+
+@pytest.fixture
+def run_job(uow: UnitOfWork) -> RunJob:
+    """plan и все чанки job по очереди в сессии теста — как воркер, но без Celery. Чанки по 2
+    строки: даже у пары записей их несколько. job_id — и строкой из ответа API."""
+    service = BulkService(uow, RoleCatalog.load(POLICIES_DIR), FakeTaskQueue(), chunk_size=2)
+
+    async def run(job_id: uuid.UUID | str) -> None:
+        job_id = uuid.UUID(str(job_id))
+        for no in await service.plan(job_id):
+            await service.run_chunk(job_id, no)
+
+    return run

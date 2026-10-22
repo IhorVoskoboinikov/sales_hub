@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     # Outbox relay (раздел 15): строк за одну транзакцию и сколько ждать NOTIFY до опроса.
     outbox_batch_size: int = 100
     outbox_poll_seconds: float = 2.0
+    # Массовые операции (раздел 6): строк в чанке. Границы чанков считаются по реальным
+    # строкам выборки, а не равными диапазонами id. 0 — ошибка конфигурации уже при старте.
+    bulk_chunk_size: int = Field(10_000, ge=1)
 
     # --- Вход по почте (раздел 4)
     # Путь относительно backend/ (в контейнере — /app). В dev файл создаёт make keys.

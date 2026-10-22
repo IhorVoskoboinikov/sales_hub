@@ -8,13 +8,16 @@
 explain_lists.py) проверяет ровно тот SQL, который выполняет API.
 """
 
-from typing import Any
+import uuid
+from typing import Any, cast
 
-from sqlalchemy import Select, select
+from sqlalchemy import ColumnElement, Select, and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.authz.access import Access
 from app.errors import NotFound
+from app.models import Activity
+from app.repositories.bulk import move_team_filter
 
 
 class SoftDeleteRepository[M]:
@@ -61,11 +64,20 @@ class SoftDeleteRepository[M]:
         self.session.add(obj)
 
 
+def live(model: Any) -> ColumnElement[bool]:
+    """Живая запись: не в корзине. У активностей корзины нет — живые там открытые задачи
+    (done_at IS NULL); выполненные — история, она остаётся с прежним отделом."""
+    if model is Activity:
+        return Activity.done_at.is_(None)
+    return cast(ColumnElement[bool], model.deleted_at.is_(None))
+
+
 class LiveRecords:
-    """Есть ли у отдела или человека живые CRM-записи. Такой отдел нельзя удалить, а человека —
-    перевести в другой отдел, пока нет bulk job move_team (этап 5): иначе team_id записей
-    разошёлся бы с отделом ответственного. Запросы идут по частичным индексам *_team_id и
-    *_owner_id (WHERE deleted_at IS NULL)."""
+    """Есть ли у отдела или человека живые CRM-записи: компании, контакты, сделки (и закрытые —
+    они в отчётах отдела) и открытые активности. Отдел с такими записями нельзя удалить, а
+    человека — сделать org_admin или viewer: отдела у него больше не будет, а team_id записей —
+    это отдел ответственного. Запросы идут по частичным индексам *_team_id и *_owner_id
+    (WHERE deleted_at IS NULL, у активностей — WHERE done_at IS NULL)."""
 
     def __init__(self, session: AsyncSession, models: tuple[Any, ...]) -> None:
         self.session = session
@@ -75,7 +87,18 @@ class LiveRecords:
         for model in self.models:
             column = model.team_id if team_id is not None else model.owner_id
             value = team_id if team_id is not None else owner_id
-            query = select(model.id).where(column == value, model.deleted_at.is_(None)).limit(1)
-            if await self.session.scalar(query) is not None:
+            if await self._any(model, and_(column == value, live(model))):
                 return True
         return False
+
+    async def exist_outside_team(self, *, owner_id: uuid.UUID, team_id: uuid.UUID) -> bool:
+        """Есть ли у человека записи, которые должна догнать job move_team: живые компании и
+        контакты, открытые живые сделки и открытые активности с team_id не его отдела team_id.
+        Условие — то же, по которому job режет и обновляет чанки."""
+        for model in self.models:
+            if await self._any(model, move_team_filter(model, owner_id, team_id)):
+                return True
+        return False
+
+    async def _any(self, model: Any, where: ColumnElement[bool]) -> bool:
+        return await self.session.scalar(select(model.id).where(where).limit(1)) is not None

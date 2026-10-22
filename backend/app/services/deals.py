@@ -1,6 +1,7 @@
 """Воронки (настраивает org_admin) и сделки (раздел 3, правила доступа — раздел 5)."""
 
 import builtins
+import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -15,7 +16,7 @@ from app.repositories.crm import SoftDeleteRepository
 from app.repositories.deals import DealFilters, StageTotal
 from app.repositories.pagination import Page, PageResult
 from app.services.contacts import CrmService, check_version
-from app.services.crm import ensure_reference
+from app.services.crm import ensure_reference, owner_for_restore
 from app.services.fx import CENT, Display, FxService
 from app.uow import UnitOfWork
 
@@ -181,7 +182,18 @@ class DealService(CrmService[Deal]):
         if "status" in fields and fields["status"] != deal.status:
             closed = fields["status"] != DealStatus.OPEN
             fields["closed_at"] = datetime.now(UTC) if closed else None
+            if not closed and fields.get("owner_id") in (None, deal.owner_id):
+                fields["team_id"] = await self._reopened_team(access, deal)
         return await self._update(access, deal, version, fields)
+
+    async def _reopened_team(self, access: Access, deal: Deal) -> uuid.UUID:
+        """Закрытую сделку move_team не переносит — это история, она остаётся в отделе, где её
+        закрыли. Снова открытая, она возвращается в текущий отдел ответственного — как запись из
+        корзины (строка ответственного FOR SHARE: перевод его в другой отдел ждёт и потом видит
+        открытую сделку). Новый ответственный в том же PATCH — отдел ставит _update."""
+        owner = await owner_for_restore(self.uow, deal)
+        access.ensure_allowed(owner)  # ответственный мог перейти в чужой для меня отдел
+        return owner.team_id
 
     async def kanban(
         self, access: Access, pipeline_id: int, per_stage: int

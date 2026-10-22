@@ -1,7 +1,8 @@
 """Зависимости FastAPI: отдают то, что создано при старте приложения (lifespan в main.py),
 и собирают сервисы для эндпоинтов."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager
 from datetime import timedelta
 from typing import cast
 
@@ -21,6 +22,7 @@ from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
 from app.services.activities import ActivityService, AuditService, NoteService
 from app.services.auth import AuthService, ClientInfo, CurrentUser
+from app.services.bulk import BulkService
 from app.services.contacts import CompanyService, ContactService
 from app.services.deals import DealService, PipelineService
 from app.services.fx import FxService, NbuClient
@@ -30,6 +32,8 @@ from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
 from app.services.reports import ReportService
 from app.uow import UnitOfWork
+from app.workers.celery_app import celery_app
+from app.workers.queue import CeleryTaskQueue, TaskQueue
 
 # Кнопка Authorize в Swagger: форма логина отправляется на tokenUrl.
 # auto_error=False — нет токена → наш Unauthorized в общем формате, а не HTTPException FastAPI.
@@ -66,8 +70,22 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
         yield session  # закроется после ответа
 
 
+# Короткая сессия вне сессии запроса: `async with scope() as session`. Нужна потоку SSE — он
+# опрашивает job раз в секунду и не держит соединение между опросами (раздел 15).
+SessionScope = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
+
+def get_session_scope(request: Request) -> SessionScope:
+    return cast(async_sessionmaker[AsyncSession], request.app.state.session_factory)
+
+
 def get_uow(session: AsyncSession = Depends(get_session)) -> UnitOfWork:
     return UnitOfWork(session)
+
+
+def get_task_queue() -> TaskQueue:
+    """Постановка задач Celery после коммита (best-effort). В тестах — фейк."""
+    return CeleryTaskQueue(celery_app)
 
 
 def get_user_cache(redis: Redis = Depends(get_redis)) -> UserCache:
@@ -126,9 +144,12 @@ def get_team_service(uow: UnitOfWork = Depends(get_uow)) -> TeamService:
 
 
 def get_member_service(
-    uow: UnitOfWork = Depends(get_uow), cache: UserCache = Depends(get_user_cache)
+    uow: UnitOfWork = Depends(get_uow),
+    cache: UserCache = Depends(get_user_cache),
+    queue: TaskQueue = Depends(get_task_queue),
 ) -> MemberService:
-    return MemberService(uow, cache)
+    # queue — bulk.plan для job move_team после перевода человека с записями.
+    return MemberService(uow, cache, queue)
 
 
 def get_company_service(
@@ -181,6 +202,15 @@ def get_report_service(
     uow: UnitOfWork = Depends(get_uow), fx: FxService = Depends(get_fx_service)
 ) -> ReportService:
     return ReportService(uow, fx)
+
+
+def get_bulk_service(
+    uow: UnitOfWork = Depends(get_uow),
+    roles: RoleCatalog = Depends(get_roles),
+    queue: TaskQueue = Depends(get_task_queue),
+    settings: Settings = Depends(get_app_settings),
+) -> BulkService:
+    return BulkService(uow, roles, queue, chunk_size=settings.bulk_chunk_size)
 
 
 def get_page(

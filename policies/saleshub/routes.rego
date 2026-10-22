@@ -55,4 +55,8 @@ actions := {
 	# --- этап 4: отчёты
 	"GET /api/v1/reports/pipeline": "report:read",
 	"GET /api/v1/reports/managers": "report:read",
+	# --- этап 5: массовые операции и выгрузка (каждый шаг добавляет свои строки)
+	"POST /api/v1/bulk/reassign-owner": "bulk:run",
+	"GET /api/v1/bulk-jobs/{job_id}": "bulk_job:read",
+	"GET /api/v1/bulk-jobs/{job_id}/events": "bulk_job:read",
 }

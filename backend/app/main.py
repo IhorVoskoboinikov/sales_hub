@@ -11,6 +11,8 @@ from app.api.v1 import (  # noqa: F401 — модули с эндпоинтам�
     admin_router,
     audit,
     auth,
+    bulk,
+    bulk_jobs,
     companies,
     contacts,
     deals,

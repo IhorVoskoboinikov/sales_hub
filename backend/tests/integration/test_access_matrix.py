@@ -16,6 +16,12 @@ test_every_route_has_a_case.
 - other_org — запись чужой организации.
 У объектов этапа 3 (отделы, люди) отделов-владельцев нет: для них цели только same_org и
 other_org.
+
+Этап 5: у POST /bulk/reassign-owner цель — from_user (чьи записи передаём): коллега по отделу,
+менеджер другого отдела или чужой организации; не виден автору по member:read — 422, а не 404
+(это поле тела, а не объект в пути). У /bulk-jobs/{job_id} цель own — job самого вызывающего
+(bulk_job:read у viewer — own, свои выгрузки), остальные — job менеджеров, как у CRM-записей;
+job уже завершена, поэтому SSE сразу отдаёт снимок и закрывается. TaskQueue — фейк (conftest).
 """
 
 import uuid
@@ -35,7 +41,14 @@ from app.core.jwt import KeySet
 from app.models import Team, User
 from app.uow import UnitOfWork
 from tests.conftest import POLICIES_DIR
-from tests.integration.conftest import MakeOrg, MakeRecord, MakeUser, OrgFixture, member
+from tests.integration.conftest import (
+    MakeJob,
+    MakeOrg,
+    MakeRecord,
+    MakeUser,
+    OrgFixture,
+    member,
+)
 
 ROLES = ["org_admin", "team_lead", "sales_rep", "viewer", "super_admin"]
 CATALOG = RoleCatalog.load(POLICIES_DIR)
@@ -57,6 +70,8 @@ class World:
     empty_team: dict[str, uuid.UUID]  # same_org / other_org → отдел без людей и записей
     any_user: dict[str, uuid.UUID]  # same_org / other_org → пользователь (не вызывающий)
     ids: dict[str, dict[str, int]] = field(default_factory=dict)  # сущность → цель → id
+    people: dict[str, uuid.UUID] = field(default_factory=dict)  # цель → владелец её записей
+    jobs: dict[str, uuid.UUID] = field(default_factory=dict)  # цель → bulk job
 
     def owner_for(self, role: str) -> dict[str, Any]:
         """Ответственный в теле запроса: менеджер сам, руководитель и админ — менеджер отдела."""
@@ -66,6 +81,7 @@ class World:
 
 
 Body = Callable[[World, str], dict[str, Any]]
+TargetBody = Callable[[World, str, str | None], dict[str, Any]]  # тело зависит и от цели
 
 
 @dataclass(frozen=True)
@@ -84,6 +100,8 @@ class Case:
     lists: str | None = None  # сущность списка: проверить, что в нём ровно записи уровня
     query: Body | None = None  # query-параметры (канбану нужен ?pipeline_id=)
     org_object: bool = False  # объект организации (воронка): чужая — 404, своя видна всем
+    target_body: TargetBody | None = None
+    invisible: int = 404  # ответ, когда цель вне уровня read (у ссылки в теле — 422)
 
 
 def company_body(world: World, role: str) -> dict[str, Any]:
@@ -101,6 +119,15 @@ def deal_body(world: World, role: str) -> dict[str, Any]:
 
 def contact_body(world: World, role: str) -> dict[str, Any]:
     return {"first_name": "Іван", "email": f"{unique('c')}@example.com", **world.owner_for(role)}
+
+
+def reassign_body(world: World, role: str, target: str | None) -> dict[str, Any]:
+    # Получатель — менеджер отдела 1: в уровне и org_admin, и team_lead этого отдела.
+    assert target is not None
+    return {
+        "from_user_id": str(world.people[target]),
+        "to_user_id": str(world.users["sales_rep"].id),
+    }
 
 
 # Описание каждого маршрута routes.rego: тело запроса и какие объекты подставлять в путь.
@@ -205,6 +232,16 @@ CASES: dict[str, Case] = {
         org_object=True,
     ),
     "GET /api/v1/reports/managers": Case("report:read"),
+    # --- этап 5
+    "POST /api/v1/bulk/reassign-owner": Case(
+        "bulk:run",
+        targets=("same_team", "same_org", "other_org"),
+        read="member:read",
+        target_body=reassign_body,
+        invisible=422,
+    ),
+    "GET /api/v1/bulk-jobs/{job_id}": Case("bulk_job:read", None, CRM_TARGETS),
+    "GET /api/v1/bulk-jobs/{job_id}/events": Case("bulk_job:read", None, CRM_TARGETS),
 }
 
 
@@ -256,7 +293,7 @@ def expected_status(role: str, case: Case, target: str | None, success: int) -> 
     if case.org_object:
         return 404 if target == "other_org" else success
     if not in_scope(target, levels.get(case.read or case.action)):
-        return 404  # вне уровня чтения — как несуществующий
+        return case.invisible  # вне уровня чтения — как несуществующий
     if not in_scope(target, levels[case.action]):
         return 403  # виден, но менять нельзя
     return success
@@ -271,6 +308,7 @@ async def build_world(
     make_pipeline: MakeRecord,
     make_deal: MakeRecord,
     make_activity: MakeRecord,
+    make_job: MakeJob,
 ) -> World:
     mine, other = await make_org(), await make_org()
     users = {role: await member(make_user, mine, role) for role in ROLES[:4]}
@@ -292,6 +330,9 @@ async def build_world(
         "same_org": await member(make_user, mine, "sales_rep", team=1),
         "other_org": await member(make_user, other, "sales_rep"),
     }
+    world.people = {t: o.id for t, o in owners.items()}
+    # Job менеджеров; job цели own — самого вызывающего, её создаёт test_access.
+    world.jobs = {t: (await make_job(o)).id for t, o in owners.items() if t != "own"}
     world.ids["company"] = {t: (await make_company(o)).id for t, o in owners.items()}
     world.ids["contact"] = {t: (await make_contact(o)).id for t, o in owners.items()}
     pipelines = {
@@ -345,6 +386,7 @@ def url_for(route: str, target: str | None, world: World) -> str:
         "{deal_id}": lambda: str(world.ids["deal"][target]),
         "{activity_id}": lambda: str(world.ids["activity"][target]),
         "{pipeline_id}": lambda: str(world.ids["pipeline"][target]),
+        "{job_id}": lambda: str(world.jobs[target]),
     }
     for placeholder, value in replacements.items():
         if placeholder in path:
@@ -352,9 +394,19 @@ def url_for(route: str, target: str | None, world: World) -> str:
     return path
 
 
+def body_for(case: Case, world: World, role: str, target: str | None) -> dict[str, Any] | None:
+    if case.target_body is not None:
+        return case.target_body(world, role, target)
+    return case.body(world, role) if case.body else None
+
+
 SUCCESS = {"GET": 200, "PATCH": 200, "POST": 201, "DELETE": 204}
 RESTORE = 200  # POST …/restore возвращает восстановленную запись, а не создаёт новую
-ACCEPTED = {"POST /api/v1/invites", "POST /api/v1/admin/orgs/{org_id}/invites"}
+ACCEPTED = {
+    "POST /api/v1/invites",
+    "POST /api/v1/admin/orgs/{org_id}/invites",
+    "POST /api/v1/bulk/reassign-owner",
+}
 
 
 @pytest.mark.parametrize(("role", "route", "target"), all_cases())
@@ -371,6 +423,7 @@ async def test_access(
     make_pipeline: MakeRecord,
     make_deal: MakeRecord,
     make_activity: MakeRecord,
+    make_job: MakeJob,
     uow: UnitOfWork,
     settings: Settings,
 ) -> None:
@@ -383,8 +436,13 @@ async def test_access(
         make_pipeline,
         make_deal,
         make_activity,
+        make_job,
     )
     user = world.users[role]
+    if "{job_id}" in route:
+        # У супер-админа организации нет — и job тоже; ему всё равно 403.
+        author = world.users["sales_rep" if role == "super_admin" else role]
+        world.jobs["own"] = (await make_job(author)).id
     # Access-токен выпускаем напрямую: логин с argon2 на сотни кейсов был бы медленным.
     token = KeySet.from_settings(settings).issue_access_token(user.id, uuid.uuid4(), 0)
     method = route.split(" ", 1)[0]
@@ -398,7 +456,7 @@ async def test_access(
         method,
         path,
         params=case.query(world, target) if case.query else None,
-        json=case.body(world, role) if case.body else None,
+        json=body_for(case, world, role, target),
         headers={"Authorization": f"Bearer {token}"},
     )
 

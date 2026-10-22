@@ -9,6 +9,7 @@ x-app-env: &app-env
   DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@postgres:5432/saleshub
   REDIS_URL: redis://redis:6379/0
   CELERY_BROKER_URL: redis://redis:6379/1  # очереди Celery — отдельно от кэша (раздел 15)
+  BULK_CHUNK_SIZE: 10000  # строк в чанке массовой операции (раздел 6)
   SMTP_HOST: mailpit  # письма видно на localhost:8025
   OPA_URL: http://opa:8181
   POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA

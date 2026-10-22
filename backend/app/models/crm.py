@@ -93,7 +93,8 @@ class Company(CrmRecord, Base):
     __table_args__ = (
         # Список компаний сортируется по имени: keyset (name, id).
         Index("ix_companies_org_id_name", "org_id", "name", "id", postgresql_where=ALIVE),
-        # Удаление отдела и перевод человека проверяют, что записей нет (*.has_records).
+        # Удаление отдела и смена роли человека проверяют, что записей нет (*.has_records);
+        # перевод человека ищет записи, которые догонит job move_team.
         Index("ix_companies_team_id", "team_id", postgresql_where=ALIVE),
         Index("ix_companies_owner_id", "owner_id", postgresql_where=ALIVE),
         # Поиск ?q= по подстроке: ILIKE '%acme%' через триграммы (pg_trgm).

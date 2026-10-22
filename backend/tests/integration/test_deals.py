@@ -7,7 +7,14 @@ from typing import Any
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tests.integration.conftest import MakeOrg, MakeRecord, MakeUser, member, tokens_for
+from tests.integration.conftest import (
+    MakeOrg,
+    MakeRecord,
+    MakeUser,
+    RunJob,
+    member,
+    tokens_for,
+)
 
 
 async def test_pipeline_stages_are_replaced_as_a_list(
@@ -193,6 +200,7 @@ async def test_overdue_list_and_member_with_deals(
     make_org: MakeOrg,
     make_pipeline: MakeRecord,
     make_deal: MakeRecord,
+    run_job: RunJob,
 ) -> None:
     org = await make_org()
     stage = (await make_pipeline(org.id)).stages[0]
@@ -203,11 +211,18 @@ async def test_overdue_list_and_member_with_deals(
     await make_deal(rep, stage, title="none")
     auth = await tokens_for(client, rep)
     admin = await tokens_for(client, await member(make_user, org, "org_admin"))
+    new_lead = await tokens_for(client, await member(make_user, org, "team_lead", team=1))
 
     overdue = await client.get("/api/v1/deals", params={"overdue": True}, headers=auth)
     moved = await client.patch(
         f"/api/v1/users/{rep.id}", json={"team_id": str(org.team_ids[1])}, headers=admin
     )
+    lagging = await client.get("/api/v1/deals", headers=new_lead)
+    await run_job(moved.json()["bulk_job_id"])
+    caught_up = await client.get("/api/v1/deals", headers=new_lead)
 
     assert [d["title"] for d in overdue.json()["items"]] == ["due5", "due1"]  # самые старые сначала
-    assert (moved.status_code, moved.json()["code"]) == (409, "member.has_records")
+    assert moved.status_code == 200
+    # Пока job move_team не прошла, сделки ещё в старом отделе — новый руководитель их не видит.
+    assert lagging.json()["items"] == []
+    assert len(caught_up.json()["items"]) == 4

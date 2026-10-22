@@ -23,9 +23,10 @@ class UserRepository:
         )
 
     async def get_for_share(self, user_id: uuid.UUID) -> User | None:
-        """FOR SHARE — человек становится ответственным за запись. Конфликтует с FOR UPDATE
-        в смене роли и отдела: перевод подождёт, пока запись создастся, и увидит её
-        (409 member.has_records), а не оставит запись в старом отделе."""
+        """FOR SHARE — человек становится ответственным за запись (или чанк bulk читает его
+        текущий отдел). Конфликтует с FOR UPDATE в смене роли и отдела: перевод подождёт, пока
+        запись создастся, и увидит её (job move_team догонит её до нового отдела; при смене
+        роли — 409 member.has_records), а не оставит запись в старом отделе незамеченной."""
         return await self.session.scalar(
             select(User)
             .where(User.id == user_id)

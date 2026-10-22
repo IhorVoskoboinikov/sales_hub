@@ -3,18 +3,27 @@
 
 OPA решает только «может ли роль вызвать PATCH /users/{id}» (member:manage — только
 org_admin). Всё остальное — бизнес-правила, их проверяет этот сервис.
+
+Перевод человека с записями в другой отдел (с этапа 5): users.team_id меняется сразу, а записи
+догоняет bulk job move_team, которую сервис вставляет в той же транзакции (раздел 6).
 """
 
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+import structlog
+
 from app.authz.access import Access
 from app.errors import Conflict, Forbidden, NotFound, ValidationFailed
-from app.models import ROLES_WITH_TEAM, Role, User
+from app.models import ROLES_WITH_TEAM, BulkJob, Role, User
 from app.repositories.audit import diff
 from app.repositories.user_cache import UserCache
+from app.services.bulk import PLAN_TASK, new_move_team_job
 from app.uow import UnitOfWork
+from app.workers.queue import TaskQueue
+
+logger = structlog.get_logger("members")
 
 
 @dataclass(frozen=True)
@@ -28,15 +37,24 @@ class MemberChanges:
     is_active: bool | None = None
 
 
+@dataclass(frozen=True)
+class MemberChanged:
+    user: User
+    bulk_job_id: uuid.UUID | None = None  # move_team: записи догоняют новый отдел человека
+
+
 class MemberService:
-    def __init__(self, uow: UnitOfWork, cache: UserCache) -> None:
+    def __init__(self, uow: UnitOfWork, cache: UserCache, queue: TaskQueue) -> None:
         self.uow = uow
         self.cache = cache
+        self.queue = queue
 
     async def list(self, access: Access) -> list[User]:
         return await self.uow.users.list_visible(access)
 
-    async def change(self, access: Access, user_id: uuid.UUID, changes: MemberChanges) -> User:
+    async def change(
+        self, access: Access, user_id: uuid.UUID, changes: MemberChanges
+    ) -> MemberChanged:
         if user_id == access.user_id:
             # Иначе админ мог бы случайно разжаловать себя и потерять доступ к настройкам.
             raise Forbidden("member.cannot_change_self")
@@ -53,12 +71,24 @@ class MemberService:
         team_id = await self._new_team(access, user, role, changes)
         is_active = user.is_active if changes.is_active is None else changes.is_active
 
-        moves_records = team_id != user.team_id or (
-            user.role in ROLES_WITH_TEAM and role not in ROLES_WITH_TEAM
-        )
-        if moves_records and await self.uow.live_records.exist(owner_id=user.id):
-            # Записи ведёт этот человек, и их team_id — его отдел. Пока нет bulk job move_team
-            # (этап 5), который перенесёт их вместе с ним, перевод запрещён.
+        job: BulkJob | None = None
+        if role in ROLES_WITH_TEAM and changes.team_given:
+            assert team_id is not None  # у team_lead и sales_rep отдел есть всегда (_new_team)
+            # Записи человека переходят в новый отдел вместе с ним: team_id записи — всегда отдел
+            # ответственного. Блокировка строки человека (FOR UPDATE выше) дождалась записей,
+            # которые создаются сейчас (они читают ответственного FOR SHARE), — job их увидит, а
+            # созданные после коммита сразу получат новый отдел. Отдел проверяется, даже если он
+            # тот же: повторный PATCH создаёт новую job, если записи вне отдела остались, — так
+            # чинится упавшая.
+            if await self.uow.live_records.exist_outside_team(owner_id=user.id, team_id=team_id):
+                job = new_move_team_job(access, user.id)
+        elif (
+            user.role in ROLES_WITH_TEAM
+            and role not in ROLES_WITH_TEAM
+            and await self.uow.live_records.exist(owner_id=user.id)
+        ):
+            # У org_admin и viewer отдела нет, и вести записи они не могут: сначала записи
+            # передают другому (POST /bulk/reassign-owner).
             raise Conflict("member.has_records")
 
         loses_admin = (
@@ -85,10 +115,17 @@ class MemberService:
                 entity_id=user.id,
                 changes=changed,
             )
+        if job is not None:
+            self.uow.bulk_jobs.add(job)
         await self.uow.commit()
         # После коммита: иначе другой запрос успел бы положить в кэш старую роль.
         await self.cache.invalidate(user.id)
-        return user
+        if job is None:
+            return MemberChanged(user)
+        logger.info("bulk_job_created", job_id=str(job.id), kind=job.kind, user_id=str(user.id))
+        # Тоже после коммита и best-effort: потерянную постановку подберёт bulk.reap_stuck.
+        await self.queue.enqueue(PLAN_TASK, str(job.id))
+        return MemberChanged(user, job.id)
 
     async def _new_team(
         self, access: Access, user: User, role: Role, changes: MemberChanges

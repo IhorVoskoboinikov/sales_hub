@@ -183,12 +183,53 @@ rank := {"own": 1, "team": 2, "org": 3}
 # Массовые операции и выгрузка не шире, чем права на одну запись:
 # иначе через bulk можно было бы обойти ограничения роли.
 test_bulk_and_export_not_wider_than_single_record if {
-	pairs := {"bulk:run": "contact:write", "export:run": "contact:read"}
+	# Множество пар, а не объект: у bulk:run несколько «базовых» действий — передача клиентов
+	# меняет компании, контакты, сделки и активности одним уровнем bulk:run.
+	pairs := {
+		["bulk:run", "company:write"], ["bulk:run", "contact:write"],
+		["bulk:run", "deal:write"], ["bulk:run", "activity:write"],
+		["export:run", "contact:read"], ["bulk_job:cancel", "bulk_job:read"],
+	}
 	bad := {[name, a] |
 		some name, r in data.saleshub.roles
-		some a, base in pairs
+		some [a, base] in pairs
 		r.permissions[a]
 		not rank[r.permissions[a]] <= rank[r.permissions[base]]
 	}
 	count(bad) == 0
+}
+
+test_bulk_run_by_org_admin_and_team_lead if {
+	every user in [org_admin, team_lead] {
+		d := authz.decision with input as req(user, "POST", "/api/v1/bulk/reassign-owner")
+		d.allow
+		d.action == "bulk:run"
+	}
+	not authz.allow with input as req(super_admin, "POST", "/api/v1/bulk/reassign-owner")
+}
+
+# Менеджер не запускает массовые операции и не выгружает клиентов.
+test_sales_rep_has_no_bulk_and_export if {
+	not data.saleshub.roles.sales_rep.permissions["bulk:run"]
+	not data.saleshub.roles.sales_rep.permissions["export:run"]
+	not data.saleshub.roles.sales_rep.permissions["bulk_job:read"]
+	not authz.allow with input as req(sales_rep, "POST", "/api/v1/bulk/reassign-owner")
+	not authz.allow with input as req(sales_rep, "GET", "/api/v1/bulk-jobs/{job_id}")
+}
+
+# Наблюдатель выгружает (export:run — org), но массовых изменений не запускает.
+test_viewer_exports_but_cannot_run_bulk if {
+	data.saleshub.roles.viewer.permissions["export:run"] == "org"
+	not data.saleshub.roles.viewer.permissions["bulk:run"]
+	not authz.allow with input as req(viewer, "POST", "/api/v1/bulk/reassign-owner")
+}
+
+# Наблюдатель видит только свои job (выгрузки в S3 — этап 10).
+test_viewer_reads_own_jobs if {
+	data.saleshub.roles.viewer.permissions["bulk_job:read"] == "own"
+	every route in ["/api/v1/bulk-jobs/{job_id}", "/api/v1/bulk-jobs/{job_id}/events"] {
+		d := authz.decision with input as req(viewer, "GET", route)
+		d.allow
+		d.action == "bulk_job:read"
+	}
 }

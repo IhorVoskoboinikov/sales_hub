@@ -88,11 +88,12 @@ async def test_lists_never_show_foreign_rows(
     )
     _, foreign = await fill(org_b, make_user, make_contact, make_pipeline, make_deal, make_activity)
     await uow.reports.refresh()
+    # По таблицам: id у контактов, сделок и активностей — свои последовательности, и одно и то
+    # же число в разных таблицах — не «чужая строка».
     all_foreign = {
-        *foreign.contacts.values(),
-        *foreign.deleted.values(),
-        *foreign.deals.values(),
-        *foreign.tasks.values(),
+        "contacts": {*foreign.contacts.values(), *foreign.deleted.values()},
+        "deals": set(foreign.deals.values()),
+        "tasks": set(foreign.tasks.values()),
     }
 
     async def ids(auth: dict[str, str], url: str, **params: Any) -> set[Any]:
@@ -118,7 +119,8 @@ async def test_lists_never_show_foreign_rows(
         assert lists["contacts?tag"] == expect["contacts"], role
         assert lists["deals"] == expect["deals"], role
         assert lists["tasks"] == expect["tasks"], role
-        assert not set().union(*lists.values()) & all_foreign, role
+        for name, found in lists.items():
+            assert not found & all_foreign[name.split("?")[0]], (role, name)
 
         if role in ("lead", "admin"):  # корзина — у тех, кто может удалять
             trash = await ids(auth, "/api/v1/contacts/trash")

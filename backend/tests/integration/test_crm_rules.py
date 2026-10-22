@@ -1,42 +1,80 @@
 """Правила этапа 4.1, которые живут не в CRM-эндпоинтах, а рядом (раздел 5):
 
 - отдел с живыми записями не удалить — 409 team.has_records;
-- человека с живыми записями не перевести в другой отдел и не сделать org_admin / viewer,
-  пока нет bulk job move_team (этап 5), — 409 member.has_records; отключить можно;
+- человека с живыми записями не сделать org_admin / viewer — 409 member.has_records; перевести
+  в другой отдел можно (с этапа 5): записи догоняет bulk job move_team; отключить можно;
 - версия записи растёт при каждом UPDATE, устаревшая версия — 409 version.conflict.
 """
 
+import uuid
 from datetime import UTC, datetime
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.exc import StaleDataError
 
-from app.models import Contact
-from tests.integration.conftest import MakeOrg, MakeRecord, MakeUser, member, tokens_for
+from app.models import AuditEntry, BulkJob, Contact
+from tests.integration.conftest import (
+    FakeTaskQueue,
+    MakeOrg,
+    MakeRecord,
+    MakeUser,
+    RunJob,
+    member,
+    tokens_for,
+)
 
 
-async def test_member_with_records_cannot_change_team_or_role(
-    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, make_contact: MakeRecord
+async def test_member_with_records_moves_but_cannot_lose_team(
+    client: AsyncClient,
+    make_user: MakeUser,
+    make_org: MakeOrg,
+    make_contact: MakeRecord,
+    task_queue: FakeTaskQueue,
+    run_job: RunJob,
+    db_session: AsyncSession,
 ) -> None:
     org = await make_org()
-    admin = await tokens_for(client, await member(make_user, org, "org_admin"))
+    admin_user = await member(make_user, org, "org_admin")
+    admin, admin_id = await tokens_for(client, admin_user), admin_user.id
     rep = await member(make_user, org, "sales_rep", team=1)
-    await make_contact(rep)
-    url = f"/api/v1/users/{rep.id}"
+    rep_id = rep.id  # ответ 409 откатывает сессию теста, и объекты «протухают»
+    contact_id = (await make_contact(rep)).id
+    url = f"/api/v1/users/{rep_id}"
+    new_team = org.team_ids[0]
 
-    moved = await client.patch(url, json={"team_id": str(org.team_ids[0])}, headers=admin)
+    moved = await client.patch(url, json={"team_id": str(new_team)}, headers=admin)
     demoted = await client.patch(url, json={"role": "viewer"}, headers=admin)
     promoted = await client.patch(url, json={"role": "team_lead"}, headers=admin)  # тот же отдел
     disabled = await client.patch(url, json={"is_active": False}, headers=admin)
 
-    assert (moved.status_code, moved.json()["code"]) == (409, "member.has_records")
+    assert moved.status_code == 200
+    assert moved.json()["team_id"] == str(new_team)
+    job_id = uuid.UUID(moved.json()["bulk_job_id"])
+    assert task_queue.enqueued == [("bulk.plan", (str(job_id),))]  # после коммита
+    job = await db_session.get(BulkJob, job_id)
+    assert job is not None
+    assert (job.kind, job.status, job.owner_id) == ("move_team", "pending", admin_id)
+    assert job.params["user_id"] == str(rep_id)
     assert (demoted.status_code, demoted.json()["code"]) == (409, "member.has_records")
-    assert promoted.status_code == 200
-    # Отключить можно: записи остаются, их передадут другому (bulk, этап 5).
+    assert (promoted.status_code, promoted.json()["bulk_job_id"]) == (200, None)
+    # Отключить можно: записи остаются, их передадут другому (bulk).
     assert disabled.status_code == 200
+
+    await run_job(job_id)
+
+    team = await db_session.scalar(select(Contact.team_id).where(Contact.id == contact_id))
+    assert team == new_team  # запись догнала отдел ответственного
+    entry = await db_session.scalar(select(AuditEntry).where(AuditEntry.entity_id == str(job_id)))
+    assert entry is not None
+    assert entry.action == "bulk.move_team"
+    assert entry.changes == {
+        "user_id": str(rep_id),
+        "status": "done",
+        "rows": {"companies": 0, "contacts": 1, "deals": 0, "activities": 0},
+    }
 
 
 async def test_records_in_trash_do_not_block(
@@ -70,6 +108,27 @@ async def test_empty_team_with_records_cannot_be_deleted(
     rep = await member(make_user, org, "sales_rep", team=1)
     await make_contact(rep)
     # Человек ушёл из отдела в обход правил (например, данными до этапа 4) — записи остались.
+    await db_session.execute(
+        update(type(rep)).where(type(rep).id == rep.id).values(role="viewer", team_id=None)
+    )
+    await db_session.commit()
+
+    resp = await client.delete(f"/api/v1/teams/{org.team_ids[1]}", headers=admin)
+
+    assert (resp.status_code, resp.json()["code"]) == (409, "team.has_records")
+
+
+async def test_team_with_open_activity_cannot_be_deleted(
+    client: AsyncClient,
+    make_user: MakeUser,
+    make_org: MakeOrg,
+    make_activity: MakeRecord,
+    db_session: AsyncSession,
+) -> None:
+    org = await make_org()
+    admin = await tokens_for(client, await member(make_user, org, "org_admin"))
+    rep = await member(make_user, org, "sales_rep", team=1)
+    await make_activity(rep)  # только открытая задача — тоже живая запись отдела
     await db_session.execute(
         update(type(rep)).where(type(rep).id == rep.id).values(role="viewer", team_id=None)
     )

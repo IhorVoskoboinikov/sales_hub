@@ -18,7 +18,7 @@ from app.models import Activity, AuditEntry, Note
 from app.repositories.activities import AuditFilters, TaskWindow
 from app.repositories.crm import SoftDeleteRepository
 from app.repositories.pagination import Page, PageResult
-from app.services.crm import ensure_reference, get_for_change, resolve_owner
+from app.services.crm import ensure_reference, get_for_change, owner_for_restore, resolve_owner
 from app.uow import UnitOfWork
 
 Due = Literal["today", "overdue"]
@@ -78,19 +78,26 @@ class ActivityService:
     async def update(self, access: Access, activity_id: int, fields: dict[str, Any]) -> Activity:
         activity = await self._for_change(access, activity_id)
         owner_id = fields.pop("owner_id", None)
+        done = fields.pop("done", None)
+        reopen = done is False and activity.done_at is not None
+        if reopen and activity.due_at is None and "due_at" not in fields:
+            # Открытая задача без срока не попала бы ни в один список.
+            raise ValidationFailed(field="due_at")
+        # Все чтения — до присваиваний: иначе autoflush отправил бы UPDATE раньше времени.
+        owner = None
         if owner_id is not None and owner_id != activity.owner_id:
             owner = await resolve_owner(self.uow, access, owner_id)
+        elif reopen:
+            # Выполненную задачу move_team не переносит (история). Снова открытая, она
+            # возвращается в текущий отдел ответственного — как запись из корзины.
+            owner = await owner_for_restore(self.uow, activity)
+        if owner is not None:
             access.ensure_allowed(owner)
             activity.owner_id, activity.team_id = owner.owner_id, owner.team_id
-        if "done" in fields:
-            done = fields.pop("done")
-            if done and activity.done_at is None:
-                activity.done_at = datetime.now(UTC)
-            elif not done and activity.done_at is not None:
-                if activity.due_at is None and "due_at" not in fields:
-                    # Открытая задача без срока не попала бы ни в один список.
-                    raise ValidationFailed(field="due_at")
-                activity.done_at = None
+        if done and activity.done_at is None:
+            activity.done_at = datetime.now(UTC)
+        elif reopen:
+            activity.done_at = None
         for field, value in fields.items():
             setattr(activity, field, value)
         await self.uow.commit()

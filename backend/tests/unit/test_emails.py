@@ -1,30 +1,9 @@
-"""Письма: шаблоны и отправка после ответа (BackgroundTasks)."""
+"""Письма: шаблоны и ключи дедупа (отправка — воркером из outbox, tests/integration)."""
 
 import pytest
-from fastapi import APIRouter, BackgroundTasks, FastAPI
-from httpx import AsyncClient
-from structlog.testing import capture_logs
 
-from app.emails.mailer import BackgroundMailer, send_safely
 from app.emails.render import render_email
-from app.emails.sender import Email
-from tests.conftest import FakeEmailSender
-
-sender = FakeEmailSender()
-router = APIRouter(prefix="/test")
-
-
-@router.post("/invite")
-async def invite(background: BackgroundTasks) -> dict[str, str]:
-    mailer = BackgroundMailer(sender, background)
-    mailer.send_later(Email(to="ivan@example.com", subject="s", text="t", html="h"))
-    return {"status": "queued"}
-
-
-@pytest.fixture
-def app(app: FastAPI) -> FastAPI:
-    app.include_router(router)
-    return app
+from app.notifications.keys import email_key
 
 
 def test_invite_email_has_token_in_text_and_html() -> None:
@@ -59,21 +38,7 @@ def test_missing_variable_is_an_error() -> None:
         render_email("invite", "a@b.c", token="t")
 
 
-async def test_email_is_sent_after_response(client: AsyncClient) -> None:
-    sender.sent.clear()
-
-    resp = await client.post("/test/invite")
-
-    assert resp.status_code == 200
-    assert [e.to for e in sender.sent] == ["ivan@example.com"]
-
-
-async def test_send_failure_is_logged_not_raised() -> None:
-    class BrokenSender:
-        async def send(self, email: Email) -> None:
-            raise ConnectionRefusedError("smtp down")
-
-    with capture_logs() as logs:
-        await send_safely(BrokenSender(), Email(to="a@b.c", subject="s", text="t", html="h"))
-
-    assert any(e["event"] == "email_send_failed" and e["to"] == "a@b.c" for e in logs)
+def test_email_dedup_key_format() -> None:
+    # Формат ключа — часть данных: строки sent_notifications живут 30 дней, и смена формата
+    # между релизами отправила бы уже отправленные письма ещё раз.
+    assert email_key(42) == "email:42"

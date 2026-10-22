@@ -14,6 +14,7 @@ from app.repositories.organizations import OrganizationRepository, TeamRepositor
 from app.repositories.outbox import OutboxRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.reports import ReportRepository
+from app.repositories.sent_notifications import SentNotificationRepository
 from app.repositories.users import UserRepository
 
 
@@ -37,6 +38,7 @@ class UnitOfWork:
         self.reports = ReportRepository(session)
         self.live_records = LiveRecords(session, (Company, Contact, Deal))
         self.outbox = OutboxRepository(session)
+        self.sent_notifications = SentNotificationRepository(session)
 
     async def flush(self) -> None:
         """Отправить изменения в базу без коммита: проверить ограничения, получить значения

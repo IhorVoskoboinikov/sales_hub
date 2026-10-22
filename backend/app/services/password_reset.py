@@ -1,10 +1,11 @@
-"""Сброс забытого пароля письмом (раздел 4)."""
+"""Сброс забытого пароля письмом (раздел 4).
+
+Письмо — командой email.send в outbox в той же транзакции, что токен; отправит воркер.
+"""
 
 from datetime import UTC, datetime, timedelta
 
 from app.core.security import check_password_rules, hash_password
-from app.emails.render import render_email
-from app.emails.sender import Mailer
 from app.errors import ValidationFailed
 from app.models import EmailTokenPurpose
 from app.repositories import rate_limiter
@@ -19,23 +20,22 @@ class PasswordResetService:
     def __init__(
         self,
         uow: UnitOfWork,
-        mailer: Mailer,
         cache: UserCache,
         limiter: RateLimiter,
         ttl: timedelta,
         docs_url: str,
     ) -> None:
         self.uow = uow
-        self.mailer = mailer
         self.cache = cache
         self.limiter = limiter
         self.ttl = ttl
         self.docs_url = docs_url
 
     async def forgot(self, email: str) -> None:
-        """Письмо со ссылкой — только существующему и активному пользователю. Снаружи разницы
-        не видно: ответ всегда 202, а письмо уходит после ответа. Лимит — 3 запроса в час на
-        email, и для несуществующих тоже: иначе 429 выдавал бы, что email есть в базе."""
+        """Письмо с токеном — только существующему и активному пользователю. Снаружи разницы
+        не видно: ответ всегда 202, а SMTP ответ не ждёт — письмо отправляет воркер из outbox.
+        Лимит — 3 запроса в час на email, и для несуществующих тоже: иначе 429 выдавал бы, что
+        email есть в базе."""
         await self.limiter.hit(rate_limiter.PASSWORD_FORGOT, email.casefold())
         user = await self.uow.users.get_by_email(email)
         if user is None or not user.is_active:
@@ -43,16 +43,18 @@ class PasswordResetService:
         token = await issue_email_token(
             self.uow, EmailTokenPurpose.RESET_PASSWORD, user.email, self.ttl, user_id=user.id
         )
-        await self.uow.commit()
-        self.mailer.send_later(
-            render_email(
-                "reset_password",
-                user.email,
-                token=token.raw,
-                docs_url=self.docs_url,
-                expires_at=format_expiry(token.row.expires_at),
-            )
+        self.uow.outbox.add_email(
+            user.email,
+            "reset_password",
+            {
+                "token": token.raw,
+                "docs_url": self.docs_url,
+                "expires_at": format_expiry(token.row.expires_at),
+            },
+            org_id=user.org_id,
+            user_id=user.id,
         )
+        await self.uow.commit()
 
     async def reset(self, raw_token: str, new_password: str) -> None:
         """Новый пароль по токену из письма. Все сессии закрываются, все access-токены умирают."""

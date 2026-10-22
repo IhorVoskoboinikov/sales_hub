@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import cast
 
 import structlog
-from fastapi import BackgroundTasks, Depends, Query, Request
+from fastapi import Depends, Query, Request
 from fastapi.security import OAuth2PasswordBearer
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -15,8 +15,6 @@ from app.authz.opa import OpaClient
 from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.core.jwt import KeySet
-from app.emails.mailer import BackgroundMailer
-from app.emails.sender import EmailSender, Mailer
 from app.errors import Unauthorized
 from app.repositories.pagination import DEFAULT_LIMIT, MAX_LIMIT, Page
 from app.repositories.rate_limiter import RateLimiter
@@ -62,16 +60,6 @@ def get_roles(request: Request) -> RoleCatalog:
     return cast(RoleCatalog, request.app.state.roles)
 
 
-def get_email_sender(request: Request) -> EmailSender:
-    return cast(EmailSender, request.app.state.email_sender)
-
-
-def get_mailer(
-    background: BackgroundTasks, sender: EmailSender = Depends(get_email_sender)
-) -> Mailer:
-    return BackgroundMailer(sender, background)
-
-
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     factory = cast(async_sessionmaker[AsyncSession], request.app.state.session_factory)
     async with factory() as session:  # одна сессия на запрос
@@ -102,13 +90,12 @@ def get_auth_service(
 
 def get_invite_service(
     uow: UnitOfWork = Depends(get_uow),
-    mailer: Mailer = Depends(get_mailer),
     limiter: RateLimiter = Depends(get_rate_limiter),
     settings: Settings = Depends(get_app_settings),
 ) -> InviteService:
+    # Письма — командой в outbox (InviteService), отправляет их воркер: SMTP у API нет.
     return InviteService(
         uow,
-        mailer,
         limiter,
         timedelta(days=settings.invite_ttl_days),
         f"{settings.public_url}/docs",
@@ -117,14 +104,12 @@ def get_invite_service(
 
 def get_password_reset_service(
     uow: UnitOfWork = Depends(get_uow),
-    mailer: Mailer = Depends(get_mailer),
     cache: UserCache = Depends(get_user_cache),
     limiter: RateLimiter = Depends(get_rate_limiter),
     settings: Settings = Depends(get_app_settings),
 ) -> PasswordResetService:
     return PasswordResetService(
         uow,
-        mailer,
         cache,
         limiter,
         timedelta(minutes=settings.reset_password_ttl_minutes),

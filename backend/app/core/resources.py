@@ -1,7 +1,8 @@
 """Ресурсы процесса: пул Postgres, Redis, HTTP-клиент, файл ролей, отправка писем.
 
 Собирает их одна функция — для API (lifespan в main.py) и для воркеров (workers/runtime.py),
-поэтому таймауты у всех одинаковые, а отличается только размер пула (раздел 15).
+поэтому таймауты у всех одинаковые, а отличаются размер пула и то, что SMTP-отправитель есть
+только у воркеров (for_worker=True): с шага 5.3 API почту не отправляет (раздел 15).
 Соединения открываются лениво — при первом запросе, а не при создании.
 """
 
@@ -31,8 +32,8 @@ class Resources:
     opa: OpaClient
     nbu: NbuClient
     roles: RoleCatalog
-    # API шлёт письма сам до шага 5.3; потом — только воркер (раздел 15).
-    email_sender: EmailSender
+    # Только у воркеров: API пишет команду email.send в outbox, письмо отправляет воркер.
+    email_sender: EmailSender | None
 
     @classmethod
     def create(
@@ -42,9 +43,11 @@ class Resources:
         roles: RoleCatalog | None = None,
         pool_size: int = 5,
         max_overflow: int = 10,
+        for_worker: bool = False,
     ) -> "Resources":
         """roles — уже прочитанный файл ролей (API читает его при сборке приложения),
-        иначе он читается здесь. Нет файла — RuntimeError: процесс не стартует."""
+        иначе он читается здесь. Нет файла — RuntimeError: процесс не стартует.
+        for_worker — собрать и отправителя писем (у API его нет)."""
         # Файл ролей — первым: при ошибке пул и HTTP-клиент ещё не созданы, закрывать нечего.
         if roles is None:
             roles = RoleCatalog.load(settings.policies_dir)
@@ -65,19 +68,22 @@ class Resources:
             opa=OpaClient(http, settings.opa_url),
             nbu=NbuClient(http, settings.nbu_url),  # тот же пул: OPA и НБУ — разные хосты
             roles=roles,
-            email_sender=SmtpEmailSender(
-                host=settings.smtp_host,
-                port=settings.smtp_port,
-                sender=settings.email_from,
-                username=settings.smtp_username,
-                password=(
-                    settings.smtp_password.get_secret_value() if settings.smtp_password else None
-                ),
-                start_tls=settings.smtp_start_tls,
-            ),
+            email_sender=smtp_sender(settings) if for_worker else None,
         )
 
     async def aclose(self) -> None:
         await self.http.aclose()
         await self.redis.aclose()
         await self.engine.dispose()
+
+
+def smtp_sender(settings: Settings) -> SmtpEmailSender:
+    """Отправитель по SMTP из настроек. Соединение открывается на каждое письмо, не здесь."""
+    return SmtpEmailSender(
+        host=settings.smtp_host,
+        port=settings.smtp_port,
+        sender=settings.email_from,
+        username=settings.smtp_username,
+        password=settings.smtp_password.get_secret_value() if settings.smtp_password else None,
+        start_tls=settings.smtp_start_tls,
+    )

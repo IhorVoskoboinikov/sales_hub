@@ -16,7 +16,9 @@ from celery.app.task import Context
 from celery.app.trace import get_log_policy, log_policy_expected, log_policy_unexpected
 from sqlalchemy.exc import DBAPIError, IntegrityError, InterfaceError
 
+from app.core.config import Settings
 from app.core.context import request_id_var
+from app.core.resources import Resources
 from app.errors import Conflict, NotFound, ServiceUnavailable
 from app.workers.base import BACKOFF_MAX_SECONDS, BaseTask, backoff, is_retryable
 from app.workers.celery_app import TASK_ROUTES, celery_app
@@ -82,6 +84,10 @@ def test_db_error_without_sqlstate_is_not_retried() -> None:
         aiosmtplib.SMTPServerDisconnected("mailpit"),
         aiosmtplib.SMTPConnectTimeoutError("mailpit"),
         aiosmtplib.SMTPResponseException(421, "try again later"),
+        # Отказ на RCPT TO с 4xx — greylisting: через несколько минут адрес примут.
+        aiosmtplib.SMTPRecipientsRefused(
+            [aiosmtplib.SMTPRecipientRefused(451, "Greylisted", "alice@corp.example")]
+        ),
         redis.exceptions.ConnectionError("redis:6379"),
         redis.exceptions.TimeoutError("Timeout connecting to server"),  # не TimeoutError Python
         ServiceUnavailable(failed=["redis"]),
@@ -107,6 +113,9 @@ def test_temporary_failures_are_retried(exc: BaseException) -> None:
         PermissionError("data.yaml"),
         jinja2.TemplateNotFound("invite.html"),
         # SMTP 5xx — отказ навсегда: повтор получит тот же ответ.
+        aiosmtplib.SMTPRecipientsRefused(
+            [aiosmtplib.SMTPRecipientRefused(550, "no such user", "alice@corp.example")]
+        ),
         aiosmtplib.SMTPRecipientsRefused([]),
         aiosmtplib.SMTPResponseException(550, "mailbox unavailable"),
         aiosmtplib.SMTPAuthenticationError(535, "bad credentials"),
@@ -168,6 +177,16 @@ def test_routes_by_full_task_name() -> None:
     assert queue("bulk.plan") == "default"
     assert queue("bulk.reap_stuck") == "default"
     assert queue("workers.heartbeat") == "default"
+
+
+@pytest.mark.parametrize("for_worker", [False, True])
+async def test_email_sender_only_for_workers(settings: Settings, for_worker: bool) -> None:
+    # С шага 5.3 API почту не отправляет: SMTP-отправитель собирается только у воркеров.
+    resources = Resources.create(settings, for_worker=for_worker)
+    try:
+        assert (resources.email_sender is not None) is for_worker
+    finally:
+        await resources.aclose()
 
 
 def test_broker_io_is_bounded() -> None:

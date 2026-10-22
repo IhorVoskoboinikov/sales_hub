@@ -8,4 +8,6 @@ telegram.send и доменные события.
 Ключ — строка, а не EventType: relay ищет маршрут по значению колонки event_type.
 """
 
-ROUTES: dict[str, str] = {}
+ROUTES: dict[str, str] = {
+    "email.send": "notifications.send_email",
+}

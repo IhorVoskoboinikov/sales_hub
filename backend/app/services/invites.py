@@ -4,6 +4,9 @@
 Кто приглашает:
 - супер-админ — первого админа новой организации (invite_first_admin);
 - админ организации — людей в свою организацию с ролью и отделом (invite_member).
+
+Письмо сервис не отправляет: пишет команду email.send в outbox в той же транзакции, что токен
+и строка журнала. Отправит её воркер после коммита (notifications.send_email, раздел 4).
 """
 
 import uuid
@@ -13,8 +16,6 @@ from typing import Any
 
 from app.authz.access import Access
 from app.core.security import check_password_rules, hash_password
-from app.emails.render import render_email
-from app.emails.sender import Mailer
 from app.errors import Conflict, NotFound, ValidationFailed
 from app.models import ROLES_WITH_TEAM, EmailTokenPurpose, Organization, Role, User
 from app.repositories import rate_limiter
@@ -34,13 +35,11 @@ class InviteService:
     def __init__(
         self,
         uow: UnitOfWork,
-        mailer: Mailer,
         limiter: RateLimiter,
         ttl: timedelta,
         docs_url: str,
     ) -> None:
         self.uow = uow
-        self.mailer = mailer
         self.limiter = limiter
         self.ttl = ttl
         self.docs_url = docs_url
@@ -81,14 +80,21 @@ class InviteService:
         await self.limiter.hit(rate_limiter.INVITE, str(org.id))
         expires_at = datetime.now(UTC) + self.ttl
         invite = {"role": role.value, "team_id": str(team_id) if team_id else None}
-        if await self.uow.users.get_by_email(email) is not None:
+        existing = await self.uow.users.get_by_email(email)
+        if existing is not None:
             # В журнал организации — то же, что при обычном приглашении: журнал читают её
             # админы (audit:read), и отдельная запись выдала бы, что email занят.
             self._audit(actor_id, org.id, "invite.created", email, invite)
-            await self.uow.commit()
             # Ответ тот же 202: админ чужой организации не должен узнать, что email занят.
             # А сам человек получит письмо и поймёт, что его пытались пригласить.
-            self.mailer.send_later(render_email("already_member", email, org_name=org.name))
+            self.uow.outbox.add_email(
+                email,
+                "already_member",
+                {"org_name": org.name},
+                org_id=org.id,
+                user_id=existing.id,
+            )
+            await self.uow.commit()
             return Invite(email=email, expires_at=expires_at)
         token = await issue_email_token(
             self.uow,
@@ -98,18 +104,20 @@ class InviteService:
             payload={"org_id": str(org.id), **invite},
         )
         self._audit(actor_id, org.id, "invite.created", email, invite)
-        await self.uow.commit()
-        self.mailer.send_later(
-            render_email(
-                "invite",
-                email,
-                token=token.raw,
-                org_name=org.name,
-                role_title=uk.ROLE_TITLES[role],
-                docs_url=self.docs_url,
-                expires_at=format_expiry(token.row.expires_at),
-            )
+        # Сырой токен — только в контексте письма (ключ token): после отправки его сотрут.
+        self.uow.outbox.add_email(
+            email,
+            "invite",
+            {
+                "token": token.raw,
+                "org_name": org.name,
+                "role_title": uk.ROLE_TITLES[role],
+                "docs_url": self.docs_url,
+                "expires_at": format_expiry(token.row.expires_at),
+            },
+            org_id=org.id,
         )
+        await self.uow.commit()
         return Invite(email=email, expires_at=token.row.expires_at)
 
     async def accept(self, raw_token: str, password: str) -> User:

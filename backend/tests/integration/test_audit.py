@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from app.models import AuditEntry
 from app.uow import UnitOfWork
-from tests.integration.conftest import Mailpit, MakeOrg, MakeUser, member, tokens_for
+from tests.integration.conftest import MakeOrg, MakeUser, member, tokens_for
 
 
 async def entries(uow: UnitOfWork, **filters: Any) -> list[AuditEntry]:
@@ -61,7 +61,6 @@ async def test_superadmin_and_team_actions_are_logged(
     client: AsyncClient,
     make_user: MakeUser,
     make_org: MakeOrg,
-    mailpit: Mailpit,
     uow: UnitOfWork,
 ) -> None:
     root = await make_user(f"root-{uuid.uuid4().hex[:8]}@example.com", is_superadmin=True)

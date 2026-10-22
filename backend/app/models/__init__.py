@@ -7,6 +7,7 @@ from app.models.crm import Company, Contact, ContactStatus
 from app.models.deals import Deal, DealStatus, Pipeline, PipelineStage
 from app.models.email_token import EmailToken, EmailTokenPurpose
 from app.models.fx import FxRate
+from app.models.notifications import NotificationChannel, SentNotification
 from app.models.organization import Organization, Team
 from app.models.outbox import OutboxEvent
 from app.models.refresh_token import RefreshToken
@@ -27,12 +28,14 @@ __all__ = [
     "EmailTokenPurpose",
     "FxRate",
     "Note",
+    "NotificationChannel",
     "Organization",
     "OutboxEvent",
     "Pipeline",
     "PipelineStage",
     "RefreshToken",
     "Role",
+    "SentNotification",
     "Team",
     "User",
 ]

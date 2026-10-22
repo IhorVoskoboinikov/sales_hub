@@ -50,8 +50,9 @@ def get_runtime() -> Runtime:
     if _runtime is None or _runtime.pid != os.getpid():
         # Сначала ресурсы, потом loop: create бросает (нет файла ролей) — ничего не создано и
         # не утекло, каждая следующая задача падает с той же понятной ошибкой.
+        # for_worker=True: отправитель писем (SMTP) есть только у воркеров.
         resources = Resources.create(
-            current_settings(), pool_size=POOL_SIZE, max_overflow=MAX_OVERFLOW
+            current_settings(), pool_size=POOL_SIZE, max_overflow=MAX_OVERFLOW, for_worker=True
         )
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

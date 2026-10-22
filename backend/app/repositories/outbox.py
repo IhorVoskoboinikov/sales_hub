@@ -1,14 +1,22 @@
 import json
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, literal, select, update
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.types import Text
 
 from app.core.context import get_request_id
+from app.events.types import EventType
 from app.models import OutboxEvent
+
+# Где в payload команды email.send лежит одноразовый токен: context.token. Под этим именем его
+# подставляют шаблоны (app/texts/emails/*: {{ token }}), и только его стирает scrub_token —
+# поэтому секрет в контексте письма кладётся только сюда, а не, например, в готовую ссылку.
+TOKEN_PATH = ("context", "token")
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,45 @@ class OutboxRepository:
         )
         self.session.add(event)
         return event
+
+    def add_email(
+        self,
+        to: str,
+        template: str,
+        context: Mapping[str, str],
+        *,
+        org_id: uuid.UUID | None = None,
+        user_id: uuid.UUID | None = None,
+        dedup_key: str | None = None,
+    ) -> OutboxEvent:
+        """Команда «отправить письмо» (раздел 4): её выполнит notifications.send_email.
+
+        Пишется до коммита, в той же транзакции, что токен и строка журнала: откат — письма
+        нет, коммит — письмо уйдёт, даже если SMTP или Redis сейчас недоступны. context — только
+        строки, готовые для шаблона; токен — под ключом token (TOKEN_PATH), его стирают после
+        отправки. dedup_key None — ключ email:{event_id} (app/notifications/keys.py)."""
+        return self.add(
+            EventType.EMAIL_SEND,
+            {
+                "to": to,
+                "template": template,
+                "context": dict(context),
+                "user_id": user_id,
+                "dedup_key": dedup_key,
+            },
+            org_id=org_id,
+        )
+
+    async def scrub_token(self, event_id: int) -> None:
+        """Стереть сырой токен из payload после отправки письма: payload #- '{context,token}'.
+        Коммит — за вызывающим, в той же транзакции, что отметка в sent_notifications."""
+        path = literal(list(TOKEN_PATH), ARRAY(Text))
+        await self.session.execute(
+            update(OutboxEvent)
+            .where(OutboxEvent.id == event_id)
+            .values(payload=OutboxEvent.payload.op("#-")(path))
+            .execution_options(synchronize_session=False)
+        )
 
     async def get(self, event_id: int) -> OutboxEvent | None:
         return await self.session.get(OutboxEvent, event_id)

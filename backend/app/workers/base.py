@@ -45,6 +45,11 @@ def is_retryable(exc: BaseException) -> bool:
         return exc.code in RETRYABLE_UNAVAILABLE_CODES
     # SMTP ответил 4xx — «попробуйте позже»; 5xx (адрес отклонён, нет авторизации) — навсегда.
     # Обрыв и таймаут SMTP — наследники ConnectionError и TimeoutError, их ловит проверка ниже.
+    # Отказ на RCPT TO aiosmtplib бросает списком SMTPRecipientsRefused — он не наследник
+    # SMTPResponseException, а коды внутри часто 4xx (greylisting 451, ящик переполнен 452).
+    # Повторяем, если все отказы временные; у нас один получатель на письмо — решает его код.
+    if isinstance(exc, aiosmtplib.SMTPRecipientsRefused):
+        return bool(exc.recipients) and all(400 <= r.code < 500 for r in exc.recipients)
     if isinstance(exc, aiosmtplib.SMTPResponseException):
         return 400 <= exc.code < 500
     # Не весь OSError: FileNotFoundError, PermissionError и TemplateNotFound тоже его

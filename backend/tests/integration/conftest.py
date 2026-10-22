@@ -3,10 +3,11 @@
 Изоляция (раздел 10): каждый тест работает во внешней транзакции, которая откатывается после
 него. Коммиты сервисов внутри теста становятся SAVEPOINT-ами — таблицы чистить не нужно.
 Задачи Celery выполняет настоящий воркер в потоке (фикстура celery_worker, маркер worker).
+Outbox внутри транзакции теста доставляет фикстура deliver_outbox, письма читает inbox.
 """
 
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -32,7 +33,9 @@ from testcontainers.core.wait_strategies import HttpWaitStrategy
 
 from app.api.deps import get_session
 from app.core.config import Settings
+from app.core.resources import smtp_sender
 from app.core.security import hash_password
+from app.events.relay import publish_batch
 from app.models import (
     Activity,
     Company,
@@ -44,6 +47,7 @@ from app.models import (
     Team,
     User,
 )
+from app.services.notifications import NotificationService
 from app.uow import UnitOfWork
 from app.workers import runtime
 from app.workers.celery_app import celery_app
@@ -163,6 +167,7 @@ def celery_worker(
     redis_url: str,
     celery_broker_url: str,
     celery_broker: None,
+    mailpit: Mailpit,
 ) -> Iterator[WorkController]:
     """Настоящий воркер нашего celery_app в потоке этого процесса (раздел 10), один на запуск.
 
@@ -177,6 +182,8 @@ def celery_worker(
             database_url=postgres_url,
             redis_url=redis_url,
             celery_broker_url=celery_broker_url,
+            smtp_host=mailpit.smtp_host,  # notifications.send_email шлёт в Mailpit контейнера
+            smtp_port=mailpit.smtp_port,
             policies_dir=POLICIES_DIR,
             jwt_private_key_file=jwt_key_file,
             nbu_url=NBU_URL,
@@ -232,6 +239,67 @@ def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
 
     app.dependency_overrides[get_session] = test_session
     return app
+
+
+Handler = Callable[[int], Awaitable[None]]
+
+
+class InlinePublisher:
+    """Издатель для outbox внутри транзакции теста: ничего не ставит в Celery, а запоминает
+    (имя задачи, id события) — deliver_inline выполнит обработчики сам."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, int]] = []
+
+    async def publish(self, task_name: str, event_id: int) -> None:
+        self.published.append((task_name, event_id))
+
+
+async def deliver_inline(session: AsyncSession, handlers: Mapping[str, Handler]) -> int:
+    """Доставить outbox в сессии теста (раздел 10): строки транзакции теста не закоммичены, и
+    настоящий relay их не видит. Та же publish_batch, что у relay, но обработчик задачи
+    вызывается сразу и в той же сессии — после коммита батча, как воркер после relay. Круги —
+    пока неопубликованные строки не кончатся (notify порождает новые команды, шаг 5.12).
+    Возвращает число доставленных событий. Фикстура deliver_outbox — то же с обработчиками
+    настоящих задач."""
+    delivered = 0
+    while True:
+        publisher = InlinePublisher()
+        await publish_batch(session, publisher, batch_size=100)
+        if not publisher.published:
+            return delivered
+        for task_name, event_id in publisher.published:
+            await handlers[task_name](event_id)
+        delivered += len(publisher.published)
+
+
+DeliverOutbox = Callable[[], Awaitable[int]]
+
+
+@pytest.fixture
+def deliver_outbox(db_session: AsyncSession, settings: Settings) -> DeliverOutbox:
+    """deliver_outbox() — доставить outbox этого теста: письма уходят в Mailpit контейнера."""
+    notifications = NotificationService(UnitOfWork(db_session), smtp_sender(settings))
+    handlers: dict[str, Handler] = {"notifications.send_email": notifications.send_email}
+
+    async def run() -> int:
+        return await deliver_inline(db_session, handlers)
+
+    return run
+
+
+Inbox = Callable[[str], Awaitable[list[dict[str, Any]]]]
+
+
+@pytest.fixture
+def inbox(deliver_outbox: DeliverOutbox, mailpit: Mailpit) -> Inbox:
+    """inbox(email) = доставить outbox теста + письма адреса из Mailpit (от новых к старым)."""
+
+    async def read(to: str) -> list[dict[str, Any]]:
+        await deliver_outbox()
+        return await read_emails(mailpit, to)
+
+    return read
 
 
 PASSWORD = "correct horse battery"  # пароль всех пользователей из make_user

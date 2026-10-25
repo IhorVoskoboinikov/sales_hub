@@ -1,6 +1,8 @@
 """Массовые операции на настоящих транзакциях (маркер committing) и на настоящем воркере.
 
 - два чанка заканчивают одновременно — job завершается ровно один раз, одна строка журнала;
+- два прохода bulk.reap_stuck одновременно — одна повторная отправка; job, которую держит
+  другая транзакция, reaper пропускает (SKIP LOCKED); сдавшись, он не ждёт строку идущего чанка;
 - конец в конец: POST-сценарий через сервис → bulk.plan в Redis → воркер режет на чанки →
   группа bulk.chunk → finalize. Данные коммитятся, после теста фикстура удаляет организацию.
 """
@@ -9,10 +11,11 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timedelta
 
 import pytest
 from celery.worker import WorkController
-from sqlalchemy import delete, func, insert, select
+from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.authz.access import Access
@@ -30,7 +33,7 @@ from app.models import (
     Team,
     User,
 )
-from app.services.bulk import BulkService, ReassignOwnerRequest
+from app.services.bulk import BulkService, ReapPolicy, ReassignOwnerRequest
 from app.uow import UnitOfWork
 from app.workers import runtime
 from app.workers.celery_app import celery_app
@@ -119,8 +122,59 @@ async def add_contacts(
         await s.commit()
 
 
-def service(session: AsyncSession, chunk_size: int = 2) -> BulkService:
-    return BulkService(UnitOfWork(session), CATALOG, FakeTaskQueue(), chunk_size=chunk_size)
+def service(
+    session: AsyncSession, chunk_size: int = 2, queue: FakeTaskQueue | None = None
+) -> BulkService:
+    return BulkService(
+        UnitOfWork(session), CATALOG, queue or FakeTaskQueue(), chunk_size=chunk_size
+    )
+
+
+async def empty_queue(queue: str) -> int:
+    return 0  # LLEN очереди bulk: сообщений нет
+
+
+async def started_job(
+    sessions: async_sessionmaker[AsyncSession], org: CommittedOrg, contacts: int
+) -> uuid.UUID:
+    """Закоммиченная job reassign_owner: до plan (contacts = 0 — только pending) или с чанками."""
+    if contacts:
+        await add_contacts(sessions, org, org.leaving_id, contacts)
+    async with sessions() as s:
+        bulk = service(s)
+        request = ReassignOwnerRequest(org.leaving_id, org.heir_id, ("contacts",))
+        job_id = (await bulk.start_reassign_owner(org.admin_access(), request, None)).id
+        if contacts:
+            await bulk.plan(job_id)
+    return job_id
+
+
+async def age_job(
+    sessions: async_sessionmaker[AsyncSession], job_id: uuid.UUID, minutes: int, **values: object
+) -> None:
+    async with sessions() as s:
+        await s.execute(
+            update(BulkJob)
+            .where(BulkJob.id == job_id)
+            .values(updated_at=func.now() - timedelta(minutes=minutes), **values)
+        )
+        await s.commit()
+
+
+async def read_job(sessions: async_sessionmaker[AsyncSession], job_id: uuid.UUID) -> BulkJob:
+    async with sessions() as s:
+        job = await s.get(BulkJob, job_id)
+        assert job is not None
+        return job
+
+
+def plans_of(queues: list[FakeTaskQueue], job_id: uuid.UUID) -> int:
+    return sum(
+        1
+        for queue in queues
+        for name, args in queue.enqueued
+        if name == "bulk.plan" and args == (str(job_id),)
+    )
 
 
 async def audit_count(sessions: async_sessionmaker[AsyncSession], job_id: uuid.UUID) -> int:
@@ -199,6 +253,89 @@ async def test_concurrent_finalize_has_one_winner(
     assert await audit_count(sessions, job_id) == 1
 
 
+@pytest.mark.committing
+async def test_concurrent_reapers_resend_once(
+    sessions: async_sessionmaker[AsyncSession], committed: CommittedOrg
+) -> None:
+    job_id = await started_job(sessions, committed, 0)
+    await age_job(sessions, job_id, 3)  # pending 3 минуты — потерянный bulk.plan
+    queues = [FakeTaskQueue(), FakeTaskQueue()]
+
+    # Beat поставил следующий проход, пока медленный ещё идёт: оба видят одну job.
+    async with sessions() as first, sessions() as second:
+        await asyncio.gather(
+            service(first, queue=queues[0]).reap_stuck(ReapPolicy(), empty_queue),
+            service(second, queue=queues[1]).reap_stuck(ReapPolicy(), empty_queue),
+        )
+
+    assert plans_of(queues, job_id) == 1
+    assert (await read_job(sessions, job_id)).reaps == 1
+
+
+@pytest.mark.committing
+async def test_reaper_skips_job_locked_by_another(
+    sessions: async_sessionmaker[AsyncSession], committed: CommittedOrg
+) -> None:
+    job_id = await started_job(sessions, committed, 0)
+    await age_job(sessions, job_id, 3)
+    queue = FakeTaskQueue()
+
+    async with sessions() as holder:
+        # Строку держит другая копия reaper (или отмена): SKIP LOCKED — не ждать, не слать.
+        await holder.execute(select(BulkJob).where(BulkJob.id == job_id).with_for_update())
+        async with sessions() as s:
+            await asyncio.wait_for(
+                service(s, queue=queue).reap_stuck(ReapPolicy(), empty_queue), timeout=5
+            )
+        assert plans_of([queue], job_id) == 0
+        await holder.rollback()
+
+    async with sessions() as s:
+        await service(s, queue=queue).reap_stuck(ReapPolicy(), empty_queue)
+    assert plans_of([queue], job_id) == 1
+
+
+@pytest.mark.committing
+async def test_giving_up_does_not_wait_for_running_chunk(
+    sessions: async_sessionmaker[AsyncSession], committed: CommittedOrg
+) -> None:
+    job_id = await started_job(sessions, committed, 4)  # чанки 0 и 1
+    await age_job(sessions, job_id, 6, reaps=3)
+
+    async with sessions() as chunk:
+        # Чанк 0 «выполняется»: его строка взята FOR UPDATE, как в run_chunk. Reaper сдаётся и
+        # не ждёт её (иначе чанк, дойдя до строки job, ждал бы reaper — deadlock).
+        await chunk.execute(
+            select(BulkJobChunk)
+            .where(BulkJobChunk.job_id == job_id, BulkJobChunk.no == 0)
+            .with_for_update()
+        )
+        async with sessions() as s:
+            await asyncio.wait_for(service(s).reap_stuck(ReapPolicy(), empty_queue), timeout=5)
+        job = await read_job(sessions, job_id)
+        assert (job.status, job.error) == ("running", "bulk.stuck")  # чанк 0 ещё pending
+        await chunk.rollback()  # процесс чанка умер, строка осталась pending
+
+    # Живой чанк доработал бы сам и вызвал finalize (error уже есть — failed). Умерший — снова
+    # «без прогресса» (set_error обновил updated_at), и проход через 5 минут дожимает: оставшийся
+    # чанк skipped, job failed.
+    await age_job(sessions, job_id, 6)
+    async with sessions() as s:
+        await service(s).reap_stuck(ReapPolicy(), empty_queue)
+    job = await read_job(sessions, job_id)
+    assert (job.status, job.error) == ("failed", "bulk.stuck")
+    async with sessions() as s:
+        statuses = list(
+            await s.scalars(
+                select(BulkJobChunk.status)
+                .where(BulkJobChunk.job_id == job_id)
+                .order_by(BulkJobChunk.no)
+            )
+        )
+    assert statuses == ["skipped", "skipped"]
+    assert await audit_count(sessions, job_id) == 1
+
+
 @pytest.mark.worker
 @pytest.mark.committing
 async def test_reassign_end_to_end_on_worker(
@@ -244,3 +381,24 @@ async def test_reassign_end_to_end_on_worker(
         assert left == 0
         assert list(statuses) == ["done"]
     assert await audit_count(sessions, job_id) == 1
+
+
+@pytest.mark.worker
+@pytest.mark.committing
+async def test_reaper_on_worker_recovers_lost_plan(
+    celery_worker: WorkController,
+    sessions: async_sessionmaker[AsyncSession],
+    committed: CommittedOrg,
+) -> None:
+    # API закоммитил job, а bulk.plan в брокер не попал (фейковая очередь его «потеряла»).
+    job_id = await started_job(sessions, committed, 0)
+    await add_contacts(sessions, committed, committed.leaving_id, 5)
+    await age_job(sessions, job_id, 3)
+
+    celery_app.send_task("bulk.reap_stuck")  # как beat: reaper → bulk.plan → чанки → finalize
+
+    deadline = asyncio.get_running_loop().time() + WAIT_SECONDS
+    while (job := await read_job(sessions, job_id)).finished_at is None:
+        assert asyncio.get_running_loop().time() < deadline, f"job не завершилась: {job.status}"
+        await asyncio.sleep(0.2)
+    assert (job.status, job.processed, job.reaps) == ("done", 5, 1)

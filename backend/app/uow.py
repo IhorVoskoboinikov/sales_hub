@@ -10,6 +10,7 @@ from app.repositories.contacts import CompanyRepository, ContactRepository
 from app.repositories.crm import LiveRecords
 from app.repositories.deals import DealRepository, PipelineRepository
 from app.repositories.email_tokens import EmailTokenRepository
+from app.repositories.failed_tasks import FailedTaskRepository
 from app.repositories.fx import FxRateRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
 from app.repositories.outbox import OutboxRepository
@@ -43,6 +44,7 @@ class UnitOfWork:
         self.bulk_jobs = BulkJobRepository(session)
         self.bulk_chunks = BulkChunkRepository(session)
         self.bulk = BulkRepository(session)
+        self.failed_tasks = FailedTaskRepository(session)
 
     async def flush(self) -> None:
         """Отправить изменения в базу без коммита: проверить ограничения, получить значения

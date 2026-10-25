@@ -10,6 +10,11 @@ x-app-env: &app-env
   REDIS_URL: redis://redis:6379/0
   CELERY_BROKER_URL: redis://redis:6379/1  # очереди Celery — отдельно от кэша (раздел 15)
   BULK_CHUNK_SIZE: 10000  # строк в чанке массовой операции (раздел 6)
+  # bulk.reap_stuck (раздел 15): пороги в секундах и сколько раз переотправлять до bulk.stuck
+  BULK_REAP_PENDING_SECONDS: 120
+  BULK_REAP_STALL_SECONDS: 300
+  IMPORT_REAP_STALL_SECONDS: 900
+  BULK_MAX_REAPS: 3
   SMTP_HOST: mailpit  # письма видно на localhost:8025
   OPA_URL: http://opa:8181
   POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA

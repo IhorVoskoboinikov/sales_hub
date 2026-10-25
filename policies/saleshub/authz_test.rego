@@ -139,9 +139,29 @@ test_everyone_in_org_reads_reports_in_own_level if {
 	not authz.allow with input as req(super_admin, "GET", "/api/v1/reports/pipeline")
 }
 
+# Упавшие задачи Celery — системное, только супер-админ: админ организации их не видит.
+test_only_super_admin_sees_failed_tasks if {
+	routes := [
+		["GET", "/api/v1/admin/failed-tasks"],
+		["GET", "/api/v1/admin/failed-tasks/{failed_task_id}"],
+		["POST", "/api/v1/admin/failed-tasks/{failed_task_id}/replay"],
+	]
+	every r in routes {
+		d := authz.decision with input as req(super_admin, r[0], r[1])
+		d.allow
+		d.action == "admin:system"
+	}
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		every r in routes {
+			not authz.allow with input as req(user, r[0], r[1])
+		}
+	}
+}
+
 # У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
 test_super_admin_only_admin_routes if {
 	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/orgs")
+	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/failed-tasks")
 	not authz.allow with input as req(super_admin, "GET", "/api/v1/org")
 	not authz.allow with input as req(super_admin, "POST", "/api/v1/invites")
 }
@@ -232,4 +252,18 @@ test_viewer_reads_own_jobs if {
 		d.allow
 		d.action == "bulk_job:read"
 	}
+}
+
+# Отменить job может тот, кто её видит: админ, руководитель и наблюдатель (свои выгрузки);
+# менеджер — нет, у него нет ни bulk_job:read, ни bulk_job:cancel.
+test_bulk_job_cancel if {
+	every user in [org_admin, team_lead, viewer] {
+		d := authz.decision with input as req(user, "POST", "/api/v1/bulk-jobs/{job_id}/cancel")
+		d.allow
+		d.action == "bulk_job:cancel"
+	}
+	data.saleshub.roles.viewer.permissions["bulk_job:cancel"] == "own"
+	not data.saleshub.roles.sales_rep.permissions["bulk_job:cancel"]
+	not authz.allow with input as req(sales_rep, "POST", "/api/v1/bulk-jobs/{job_id}/cancel")
+	not authz.allow with input as req(super_admin, "POST", "/api/v1/bulk-jobs/{job_id}/cancel")
 }

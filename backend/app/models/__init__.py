@@ -15,6 +15,7 @@ from app.models.bulk import (
 from app.models.crm import Company, Contact, ContactStatus
 from app.models.deals import Deal, DealStatus, Pipeline, PipelineStage
 from app.models.email_token import EmailToken, EmailTokenPurpose
+from app.models.failed_tasks import FailedTask
 from app.models.fx import FxRate
 from app.models.notifications import NotificationChannel, SentNotification
 from app.models.organization import Organization, Team
@@ -42,6 +43,7 @@ __all__ = [
     "DealStatus",
     "EmailToken",
     "EmailTokenPurpose",
+    "FailedTask",
     "FxRate",
     "Note",
     "NotificationChannel",

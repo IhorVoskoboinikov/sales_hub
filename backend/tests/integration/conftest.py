@@ -32,11 +32,18 @@ from testcontainers.community.redis import RedisContainer
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import HttpWaitStrategy
 
-from app.api.deps import SessionScope, get_session, get_session_scope, get_task_queue
+from app.api.deps import (
+    SessionScope,
+    get_session,
+    get_session_scope,
+    get_task_queue,
+    get_task_sender,
+)
 from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.core.resources import smtp_sender
 from app.core.security import hash_password
+from app.errors import ServiceUnavailable
 from app.events.relay import publish_batch
 from app.models import (
     Activity,
@@ -44,6 +51,7 @@ from app.models import (
     Company,
     Contact,
     Deal,
+    FailedTask,
     Organization,
     Pipeline,
     PipelineStage,
@@ -55,6 +63,7 @@ from app.services.notifications import NotificationService
 from app.uow import UnitOfWork
 from app.workers import runtime
 from app.workers.celery_app import celery_app
+from app.workers.queue import CeleryTaskSender
 from tests.conftest import POLICIES_DIR
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -245,8 +254,38 @@ def task_queue() -> FakeTaskQueue:
     return FakeTaskQueue()
 
 
+class FakeTaskSender:
+    """Подмена TaskSender (перезапуск упавших задач): какие задачи есть и какие из них можно
+    перезапускать — настоящий реестр celery_app, а публикация только запоминается (иначе
+    задачу выполнил бы сессионный воркер). broker_down — брокер недоступен (503)."""
+
+    def __init__(self) -> None:
+        self.registry = CeleryTaskSender(celery_app)
+        self.sent: list[tuple[str, list[Any], dict[str, Any]]] = []
+        self.broker_down = False
+
+    def replayable(self, name: str) -> bool | None:
+        return self.registry.replayable(name)
+
+    async def send(self, name: str, args: list[Any], kwargs: dict[str, Any]) -> str:
+        if self.broker_down:
+            raise ServiceUnavailable()
+        self.sent.append((name, args, kwargs))
+        return f"replay-{uuid.uuid4().hex}"
+
+
 @pytest.fixture
-def app(app: FastAPI, db_session: AsyncSession, task_queue: FakeTaskQueue) -> FastAPI:
+def task_sender() -> FakeTaskSender:
+    return FakeTaskSender()
+
+
+@pytest.fixture
+def app(
+    app: FastAPI,
+    db_session: AsyncSession,
+    task_queue: FakeTaskQueue,
+    task_sender: FakeTaskSender,
+) -> FastAPI:
     # Запросы API идут в ту же транзакцию теста: после теста всё откатится.
     async def test_session() -> AsyncIterator[AsyncSession]:
         try:
@@ -267,6 +306,7 @@ def app(app: FastAPI, db_session: AsyncSession, task_queue: FakeTaskQueue) -> Fa
     app.dependency_overrides[get_session] = test_session
     app.dependency_overrides[get_session_scope] = session_scope
     app.dependency_overrides[get_task_queue] = lambda: task_queue
+    app.dependency_overrides[get_task_sender] = lambda: task_sender
     return app
 
 
@@ -599,3 +639,29 @@ def run_job(uow: UnitOfWork) -> RunJob:
             await service.run_chunk(job_id, no)
 
     return run
+
+
+MakeFailedTask = Callable[..., Awaitable[FailedTask]]
+
+
+@pytest.fixture
+def make_failed_task(uow: UnitOfWork) -> MakeFailedTask:
+    """Строка failed_tasks, как её пишет task_failure. По умолчанию — workers.heartbeat: его
+    можно перезапускать."""
+
+    async def make(**fields: Any) -> FailedTask:
+        fields.setdefault("task_id", str(uuid.uuid4()))
+        fields.setdefault("task_name", "workers.heartbeat")
+        fields.setdefault("queue", "default")
+        fields.setdefault("args", [])
+        fields.setdefault("kwargs", {})
+        fields.setdefault("exc_type", "builtins.ConnectionRefusedError")
+        fields.setdefault("exc_message", "redis:6379")
+        fields.setdefault("traceback", "Traceback (most recent call last): ...")
+        fields.setdefault("retries", 5)
+        task = FailedTask(**fields)
+        uow.session.add(task)
+        await uow.commit()
+        return task
+
+    return make

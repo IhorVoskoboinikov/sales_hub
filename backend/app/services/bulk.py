@@ -18,7 +18,8 @@
 import hashlib
 import json
 import uuid
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
@@ -27,15 +28,20 @@ from sqlalchemy.exc import IntegrityError
 
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
-from app.errors import Conflict, ValidationFailed
+from app.errors import Conflict, NotFound, ValidationFailed
 from app.models import BulkEntity, BulkJob, BulkJobKind, BulkJobStatus, ChunkStatus, User
-from app.models.bulk import ACTIVE_JOB_INDEX, IDEMPOTENCY_CONSTRAINT
+from app.models.bulk import ACTIVE_JOB_INDEX, FINAL_STATUSES, IDEMPOTENCY_CONSTRAINT
 from app.repositories.bulk import (
     ENTITY_MODELS,
+    STUCK_ERROR,
     ChunkPlan,
     FinishedJob,
+    lost_finalize,
     move_team_filter,
     reassign_owner_filter,
+    stale_pending,
+    stalled_chunks,
+    stalled_import,
 )
 from app.services.crm import Owner, can_own, resolve_owner
 from app.uow import UnitOfWork
@@ -52,6 +58,10 @@ REASSIGN_INCLUDE: dict[str, BulkEntity] = {
 }
 
 PLAN_TASK = "bulk.plan"
+CHUNK_TASK = "bulk.chunk"
+# Задача импорта появится в шаге 5.6; reaper ставит её по имени, как API — bulk.plan.
+IMPORT_TASK = "imports.import_contacts"
+BULK_QUEUE = "bulk"  # очередь чанков: её длину reaper смотрит перед повторной отправкой
 
 # move_team догоняет все живые и открытые записи человека — во всех четырёх таблицах.
 MOVE_TEAM_ENTITIES = list(BulkEntity)
@@ -93,6 +103,43 @@ def new_move_team_job(access: Access, user_id: uuid.UUID) -> BulkJob:
     )
 
 
+@dataclass(frozen=True)
+class ReapPolicy:
+    """Пороги bulk.reap_stuck (Settings: BULK_REAP_PENDING_SECONDS, BULK_REAP_STALL_SECONDS,
+    IMPORT_REAP_STALL_SECONDS, BULK_MAX_REAPS)."""
+
+    pending_seconds: int = 120
+    stall_seconds: int = 300
+    import_stall_seconds: int = 900
+    max_reaps: int = 3
+
+
+@dataclass
+class ReapReport:
+    """Что сделал один проход reaper — для лога и тестов."""
+
+    replanned: list[uuid.UUID] = field(default_factory=list)  # (1) снова bulk.plan
+    finalized: list[uuid.UUID] = field(default_factory=list)  # (2) потерянный finalize
+    resent: dict[uuid.UUID, list[int]] = field(default_factory=dict)  # (3) job → чанки
+    reimported: list[uuid.UUID] = field(default_factory=list)  # импорт: снова задача
+    stuck: list[uuid.UUID] = field(default_factory=list)  # сдались: bulk.stuck
+    queue_busy: bool = False  # (3) отложено: в очереди bulk есть сообщения
+
+    def __bool__(self) -> bool:
+        return bool(
+            self.replanned
+            or self.finalized
+            or self.resent
+            or self.reimported
+            or self.stuck
+            or self.queue_busy
+        )
+
+
+# Длина очереди брокера (LLEN в db 1): в воркере — Redis, в тестах — подмена.
+QueueLength = Callable[[str], Awaitable[int]]
+
+
 def failure_code(exc: BaseException) -> str:
     """Код причины в bulk_job_chunks.error: код AppError или имя класса исключения."""
     return str(getattr(exc, "code", None) or type(exc).__name__)[:64]
@@ -112,6 +159,45 @@ class BulkService:
     async def get(self, access: Access, job_id: uuid.UUID) -> BulkJob:
         """Job в уровне bulk_job:read (автор — owner_id) или своя, иначе 404."""
         return await self.uow.bulk_jobs.get_visible_or_404(job_id, access)
+
+    async def cancel(self, access: Access, job_id: uuid.UUID) -> BulkJob:
+        """Отменить job (раздел 15, «Жизненный цикл bulk job»). access — bulk_job:cancel.
+
+        Job ищется по уровню bulk_job:read (не видна — 404), отменить можно в уровне
+        bulk_job:cancel (иначе 403); свою job автор отменяет всегда — так же, как всегда её
+        видит. pending → сразу cancelled (с итогом и строкой журнала), running → cancelling
+        (чанки станут skipped, cancelled поставит finalize), cancelling / cancelled — без
+        изменений; остальные финальные статусы и move_team — 409 bulk.not_cancellable."""
+        read = access.for_action("bulk_job:read", self.roles)
+        if read is None:  # cancel не шире read (тест политик) — это страховка
+            raise NotFound(entity="bulk_job", id=str(job_id))
+        try:
+            job = await self.uow.bulk_jobs.get_visible_or_404(job_id, read, for_update=True)
+            if job.owner_id != access.user_id:
+                access.ensure_allowed(job)
+            if job.kind == BulkJobKind.MOVE_TEAM:
+                # Следствие уже сделанного перевода, а не операция автора: её не отменяют.
+                raise Conflict("bulk.not_cancellable", status=job.status)
+            if job.status == BulkJobStatus.PENDING:
+                finished = await self.uow.bulk_jobs.cancel_pending(job_id)
+                assert finished is not None  # строка под FOR UPDATE и pending
+                await self._record_final(job_id, finished)
+            elif job.status == BulkJobStatus.RUNNING:
+                await self.uow.bulk_jobs.request_cancel(job_id)
+            elif job.status in FINAL_STATUSES and job.status != BulkJobStatus.CANCELLED:
+                raise Conflict("bulk.not_cancellable", status=job.status)
+            await self.uow.commit()
+        except BaseException:
+            await self.uow.rollback()
+            raise
+        job = await self._reload(job_id)
+        logger.info("bulk_job_cancel", job_id=str(job_id), status=job.status)
+        return job
+
+    async def _reload(self, job_id: uuid.UUID) -> BulkJob:
+        job = await self.uow.bulk_jobs.get(job_id)
+        assert job is not None  # job не удаляется, пока она нужна
+        return job
 
     async def start_reassign_owner(
         self, access: Access, request: ReassignOwnerRequest, idempotency_key: str | None
@@ -365,23 +451,164 @@ class BulkService:
             if finished is None:
                 await self.uow.rollback()
                 return None
-            done = await self.uow.bulk_chunks.rows_by_entity(job_id)
-            rows = {e.value: done.get(e, 0) for e in self._entities(finished.kind, finished.params)}
-            await self.uow.bulk_jobs.set_result(job_id, {"rows": rows})
-            self.uow.audit.record(
-                actor_id=finished.owner_id,
-                org_id=finished.org_id,
-                action=f"bulk.{finished.kind}",
-                entity_type="bulk_job",
-                entity_id=job_id,
-                changes=self._audit_changes(finished, rows),
-            )
+            await self._record_final(job_id, finished)
             await self.uow.commit()
         except BaseException:
             await self.uow.rollback()
             raise
-        logger.info("bulk_job_finished", job_id=str(job_id), status=finished.status, rows=rows)
         return finished.status
+
+    async def _record_final(self, job_id: uuid.UUID, finished: FinishedJob) -> None:
+        """Итог job и одна строка журнала — в транзакции того, кто сделал финальный переход:
+        finalize, отмена pending-job или reaper, который сдался. Переход — условный UPDATE,
+        поэтому итог пишется ровно один раз."""
+        rows: dict[str, int] = {}
+        if finished.kind != BulkJobKind.IMPORT_CONTACTS:
+            # У импорта чанков нет: его итоги (result.created / updated) пишет сам импорт, а
+            # строки staging удаляются в той же транзакции, что любой финальный переход, — это
+            # место для них (шаг 5.6).
+            done = await self.uow.bulk_chunks.rows_by_entity(job_id)
+            entities = self._entities(finished.kind, finished.params)
+            rows = {e.value: done.get(e, 0) for e in entities}
+            await self.uow.bulk_jobs.set_result(job_id, {"rows": rows})
+        self.uow.audit.record(
+            actor_id=finished.owner_id,
+            org_id=finished.org_id,
+            action=f"bulk.{finished.kind}",
+            entity_type="bulk_job",
+            entity_id=job_id,
+            changes=self._audit_changes(finished, rows),
+        )
+        logger.info("bulk_job_finished", job_id=str(job_id), status=finished.status, rows=rows)
+
+    # --- bulk.reap_stuck (раздел 15, «Жизненный цикл bulk job»)
+
+    async def reap_stuck(self, policy: ReapPolicy, queue_length: QueueLength) -> ReapReport:
+        """Подобрать job, у которых потерялась задача: API не поставил bulk.plan, finalize не
+        случился, сообщения чанков пропали (жёсткий time_limit, убитый воркер), импорт встал.
+
+        Каждая job — своя короткая транзакция: строка FOR UPDATE SKIP LOCKED и повторная
+        проверка условия под блокировкой. Поэтому два прохода reaper одновременно (beat
+        поставил следующий, пока медленный ещё идёт) одну job не переотправят дважды: второй
+        пропустит занятую строку, а после коммита первого увидит свежий updated_at. Задачи
+        ставятся после коммита: потерю постановки подберёт следующий проход, а лишняя доставка
+        безопасна — plan, чанк и импорт идемпотентны."""
+        report = ReapReport()
+        # (1) pending дольше порога → снова bulk.plan.
+        condition = stale_pending(policy.pending_seconds)
+        for job_id in await self._candidates(condition):
+            if await self._resend(job_id, condition, policy, report):
+                await self.queue.enqueue(PLAN_TASK, str(job_id))
+                report.replanned.append(job_id)
+        # Импорт: одна задача на job — снова imports.import_contacts.
+        condition = stalled_import(policy.pending_seconds, policy.import_stall_seconds)
+        for job_id in await self._candidates(condition):
+            if await self._resend(job_id, condition, policy, report):
+                await self.queue.enqueue(IMPORT_TASK, str(job_id))
+                report.reimported.append(job_id)
+        # (2) pending-чанков нет, а job не завершена → потерянный finalize.
+        for job_id in await self._candidates(lost_finalize()):
+            if await self.finalize_if_complete(job_id) is not None:
+                report.finalized.append(job_id)
+        # (3) чанки стоят без прогресса → снова pending-чанки, если очередь bulk пуста: если в
+        # ней сообщения, чанки, скорее всего, ждут своей очереди за чужой job — не отправлять
+        # и не считать попытку.
+        condition = stalled_chunks(policy.stall_seconds)
+        stalled = await self._candidates(condition)
+        if stalled and await queue_length(BULK_QUEUE) > 0:
+            report.queue_busy = True
+            stalled = []
+        for job_id in stalled:
+            numbers = await self._resend_chunks(job_id, condition, policy, report)
+            for no in numbers:
+                await self.queue.enqueue(CHUNK_TASK, str(job_id), no)
+            if numbers:
+                report.resent[job_id] = numbers
+        if report:
+            logger.info(
+                "bulk_reaped",
+                replanned=len(report.replanned),
+                reimported=len(report.reimported),
+                finalized=len(report.finalized),
+                resent=len(report.resent),
+                stuck=len(report.stuck),
+                queue_busy=report.queue_busy,
+            )
+        return report
+
+    async def _candidates(self, condition: ColumnElement[bool]) -> list[uuid.UUID]:
+        try:
+            return await self.uow.bulk_jobs.ids_where(condition)
+        finally:
+            await self.uow.rollback()  # не держать снимок между транзакциями по job
+
+    async def _resend(
+        self,
+        job_id: uuid.UUID,
+        condition: ColumnElement[bool],
+        policy: ReapPolicy,
+        report: ReapReport,
+    ) -> bool:
+        """Job без чанков (pending, импорт): True — отметить повторную отправку (reaps + 1) и
+        поставить задачу. Попытки кончились — job сразу failed с bulk.stuck."""
+        try:
+            job = await self.uow.bulk_jobs.lock_where(job_id, condition)
+            if job is None:  # занята другой копией reaper или уже сдвинулась
+                await self.uow.rollback()
+                return False
+            if job.reaps >= policy.max_reaps:
+                finished = await self.uow.bulk_jobs.fail_stuck(job_id)
+                assert finished is not None  # строка под FOR UPDATE и ещё не завершена
+                await self._record_final(job_id, finished)
+                await self.uow.commit()
+                self._stuck(job, report)
+                return False
+            await self.uow.bulk_jobs.mark_reaped(job_id)
+            await self.uow.commit()
+        except BaseException:
+            await self.uow.rollback()
+            raise
+        logger.warning("bulk_job_reaped", job_id=str(job_id), reaps=job.reaps + 1)
+        return True
+
+    async def _resend_chunks(
+        self,
+        job_id: uuid.UUID,
+        condition: ColumnElement[bool],
+        policy: ReapPolicy,
+        report: ReapReport,
+    ) -> list[int]:
+        """(3) Номера pending-чанков для повторной отправки (reaps + 1). Попытки кончились —
+        error = bulk.stuck, pending-чанки skipped, и finalize ставит failed (или cancelled, если
+        job отменяли)."""
+        try:
+            job = await self.uow.bulk_jobs.lock_where(job_id, condition)
+            if job is None:
+                await self.uow.rollback()
+                return []
+            if job.reaps >= policy.max_reaps:
+                await self.uow.bulk_jobs.set_error(job_id, STUCK_ERROR)
+                await self.uow.bulk_chunks.skip_pending(job_id, STUCK_ERROR)
+                await self.uow.commit()
+                self._stuck(job, report)
+                await self.finalize_if_complete(job_id)
+                return []
+            numbers = await self.uow.bulk_chunks.pending_numbers(job_id)
+            await self.uow.bulk_jobs.mark_reaped(job_id)
+            await self.uow.commit()
+        except BaseException:
+            await self.uow.rollback()
+            raise
+        logger.warning(
+            "bulk_job_reaped", job_id=str(job_id), reaps=job.reaps + 1, chunks=len(numbers)
+        )
+        return numbers
+
+    @staticmethod
+    def _stuck(job: BulkJob, report: ReapReport) -> None:
+        # Алерт BulkJobStuck (этап 8) — по этой строке лога и по метрике.
+        logger.error("bulk_job_stuck", job_id=str(job.id), kind=job.kind, reaps=job.reaps)
+        report.stuck.append(job.id)
 
     @staticmethod
     def _audit_changes(finished: FinishedJob, rows: dict[str, int]) -> dict[str, Any]:

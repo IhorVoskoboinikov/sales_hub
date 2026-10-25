@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     # Массовые операции (раздел 6): строк в чанке. Границы чанков считаются по реальным
     # строкам выборки, а не равными диапазонами id. 0 — ошибка конфигурации уже при старте.
     bulk_chunk_size: int = Field(10_000, ge=1)
+    # bulk.reap_stuck (раздел 15), секунды: pending дольше — снова bulk.plan; running без
+    # прогресса дольше — снова pending-чанки; у импорта порог больше лимита запуска (12 минут).
+    # После bulk_max_reaps повторных отправок job проваливается с bulk.stuck.
+    bulk_reap_pending_seconds: int = Field(120, ge=1)
+    bulk_reap_stall_seconds: int = Field(300, ge=1)
+    import_reap_stall_seconds: int = Field(900, ge=1)
+    bulk_max_reaps: int = Field(3, ge=1)
 
     # --- Вход по почте (раздел 4)
     # Путь относительно backend/ (в контейнере — /app). В dev файл создаёт make keys.

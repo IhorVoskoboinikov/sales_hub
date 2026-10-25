@@ -1,4 +1,4 @@
-"""Прогресс bulk job (разделы 6 и 15): снимок и поток SSE.
+"""Прогресс bulk job (разделы 6 и 15): снимок, поток SSE и отмена.
 
 Видимость — по уровню bulk_job:read, где owner_id job — её автор: руководитель видит job
 своего отдела, наблюдатель — только свои. Чужая job — 404.
@@ -9,13 +9,13 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 
-from fastapi import Depends
+from fastapi import Depends, status
 from fastapi.responses import StreamingResponse
 from fastapi.sse import KEEPALIVE_COMMENT, EventSourceResponse, format_sse_event
 
 from app.api.deps import SessionScope, get_bulk_service, get_session_scope, get_uow
 from app.api.v1 import protected_router
-from app.api.v1.errors import NOT_FOUND, PROTECTED, Responses
+from app.api.v1.errors import CONFLICT, NOT_FOUND, PROTECTED, Responses
 from app.authz.access import Access
 from app.authz.deps import authorize
 from app.errors import NotFound
@@ -40,6 +40,27 @@ async def get_bulk_job(
     bulk: BulkService = Depends(get_bulk_service),
 ) -> BulkJobOut:
     return BulkJobOut.model_validate(await bulk.get(access, job_id))
+
+
+@protected_router.post(
+    "/bulk-jobs/{job_id}/cancel",
+    tags=["bulk"],
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={**PROTECTED, **NOT_FOUND, **CONFLICT},
+)
+async def cancel_bulk_job(
+    job_id: uuid.UUID,
+    access: Access = Depends(authorize),
+    bulk: BulkService = Depends(get_bulk_service),
+) -> BulkJobOut:
+    """Отменить job. Ещё не начатая (`pending`) отменяется сразу, идущая (`running`) переходит
+    в `cancelling`: начатый чанк доработает, следующие пропускаются, финал — `cancelled`.
+    Уже изменённые строки остаются изменёнными — сколько успели, видно в `processed`.
+
+    - уже отменяется или отменена — 202 без изменений;
+    - завершена (`done`, `partial_failed`, `failed`) или это перенос записей при смене отдела
+      (`move_team`) — 409 `bulk.not_cancellable`."""
+    return BulkJobOut.model_validate(await bulk.cancel(access, job_id))
 
 
 # Не response_class=EventSourceResponse: с ним FastAPI ждёт эндпоинт-генератор и запускает его

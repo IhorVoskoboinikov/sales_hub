@@ -25,6 +25,7 @@ from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.bulk import BulkService
 from app.services.contacts import CompanyService, ContactService
 from app.services.deals import DealService, PipelineService
+from app.services.failed_tasks import FailedTaskService
 from app.services.fx import FxService, NbuClient
 from app.services.invites import InviteService
 from app.services.members import MemberService
@@ -33,7 +34,7 @@ from app.services.password_reset import PasswordResetService
 from app.services.reports import ReportService
 from app.uow import UnitOfWork
 from app.workers.celery_app import celery_app
-from app.workers.queue import CeleryTaskQueue, TaskQueue
+from app.workers.queue import CeleryTaskQueue, CeleryTaskSender, TaskQueue, TaskSender
 
 # Кнопка Authorize в Swagger: форма логина отправляется на tokenUrl.
 # auto_error=False — нет токена → наш Unauthorized в общем формате, а не HTTPException FastAPI.
@@ -86,6 +87,11 @@ def get_uow(session: AsyncSession = Depends(get_session)) -> UnitOfWork:
 def get_task_queue() -> TaskQueue:
     """Постановка задач Celery после коммита (best-effort). В тестах — фейк."""
     return CeleryTaskQueue(celery_app)
+
+
+def get_task_sender() -> TaskSender:
+    """Перезапуск упавшей задачи супер-админом: ошибка брокера — 503. В тестах — фейк."""
+    return CeleryTaskSender(celery_app)
 
 
 def get_user_cache(redis: Redis = Depends(get_redis)) -> UserCache:
@@ -211,6 +217,12 @@ def get_bulk_service(
     settings: Settings = Depends(get_app_settings),
 ) -> BulkService:
     return BulkService(uow, roles, queue, chunk_size=settings.bulk_chunk_size)
+
+
+def get_failed_task_service(
+    uow: UnitOfWork = Depends(get_uow), sender: TaskSender = Depends(get_task_sender)
+) -> FailedTaskService:
+    return FailedTaskService(uow, sender)
 
 
 def get_page(

@@ -22,6 +22,9 @@ other_org.
 (это поле тела, а не объект в пути). У /bulk-jobs/{job_id} цель own — job самого вызывающего
 (bulk_job:read у viewer — own, свои выгрузки), остальные — job менеджеров, как у CRM-записей;
 job уже завершена, поэтому SSE сразу отдаёт снимок и закрывается. TaskQueue — фейк (conftest).
+У POST /bulk-jobs/{job_id}/cancel те же цели, но job идут (running) — у каждой свой вид: в
+организации одна активная job вида (частичный UNIQUE). Упавшие задачи (/admin/failed-tasks) —
+только супер-админ: цель system — строка failed_tasks, TaskSender — фейк (conftest).
 """
 
 import uuid
@@ -38,10 +41,11 @@ from app.authz.opa import ROUTES_PATH
 from app.authz.roles import RoleCatalog, Scope
 from app.core.config import Settings
 from app.core.jwt import KeySet
-from app.models import Team, User
+from app.models import BulkJob, Team, User
 from app.uow import UnitOfWork
 from tests.conftest import POLICIES_DIR
 from tests.integration.conftest import (
+    MakeFailedTask,
     MakeJob,
     MakeOrg,
     MakeRecord,
@@ -72,6 +76,7 @@ class World:
     ids: dict[str, dict[str, int]] = field(default_factory=dict)  # сущность → цель → id
     people: dict[str, uuid.UUID] = field(default_factory=dict)  # цель → владелец её записей
     jobs: dict[str, uuid.UUID] = field(default_factory=dict)  # цель → bulk job
+    failed_task: int | None = None  # строка failed_tasks для маршрутов супер-админа
 
     def owner_for(self, role: str) -> dict[str, Any]:
         """Ответственный в теле запроса: менеджер сам, руководитель и админ — менеджер отдела."""
@@ -242,6 +247,23 @@ CASES: dict[str, Case] = {
     ),
     "GET /api/v1/bulk-jobs/{job_id}": Case("bulk_job:read", None, CRM_TARGETS),
     "GET /api/v1/bulk-jobs/{job_id}/events": Case("bulk_job:read", None, CRM_TARGETS),
+    "POST /api/v1/bulk-jobs/{job_id}/cancel": Case(
+        "bulk_job:cancel", None, CRM_TARGETS, "bulk_job:read"
+    ),
+    "GET /api/v1/admin/failed-tasks": Case("admin:system"),
+    "GET /api/v1/admin/failed-tasks/{failed_task_id}": Case("admin:system", None, ("system",)),
+    "POST /api/v1/admin/failed-tasks/{failed_task_id}/replay": Case(
+        "admin:system", None, ("system",)
+    ),
+}
+
+CANCEL_ROUTE = "POST /api/v1/bulk-jobs/{job_id}/cancel"
+# Отменяемые job идут (running), а активная job вида в организации одна — виды разные.
+CANCEL_KINDS = {
+    "own": "add_tags",
+    "same_team": "remove_tags",
+    "same_org": "close_overdue_deals",
+    "other_org": "reassign_owner",
 }
 
 
@@ -387,6 +409,7 @@ def url_for(route: str, target: str | None, world: World) -> str:
         "{activity_id}": lambda: str(world.ids["activity"][target]),
         "{pipeline_id}": lambda: str(world.ids["pipeline"][target]),
         "{job_id}": lambda: str(world.jobs[target]),
+        "{failed_task_id}": lambda: str(world.failed_task),
     }
     for placeholder, value in replacements.items():
         if placeholder in path:
@@ -406,6 +429,8 @@ ACCEPTED = {
     "POST /api/v1/invites",
     "POST /api/v1/admin/orgs/{org_id}/invites",
     "POST /api/v1/bulk/reassign-owner",
+    CANCEL_ROUTE,
+    "POST /api/v1/admin/failed-tasks/{failed_task_id}/replay",
 }
 
 
@@ -424,6 +449,7 @@ async def test_access(
     make_deal: MakeRecord,
     make_activity: MakeRecord,
     make_job: MakeJob,
+    make_failed_task: MakeFailedTask,
     uow: UnitOfWork,
     settings: Settings,
 ) -> None:
@@ -443,6 +469,16 @@ async def test_access(
         # У супер-админа организации нет — и job тоже; ему всё равно 403.
         author = world.users["sales_rep" if role == "super_admin" else role]
         world.jobs["own"] = (await make_job(author)).id
+    if route == CANCEL_ROUTE:
+        for job_target, job_id in world.jobs.items():
+            await uow.session.execute(
+                BulkJob.__table__.update()
+                .where(BulkJob.id == job_id)
+                .values(status="running", kind=CANCEL_KINDS[job_target])
+            )
+        await uow.commit()
+    if "{failed_task_id}" in route:
+        world.failed_task = (await make_failed_task()).id
     # Access-токен выпускаем напрямую: логин с argon2 на сотни кейсов был бы медленным.
     token = KeySet.from_settings(settings).issue_access_token(user.id, uuid.uuid4(), 0)
     method = route.split(" ", 1)[0]

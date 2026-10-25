@@ -1,11 +1,13 @@
-"""Массовые операции (разделы 6 и 15): bulk.plan и bulk.chunk — тонкие обёртки над BulkService.
+"""Массовые операции (разделы 6 и 15): bulk.plan, bulk.chunk и bulk.reap_stuck — тонкие обёртки
+над BulkService.
 
 Без chord: plan после своего коммита ставит обычную группу чанков, а завершение job решает
 finalize_if_complete по строкам bulk_job_chunks. Очереди — по имени в TASK_ROUTES: bulk.chunk →
-bulk, bulk.plan → default (за тысячей чужих чанков короткий plan ждал бы зря).
+bulk, bulk.plan и bulk.reap_stuck → default (за тысячей чужих чанков короткие задачи ждали бы
+зря).
 
 replayable=False: из failed_tasks такие задачи руками не перезапускают — повторяют новой job,
-а её условия идемпотентны (шаг 5.5).
+а её условия идемпотентны. bulk.reap_stuck перезапускать можно: он и так идёт раз в минуту.
 """
 
 import uuid
@@ -15,11 +17,11 @@ import structlog
 from celery import group
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.services.bulk import BulkService, failure_code
+from app.services.bulk import BulkService, ReapPolicy, failure_code
 from app.uow import UnitOfWork
 from app.workers.base import BaseTask
 from app.workers.celery_app import celery_app
-from app.workers.queue import CeleryTaskQueue
+from app.workers.queue import CeleryTaskQueue, broker_queue_length
 from app.workers.runtime import current_settings, resources, run_async
 
 logger = structlog.get_logger("workers")
@@ -54,7 +56,7 @@ class ChunkTask(BaseTask):
     отмечается failed, и job завершается без него — partial_failed, а не повисшая job.
 
     Жёсткий time_limit убивает процесс пула без on_failure: такой чанк остаётся pending, его
-    переотправит bulk.reap_stuck (шаг 5.5)."""
+    переотправит bulk.reap_stuck."""
 
     def on_failure(self, exc: Exception, task_id: str, args: Any, kwargs: Any, einfo: Any) -> None:
         job_id, no = args
@@ -83,3 +85,26 @@ async def _run_chunk(job_id: uuid.UUID, no: int) -> None:
 async def _fail_chunk(job_id: uuid.UUID, no: int, error: str) -> None:
     async with resources().session_factory() as session:
         await bulk_service(session).fail_chunk(job_id, no, error)
+
+
+@celery_app.task(base=BaseTask, name="bulk.reap_stuck")
+def reap_stuck() -> None:
+    """Раз в минуту из beat: подобрать job с потерянными задачами (раздел 15). Два прохода
+    одновременно безопасны — каждая job берётся FOR UPDATE SKIP LOCKED."""
+    run_async(_reap_stuck())
+
+
+async def _reap_stuck() -> None:
+    settings = current_settings()
+    policy = ReapPolicy(
+        pending_seconds=settings.bulk_reap_pending_seconds,
+        stall_seconds=settings.bulk_reap_stall_seconds,
+        import_stall_seconds=settings.import_reap_stall_seconds,
+        max_reaps=settings.bulk_max_reaps,
+    )
+
+    async def queue_length(queue: str) -> int:
+        return await broker_queue_length(settings.celery_broker_url, queue)
+
+    async with resources().session_factory() as session:
+        await bulk_service(session).reap_stuck(policy, queue_length)

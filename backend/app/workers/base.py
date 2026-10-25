@@ -2,10 +2,20 @@
 
 Повторяем только временные сбои — Postgres перезапускается, нет соединения, сеть, SMTP, Redis.
 Остальные ошибки (404 / 409 / 422, ошибка в коде) — сразу провал: повтор дал бы тот же результат.
+
+Провал после всех ретраев (и сразу — для неповторяемой ошибки) записывает в failed_tasks
+обработчик сигнала task_failure (раздел 15, «Задачи, упавшие после всех ретраев»): у Celery с
+Redis нет dead-letter очереди. Жёсткий time_limit убивает процесс пула: on_failure нет, а
+task_failure Celery шлёт уже в главном процессе воркера (prefork) — там нет контекста задачи, и
+обработчик его пропускает: иначе главный процесс поднял бы свой пул Postgres и Redis вне бюджета
+соединений. Такой провал виден в логе (Hard time limit exceeded) и во Flower; чанки после него
+подбирает bulk.reap_stuck.
 """
 
+import json
 import random
 import socket
+import uuid
 from typing import TYPE_CHECKING, Any, ClassVar
 
 import aiosmtplib
@@ -13,9 +23,14 @@ import httpx
 import redis.exceptions
 import structlog
 from celery import Task
+from celery.signals import task_failure
 from sqlalchemy.exc import DBAPIError, InterfaceError
 
+from app.core.context import request_id_var
 from app.errors import AppError, ServiceUnavailable
+from app.models.failed_tasks import EXC_MESSAGE_MAX, TRACEBACK_MAX
+from app.repositories.failed_tasks import FailedTaskRepository
+from app.workers.runtime import resources, run_async
 
 logger = structlog.get_logger("workers")
 
@@ -83,14 +98,14 @@ def backoff(retries: int) -> float:
 class BaseTask(_Task):
     """Задача, которая повторяет себя при временных сбоях: max_retries раз с паузой backoff.
 
-    После последнего повтора ошибка уходит дальше — задача провалена (в 5.5 — строка
-    failed_tasks). replayable=False — задачу нельзя перезапустить из failed_tasks руками:
+    После последнего повтора ошибка уходит дальше — задача провалена: строка failed_tasks
+    (record_failed_task). replayable=False — задачу нельзя перезапустить из failed_tasks руками:
     bulk и импорт повторяют новой job.
     """
 
     max_retries = MAX_RETRIES
     # Ожидаемые отказы: Celery пишет их провал строкой INFO без traceback, а не ERROR.
-    # Сигнал task_failure (в 5.5 — строка failed_tasks) приходит всё равно.
+    # Сигнал task_failure (строка failed_tasks) приходит всё равно.
     throws = (AppError,)
     replayable: ClassVar[bool] = True
 
@@ -116,3 +131,79 @@ class BaseTask(_Task):
                 "task_retry", error=repr(exc), retries=retries, countdown=round(countdown, 1)
             )
             raise self.retry(exc=exc, countdown=countdown) from exc
+
+
+def failed_task_values(
+    task: "_Task",
+    task_id: str,
+    exc: BaseException,
+    args: Any,
+    kwargs: Any,
+    traceback: str | None,
+) -> dict[str, Any]:
+    """Строка failed_tasks из того, что пришло с сигналом task_failure. request_id и user_id —
+    из контекста задачи (его восстановил task_prerun, а task_postrun ещё не очистил)."""
+    request = task.request
+    user_id = structlog.contextvars.get_contextvars().get("user_id")
+    try:
+        user = uuid.UUID(str(user_id)) if user_id is not None else None
+    except ValueError:
+        user = None  # чужой формат в заголовке — не повод терять строку
+    exc_type = type(exc)
+    return {
+        "task_id": task_id,
+        "task_name": task.name,
+        # У транспорта Redis routing_key — имя очереди, из которой взята задача.
+        "queue": (request.delivery_info or {}).get("routing_key"),
+        # Аргументы уже прошли JSON-сериализацию Celery; default=str — страховка.
+        "args": json.loads(json.dumps(list(args or ()), default=str)),
+        "kwargs": json.loads(json.dumps(dict(kwargs or {}), default=str)),
+        "request_id": request_id_var.get(),
+        "user_id": user,
+        "exc_type": f"{exc_type.__module__}.{exc_type.__qualname__}"[:255],
+        "exc_message": str(exc)[:EXC_MESSAGE_MAX],
+        # Конец traceback, а не начало: внизу — само место ошибки.
+        "traceback": traceback[-TRACEBACK_MAX:] if traceback else None,
+        "retries": request.retries or 0,
+    }
+
+
+@task_failure.connect
+def record_failed_task(
+    sender: "_Task | None" = None,
+    task_id: str | None = None,
+    exception: BaseException | None = None,
+    args: Any = None,
+    kwargs: Any = None,
+    einfo: Any = None,
+    **_: Any,
+) -> None:
+    """Задача провалена (после всех ретраев; на Retry сигнала нет) → строка failed_tasks своей
+    сессией. ON CONFLICT (task_id) DO NOTHING: повторно доставленная задача дубля не даёт.
+    Ошибка записи только логируется — провал задачи и так уже случился.
+
+    Eager-вызовы (task.apply() в unit-тестах) не записываются: их не брал воркер из очереди,
+    и у такого процесса может не быть своей базы."""
+    if sender is None or task_id is None or exception is None or sender.request.is_eager:
+        return
+    if sender.request.id != task_id:
+        # Сигнал пришёл не из выполнения задачи: жёсткий time_limit в prefork шлёт task_failure
+        # в главном процессе, где request — пустой контекст по умолчанию. Не пишем (см. выше).
+        logger.warning("failed_task_skipped_outside_task", task_id=task_id, error=repr(exception))
+        return
+    try:
+        values = failed_task_values(
+            sender, task_id, exception, args, kwargs, getattr(einfo, "traceback", None)
+        )
+        recorded = run_async(_record_failed_task(values))
+    except Exception as error:
+        logger.error("failed_task_not_recorded", task_id=task_id, error=repr(error))
+        return
+    logger.info("failed_task_recorded" if recorded else "failed_task_duplicate", task_id=task_id)
+
+
+async def _record_failed_task(values: dict[str, Any]) -> bool:
+    async with resources().session_factory() as session:  # своя сессия, не сессия задачи
+        recorded = await FailedTaskRepository(session).record(values)
+        await session.commit()
+        return recorded

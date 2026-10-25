@@ -16,6 +16,7 @@ from app.api.v1 import (  # noqa: F401 — модули с эндпоинтам�
     companies,
     contacts,
     deals,
+    failed_tasks,
     invites,
     organizations,
     pipelines,

@@ -15,12 +15,14 @@ import pytest
 import structlog
 from celery.worker import WorkController
 from redis import Redis
-from sqlalchemy import text
+from sqlalchemy import delete, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.core.config import Settings
 from app.core.context import request_id_var
+from app.models import FailedTask
 from app.workers import base
 from app.workers.base import BaseTask, is_retryable
 from app.workers.celery_app import celery_app
@@ -118,17 +120,38 @@ def test_temporary_failure_is_retried(
 
 
 @pytest.mark.worker
-def test_retries_stop_after_max_retries(
-    celery_worker: WorkController, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.committing
+async def test_retries_stop_after_max_retries(
+    celery_worker: WorkController, monkeypatch: pytest.MonkeyPatch, settings: Settings
 ) -> None:
     monkeypatch.setattr(base, "backoff", lambda retries: 0.1)
 
-    celery_app.send_task("tests.flaky", args=[100])
+    task_id = celery_app.send_task("tests.flaky", args=[100]).id
+    try:
+        # Первая попытка и max_retries повторов — потом задача провалена.
+        assert [wait_for(attempts) for _ in range(BaseTask.max_retries + 1)] == list(range(6))
+        with pytest.raises(queue.Empty):
+            attempts.get(timeout=1)
+    finally:
+        # Провал записан в failed_tasks (шаг 5.5) и закоммичен — таблица общая, убираем строку.
+        await delete_failed_task(settings, task_id)
 
-    # Первая попытка и max_retries повторов — потом задача провалена.
-    assert [wait_for(attempts) for _ in range(BaseTask.max_retries + 1)] == list(range(6))
-    with pytest.raises(queue.Empty):
-        attempts.get(timeout=1)
+
+async def delete_failed_task(settings: Settings, task_id: str) -> None:
+    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    try:
+        deadline = time.monotonic() + WAIT_SECONDS
+        async with engine.begin() as conn:
+            # Обработчик task_failure пишет строку сразу после последней попытки — дождаться её.
+            while time.monotonic() < deadline:
+                deleted = await conn.execute(
+                    delete(FailedTask).where(FailedTask.task_id == task_id)
+                )
+                if deleted.rowcount:
+                    return
+                await asyncio.sleep(0.1)
+    finally:
+        await engine.dispose()
 
 
 async def test_real_deadlock_is_retryable(postgres_url: str) -> None:

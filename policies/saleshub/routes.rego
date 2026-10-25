@@ -59,4 +59,8 @@ actions := {
 	"POST /api/v1/bulk/reassign-owner": "bulk:run",
 	"GET /api/v1/bulk-jobs/{job_id}": "bulk_job:read",
 	"GET /api/v1/bulk-jobs/{job_id}/events": "bulk_job:read",
+	"POST /api/v1/bulk-jobs/{job_id}/cancel": "bulk_job:cancel",
+	"GET /api/v1/admin/failed-tasks": "admin:system",
+	"GET /api/v1/admin/failed-tasks/{failed_task_id}": "admin:system",
+	"POST /api/v1/admin/failed-tasks/{failed_task_id}/replay": "admin:system",
 }

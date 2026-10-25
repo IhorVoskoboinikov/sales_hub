@@ -1,6 +1,8 @@
-"""Воркеры без брокера: что повторять, пауза между повторами, контекст задачи (раздел 15)."""
+"""Воркеры без брокера: что повторять, пауза между повторами, контекст задачи, строка
+failed_tasks, перезапуск по имени, расписание beat (раздел 15)."""
 
 import socket
+import uuid
 from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
@@ -14,15 +16,26 @@ import structlog
 from billiard.einfo import ExceptionInfo
 from celery.app.task import Context
 from celery.app.trace import get_log_policy, log_policy_expected, log_policy_unexpected
+from celery.schedules import crontab
 from sqlalchemy.exc import DBAPIError, IntegrityError, InterfaceError
 
 from app.core.config import Settings
 from app.core.context import request_id_var
 from app.core.resources import Resources
 from app.errors import Conflict, NotFound, ServiceUnavailable
-from app.workers.base import BACKOFF_MAX_SECONDS, BaseTask, backoff, is_retryable
+from app.workers import base
+from app.workers.base import (
+    BACKOFF_MAX_SECONDS,
+    BaseTask,
+    backoff,
+    failed_task_values,
+    is_retryable,
+    record_failed_task,
+)
 from app.workers.celery_app import TASK_ROUTES, celery_app
 from app.workers.context import clear_context, put_context_headers, restore_context
+from app.workers.queue import CeleryTaskSender
+from app.workers.schedule import BEAT_SCHEDULE
 
 
 class DriverError(Exception):
@@ -255,3 +268,147 @@ def test_task_without_request_uses_task_id() -> None:
     assert request_id_var.get() == "task-1"
     assert structlog.contextvars.get_contextvars()["request_id"] == "task-1"
     assert structlog.contextvars.get_contextvars()["user_id"] is None
+
+
+def failed_task(**request: Any) -> Any:
+    request.setdefault("id", "t-1")  # сигнал из выполнения задачи: request.id = task_id
+    request.setdefault("retries", 5)
+    request.setdefault("delivery_info", {"routing_key": "notifications"})
+    return SimpleNamespace(name="notifications.send_email", request=Context(request))
+
+
+def test_failed_task_row_from_signal() -> None:
+    user_id = uuid.uuid4()
+    request_id_var.set("req-1")
+    structlog.contextvars.bind_contextvars(user_id=str(user_id))
+    job_id = uuid.uuid4()
+
+    values = failed_task_values(
+        failed_task(),
+        "task-1",
+        ConnectionRefusedError("smtp:25"),
+        (42, job_id),
+        {"force": True},
+        "Traceback ...",
+    )
+
+    assert values == {
+        "task_id": "task-1",
+        "task_name": "notifications.send_email",
+        "queue": "notifications",
+        "args": [42, str(job_id)],  # только JSON-типы
+        "kwargs": {"force": True},
+        "request_id": "req-1",
+        "user_id": user_id,
+        "exc_type": "builtins.ConnectionRefusedError",
+        "exc_message": "smtp:25",
+        "traceback": "Traceback ...",
+        "retries": 5,
+    }
+
+
+def test_failed_task_texts_are_truncated() -> None:
+    structlog.contextvars.bind_contextvars(user_id="not-a-uuid")
+    traceback = "head " + "x" * 30_000 + " place of error"
+
+    values = failed_task_values(
+        failed_task(delivery_info=None), "task-1", ValueError("m" * 5_000), None, None, traceback
+    )
+
+    assert len(values["exc_message"]) == 2_000
+    assert len(values["traceback"]) == 20_000
+    assert values["traceback"].endswith("place of error")  # конец, а не начало
+    assert (values["args"], values["kwargs"]) == ([], {})
+    assert (values["queue"], values["user_id"]) == (None, None)
+
+
+def test_eager_failure_is_not_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # task.apply() в тестах: задачу не брали из очереди, базы у процесса может и не быть.
+    def must_not_run(coro: Any) -> None:
+        coro.close()
+        raise AssertionError("run_async вызван для eager-задачи")
+
+    monkeypatch.setattr(base, "run_async", must_not_run)
+
+    record_failed_task(
+        sender=failed_task(is_eager=True), task_id="t-1", exception=ValueError("x"), args=[]
+    )
+
+
+def test_failure_outside_task_is_not_recorded(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Жёсткий time_limit в prefork: task_failure приходит в главный процесс, где request —
+    # пустой контекст. Там нельзя поднимать свой пул Postgres — строку не пишем.
+    def must_not_run(coro: Any) -> None:
+        coro.close()
+        raise AssertionError("run_async вызван вне выполнения задачи")
+
+    monkeypatch.setattr(base, "run_async", must_not_run)
+
+    with structlog.testing.capture_logs() as logs:
+        record_failed_task(
+            sender=failed_task(id=None), task_id="t-1", exception=TimeoutError("hard limit")
+        )
+
+    assert [log["event"] for log in logs] == ["failed_task_skipped_outside_task"]
+
+
+def test_recording_error_is_logged_not_raised(monkeypatch: pytest.MonkeyPatch) -> None:
+    def database_down(coro: Any) -> None:
+        coro.close()
+        raise ConnectionRefusedError("postgres:5432")
+
+    monkeypatch.setattr(base, "run_async", database_down)
+
+    with structlog.testing.capture_logs() as logs:
+        record_failed_task(sender=failed_task(), task_id="t-1", exception=ValueError("x"))
+
+    [log] = [log for log in logs if log["event"] == "failed_task_not_recorded"]
+    assert log["task_id"] == "t-1"
+    assert "postgres:5432" in log["error"]
+
+
+def test_replayable_comes_from_registered_task() -> None:
+    sender = CeleryTaskSender(celery_app)
+
+    # bulk и импорт повторяют новой job; остальные задачи BaseTask перезапускаются.
+    assert sender.replayable("bulk.plan") is False
+    assert sender.replayable("bulk.chunk") is False
+    assert sender.replayable("bulk.reap_stuck") is True
+    assert sender.replayable("notifications.send_email") is True
+    assert sender.replayable("workers.heartbeat") is True
+    assert sender.replayable("celery.backend_cleanup") is False  # встроенная, не BaseTask
+    assert sender.replayable("no.such_task") is None
+
+
+async def test_send_error_is_503() -> None:
+    def broker_down(*args: Any, **kwargs: Any) -> Any:
+        raise ConnectionRefusedError("redis:6379")
+
+    sender = CeleryTaskSender(celery_app)
+    stub = SimpleNamespace(send_task=broker_down)
+    sender.celery_app = stub  # type: ignore[assignment]
+
+    with pytest.raises(ServiceUnavailable):
+        await sender.send("workers.heartbeat", [], {})
+
+
+async def test_send_returns_new_task_id() -> None:
+    calls: list[tuple[Any, ...]] = []
+
+    def send_task(name: str, **kwargs: Any) -> Any:
+        calls.append((name, kwargs))
+        return SimpleNamespace(id="new-task")
+
+    sender = CeleryTaskSender(celery_app)
+    sender.celery_app = SimpleNamespace(send_task=send_task)  # type: ignore[assignment]
+
+    assert await sender.send("workers.heartbeat", [1], {"a": 2}) == "new-task"
+    assert calls == [("workers.heartbeat", {"args": [1], "kwargs": {"a": 2}, "retry": False})]
+
+
+def test_reaper_runs_every_minute() -> None:
+    entry = BEAT_SCHEDULE["bulk.reap_stuck"]
+
+    assert entry["task"] == "bulk.reap_stuck"
+    assert entry["schedule"] == crontab()
+    assert entry["options"] == {"expires": 60}  # пропущенные запуски не копятся

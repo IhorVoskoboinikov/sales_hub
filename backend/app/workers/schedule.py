@@ -17,4 +17,10 @@ BEAT_SCHEDULE: dict[str, dict[str, Any]] = {
         "schedule": crontab(),  # каждую минуту
         "options": {"expires": MINUTE},
     },
+    # Job с потерянными задачами: plan, finalize, чанки, импорт (раздел 15).
+    "bulk.reap_stuck": {
+        "task": "bulk.reap_stuck",
+        "schedule": crontab(),
+        "options": {"expires": MINUTE},
+    },
 }

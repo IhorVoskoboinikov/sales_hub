@@ -14,7 +14,7 @@
 
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from typing import Any, cast
 
@@ -45,6 +45,7 @@ from app.models import (
     BulkEntity,
     BulkJob,
     BulkJobChunk,
+    BulkJobKind,
     BulkJobStatus,
     ChunkStatus,
     Company,
@@ -99,6 +100,71 @@ def move_team_filter(
     if team_id is None:
         return false()
     return and_(model.owner_id == user_id, model.team_id != team_id, transferable(model))
+
+
+# Job ещё идёт (в частичном UNIQUE «одна job вида» те же статусы плюс pending).
+ACTIVE_STATUSES = (BulkJobStatus.RUNNING, BulkJobStatus.CANCELLING)
+STUCK_ERROR = "bulk.stuck"
+IMPORT_KIND = BulkJobKind.IMPORT_CONTACTS
+
+
+def _older_than(seconds: int) -> ColumnElement[bool]:
+    """Нет прогресса дольше seconds: updated_at ставят plan, каждый чанк и сам reaper."""
+    return BulkJob.updated_at < func.now() - timedelta(seconds=seconds)
+
+
+def _has_pending_chunks() -> ColumnElement[bool]:
+    return (
+        select(BulkJobChunk.no)
+        .where(BulkJobChunk.job_id == BulkJob.id, BulkJobChunk.status == ChunkStatus.PENDING)
+        .exists()
+    )
+
+
+# Условия bulk.reap_stuck (раздел 15). Правила (1)–(3) — для чанковых job (kind <> import),
+# импорт — своё правило: его ведёт одна задача imports.import_contacts, а не чанки.
+
+
+def stale_pending(seconds: int) -> ColumnElement[bool]:
+    """(1) pending дольше seconds — потерялась постановка bulk.plan из API."""
+    return and_(
+        BulkJob.kind != IMPORT_KIND,
+        BulkJob.status == BulkJobStatus.PENDING,
+        _older_than(seconds),
+    )
+
+
+def lost_finalize() -> ColumnElement[bool]:
+    """(2) running / cancelling без pending-чанков — потерялся finalize (упал между коммитом
+    чанка и finalize_if_complete)."""
+    return and_(
+        BulkJob.kind != IMPORT_KIND,
+        BulkJob.status.in_(ACTIVE_STATUSES),
+        ~_has_pending_chunks(),
+    )
+
+
+def stalled_chunks(seconds: int) -> ColumnElement[bool]:
+    """(3) running / cancelling с pending-чанками и без прогресса seconds — сообщения чанков
+    потерялись (жёсткий time_limit, убитый воркер)."""
+    return and_(
+        BulkJob.kind != IMPORT_KIND,
+        BulkJob.status.in_(ACTIVE_STATUSES),
+        _older_than(seconds),
+        _has_pending_chunks(),
+    )
+
+
+def stalled_import(pending_seconds: int, stall_seconds: int) -> ColumnElement[bool]:
+    """Импорт: pending дольше pending_seconds или идёт (и отменяется) без прогресса
+    stall_seconds — порог больше лимита запуска задачи (12 минут)."""
+    return and_(
+        BulkJob.kind == IMPORT_KIND,
+        or_(
+            and_(BulkJob.status == BulkJobStatus.PENDING, _older_than(pending_seconds)),
+            and_(BulkJob.status.in_(ACTIVE_STATUSES), _older_than(stall_seconds)),
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -160,14 +226,16 @@ class BulkJobRepository:
         """Без блокировки, но всегда свежая строка: job меняют чанки в других транзакциях."""
         return await self.session.get(BulkJob, job_id, populate_existing=True)
 
-    async def get_visible_or_404(self, job_id: uuid.UUID, access: Access) -> BulkJob:
+    async def get_visible_or_404(
+        self, job_id: uuid.UUID, access: Access, *, for_update: bool = False
+    ) -> BulkJob:
         """Job вне уровня bulk_job:read (и не своя) — 404, как несуществующая: owner_id — автор
-        job (visible_jobs)."""
-        job = await self.session.scalar(
-            select(BulkJob)
-            .where(BulkJob.id == job_id, visible_jobs(access))
-            .execution_options(populate_existing=True)
-        )
+        job (visible_jobs). for_update — для отмены: переход статуса не обгонит plan, который
+        берёт ту же строку FOR UPDATE."""
+        query = select(BulkJob).where(BulkJob.id == job_id, visible_jobs(access))
+        if for_update:
+            query = query.with_for_update()
+        job = await self.session.scalar(query.execution_options(populate_existing=True))
         if job is None:
             raise NotFound(entity="bulk_job", id=str(job_id))
         return job
@@ -259,6 +327,83 @@ class BulkJobRepository:
             update(BulkJob).where(BulkJob.id == job_id).values(result=result)
         )
 
+    # --- отмена (раздел 15, «Жизненный цикл bulk job»)
+
+    async def cancel_pending(self, job_id: uuid.UUID) -> FinishedJob | None:
+        """pending → сразу cancelled: plan с условием status = 'pending' уже ничего не сделает.
+        None — job уже не pending."""
+        return await self._finish(
+            update(BulkJob)
+            .where(BulkJob.id == job_id, BulkJob.status == BulkJobStatus.PENDING)
+            .values(status=BulkJobStatus.CANCELLED, finished_at=func.now())
+        )
+
+    async def request_cancel(self, job_id: uuid.UUID) -> bool:
+        """running → cancelling: следующие чанки станут skipped, finalize поставит cancelled.
+        updated_at не трогаем — это время прогресса, по нему reaper ищет зависшие job."""
+        result = await self.session.execute(
+            update(BulkJob)
+            .where(BulkJob.id == job_id, BulkJob.status == BulkJobStatus.RUNNING)
+            .values(status=BulkJobStatus.CANCELLING)
+        )
+        return cast(CursorResult[Any], result).rowcount > 0
+
+    # --- bulk.reap_stuck (раздел 15)
+
+    async def ids_where(self, where: ColumnElement[bool]) -> list[uuid.UUID]:
+        """Кандидаты reaper — без блокировок: каждую job он потом берёт lock_where и проверяет
+        условие ещё раз."""
+        return list(
+            await self.session.scalars(select(BulkJob.id).where(where).order_by(BulkJob.created_at))
+        )
+
+    async def lock_where(self, job_id: uuid.UUID, where: ColumnElement[bool]) -> BulkJob | None:
+        """Строка job FOR UPDATE SKIP LOCKED, если условие reaper всё ещё выполняется. None —
+        job занята (другая копия reaper, отмена, чанк пишет прогресс) или уже сдвинулась:
+        после коммита первой копии вторая увидит свежий updated_at и ничего не переотправит."""
+        return await self.session.scalar(
+            select(BulkJob)
+            .where(BulkJob.id == job_id, where)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+
+    async def mark_reaped(self, job_id: uuid.UUID) -> None:
+        """Ещё одна повторная отправка: reaps + 1, и отсчёт «без прогресса» начинается заново."""
+        await self.session.execute(
+            update(BulkJob)
+            .where(BulkJob.id == job_id)
+            .values(reaps=BulkJob.reaps + 1, updated_at=func.now())
+        )
+
+    async def fail_stuck(self, job_id: uuid.UUID) -> FinishedJob | None:
+        """Reaper сдался на job без чанков (pending, импорт): сразу failed. Причина — первая:
+        если error уже есть, bulk.stuck её не перепишет."""
+        return await self._finish(
+            update(BulkJob)
+            .where(
+                BulkJob.id == job_id,
+                BulkJob.status.in_((BulkJobStatus.PENDING, *ACTIVE_STATUSES)),
+            )
+            .values(
+                status=BulkJobStatus.FAILED,
+                error=func.coalesce(BulkJob.error, STUCK_ERROR),
+                finished_at=func.now(),
+            )
+        )
+
+    async def _finish(self, statement: Any) -> FinishedJob | None:
+        row = (
+            await self.session.execute(
+                statement.returning(
+                    BulkJob.status, BulkJob.kind, BulkJob.org_id, BulkJob.owner_id, BulkJob.params
+                )
+            )
+        ).first()
+        if row is None:
+            return None
+        return FinishedJob(row.status, row.kind, row.org_id, row.owner_id, row.params)
+
 
 class BulkChunkRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -319,6 +464,33 @@ class BulkChunkRepository:
             .group_by(BulkJobChunk.entity)
         )
         return {entity: int(total or 0) for entity, total in rows.all()}
+
+    async def pending_numbers(self, job_id: uuid.UUID) -> list[int]:
+        """Номера невыполненных чанков — reaper отправляет их снова."""
+        return list(
+            await self.session.scalars(
+                select(BulkJobChunk.no)
+                .where(BulkJobChunk.job_id == job_id, BulkJobChunk.status == ChunkStatus.PENDING)
+                .order_by(BulkJobChunk.no)
+            )
+        )
+
+    async def skip_pending(self, job_id: uuid.UUID, reason: str) -> int:
+        """Reaper сдался: pending-чанки → skipped. SKIP LOCKED: строку чанка, который сейчас
+        выполняется, держит он сам и в конце ждёт строку job — а её держит reaper; без SKIP
+        LOCKED они ждали бы друг друга (deadlock). Такой чанк доработает и сам вызовет finalize."""
+        pending = (
+            select(BulkJobChunk.no)
+            .where(BulkJobChunk.job_id == job_id, BulkJobChunk.status == ChunkStatus.PENDING)
+            .with_for_update(skip_locked=True)
+        )
+        result = await self.session.execute(
+            update(BulkJobChunk)
+            .where(BulkJobChunk.job_id == job_id, BulkJobChunk.no.in_(pending))
+            .values(status=ChunkStatus.SKIPPED, error=reason, finished_at=func.now())
+            .execution_options(synchronize_session=False)
+        )
+        return cast(CursorResult[Any], result).rowcount
 
 
 class BulkRepository:

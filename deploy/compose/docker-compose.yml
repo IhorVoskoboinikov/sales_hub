@@ -15,6 +15,15 @@ x-app-env: &app-env
   BULK_REAP_STALL_SECONDS: 300
   IMPORT_REAP_STALL_SECONDS: 900
   BULK_MAX_REAPS: 3
+  # Файлы — S3 API сервиса rustfs (ключи — из его environment ниже), бакет создаёт migrate.
+  S3_ENDPOINT_URL: http://rustfs:9000
+  S3_ACCESS_KEY: saleshub
+  S3_SECRET_KEY: saleshub-secret
+  S3_BUCKET: saleshub
+  S3_REGION: us-east-1
+  # Импорт контактов из CSV (раздел 6): 100 МиБ и 1 млн строк на файл.
+  IMPORT_MAX_BYTES: 104857600
+  IMPORT_MAX_ROWS: 1000000
   SMTP_HOST: mailpit  # письма видно на localhost:8025
   OPA_URL: http://opa:8181
   POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA
@@ -56,15 +65,17 @@ services:
       timeout: 3s
       retries: 10
 
-  # Одноразовый: применяет миграции, готовит месячные партиции и завершается.
+  # Одноразовый: применяет миграции, готовит месячные партиции, создаёт бакет в RustFS
+  # (сам RustFS бакетов не создаёт; ensure-bucket ждёт его до 30 с) и завершается.
   # api стартует только после него.
   migrate:
     build: ../../backend
     image: saleshub-api:dev
-    command: ["sh", "-c", "alembic upgrade head && python -m app.cli ensure-partitions"]
+    command: ["sh", "-c", "alembic upgrade head && python -m app.cli ensure-partitions && python -m app.cli ensure-bucket"]
     environment: *app-env
     depends_on:
       postgres: {condition: service_healthy}
+      rustfs: {condition: service_started}
     restart: "no"
 
   # Одноразовый: создаёт супер-админа (идемпотентно — повторный запуск ничего не меняет).

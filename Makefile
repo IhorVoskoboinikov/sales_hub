@@ -5,7 +5,7 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs logs-workers restart-workers urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean explain experiments
+.PHONY: help up infra down clean ps logs logs-workers restart-workers urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -56,6 +56,10 @@ seed-big:  ## большие данные для замеров: 5 млн кон
 
 seed-big-clean:  ## удалить данные seed-big (быстрее — make clean && make up)
 	$(COMPOSE) exec -T postgres psql -U saleshub -d saleshub < backend/scripts/seed_big_clean.sql
+
+ROWS ?= 500000
+import-csv:  ## CSV для импорта контактов в backend/tmp/: 500 тыс. строк, 5% дублей, 1% битых (ROWS=1000)
+	$(BACKEND) uv run python scripts/gen_import_csv.py --rows $(ROWS)
 
 explain:  ## планы всех списков и отчётов на seed-данных: нет ли Seq Scan по большим таблицам
 	$(BACKEND) uv run python scripts/explain_lists.py

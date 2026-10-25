@@ -12,8 +12,7 @@ from app.workers.schedule import BEAT_SCHEDULE
 
 # Очередь — не в декораторе задачи, а здесь, по полному имени. Шаблон bulk.* отправил бы
 # короткие bulk.plan и bulk.reap_stuck в очередь за тысячей чужих чанков. Всё, чего нет в
-# таблице, — в default (и bulk.plan, bulk.reap_stuck). imports.import_contacts появится в
-# шаге 5.6.
+# таблице, — в default (и bulk.plan, bulk.reap_stuck).
 TASK_ROUTES = {
     "bulk.chunk": {"queue": "bulk"},
     "imports.import_contacts": {"queue": "imports"},
@@ -26,6 +25,7 @@ celery_app = Celery(
     "saleshub",
     include=[
         "app.workers.tasks.bulk",
+        "app.workers.tasks.imports",
         "app.workers.tasks.maintenance",
         "app.workers.tasks.notifications",
     ],

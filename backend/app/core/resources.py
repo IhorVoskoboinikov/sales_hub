@@ -1,9 +1,11 @@
-"""Ресурсы процесса: пул Postgres, Redis, HTTP-клиент, файл ролей, отправка писем.
+"""Ресурсы процесса: пул Postgres, Redis, HTTP-клиент, файл ролей, хранилище файлов (S3),
+отправка писем.
 
 Собирает их одна функция — для API (lifespan в main.py) и для воркеров (workers/runtime.py),
 поэтому таймауты у всех одинаковые, а отличаются размер пула и то, что SMTP-отправитель есть
 только у воркеров (for_worker=True): с шага 5.3 API почту не отправляет (раздел 15).
-Соединения открываются лениво — при первом запросе, а не при создании.
+Соединения открываются лениво — при первом запросе, а не при создании. Клиент S3 тоже: он
+создаётся внутри event loop при первом обращении и закрывается в aclose() (app/storage/s3.py).
 """
 
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ from app.core.config import Settings
 from app.db.session import create_engine, create_session_factory
 from app.emails.sender import EmailSender, SmtpEmailSender
 from app.services.fx import NbuClient
+from app.storage import FileStorage, S3FileStorage
 
 REDIS_TIMEOUT_SECONDS = 2
 
@@ -32,6 +35,7 @@ class Resources:
     opa: OpaClient
     nbu: NbuClient
     roles: RoleCatalog
+    storage: FileStorage  # один клиент S3 на процесс: API загружает файлы импорта, воркер читает
     # Только у воркеров: API пишет команду email.send в outbox, письмо отправляет воркер.
     email_sender: EmailSender | None
 
@@ -68,10 +72,12 @@ class Resources:
             opa=OpaClient(http, settings.opa_url),
             nbu=NbuClient(http, settings.nbu_url),  # тот же пул: OPA и НБУ — разные хосты
             roles=roles,
+            storage=S3FileStorage.from_settings(settings),
             email_sender=smtp_sender(settings) if for_worker else None,
         )
 
     async def aclose(self) -> None:
+        await self.storage.aclose()
         await self.http.aclose()
         await self.redis.aclose()
         await self.engine.dispose()

@@ -25,6 +25,7 @@ from sqlalchemy import (
     Uuid,
     and_,
     bindparam,
+    case,
     false,
     func,
     insert,
@@ -32,6 +33,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    true,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB
@@ -271,6 +273,16 @@ class BulkJobRepository:
             .execution_options(populate_existing=True)
         )
 
+    async def has_active(self, org_id: uuid.UUID, kind: str) -> bool:
+        """Идёт ли в организации job этого вида (то же условие, что у частичного UNIQUE), чья
+        бы она ни была: вторая всё равно упрётся в индекс."""
+        found = await self.session.scalar(
+            select(BulkJob.id)
+            .where(BulkJob.org_id == org_id, BulkJob.kind == kind, text(ACTIVE_JOB))
+            .limit(1)
+        )
+        return found is not None
+
     async def start(self, job_id: uuid.UUID, *, total: int, chunks_total: int) -> None:
         """plan закончил нарезку: job идёт (running), прогресс считается от total."""
         await self.session.execute(
@@ -390,6 +402,97 @@ class BulkJobRepository:
                 error=func.coalesce(BulkJob.error, STUCK_ERROR),
                 finished_at=func.now(),
             )
+        )
+
+    # --- импорт CSV (раздел 6, «Поток: импорт контактов из CSV», шаг 3): одна задача на job,
+    # её шаги отмечает bulk_jobs.stage; после каждого шага и чанка — updated_at (по нему reaper
+    # ищет зависший импорт). Записи шагов — условные (status IN running, cancelling): если
+    # отмена pending или reaper завершили job, пока шаг шёл, шаг откатывается целиком — после
+    # финала (он удалил staging) ничего не пишется.
+
+    async def start_import(self, job_id: uuid.UUID) -> bool:
+        """Задача импорта взялась за job: pending → running. False — job уже не pending
+        (отменили или reaper сдался, пока задача её читала)."""
+        result = await self.session.execute(
+            update(BulkJob)
+            .where(BulkJob.id == job_id, BulkJob.status == BulkJobStatus.PENDING)
+            .values(status=BulkJobStatus.RUNNING, started_at=func.now(), updated_at=func.now())
+        )
+        return cast(CursorResult[Any], result).rowcount > 0
+
+    async def finish_import_step(
+        self, job_id: uuid.UUID, stage: str, *, failed: int = 0, total: int | None = None
+    ) -> bool:
+        """Шаг импорта закончен (в его транзакции): stage, новые ошибки строк, после parse —
+        total и начальный итог. False — job уже завершена: шаг надо откатить."""
+        values: dict[str, Any] = {
+            "stage": stage,
+            "failed_rows": BulkJob.failed_rows + failed,
+            "updated_at": func.now(),
+        }
+        if total is not None:
+            values |= {"total": total, "result": {"created": 0, "updated": 0}}
+        result = await self.session.execute(
+            update(BulkJob)
+            .where(BulkJob.id == job_id, BulkJob.status.in_(ACTIVE_STATUSES))
+            .values(**values)
+        )
+        return cast(CursorResult[Any], result).rowcount > 0
+
+    async def add_import_progress(
+        self, job_id: uuid.UUID, *, created: int, updated: int, failed: int
+    ) -> bool:
+        """Последний запрос чанка merge: прогресс, ошибки и итог created / updated — в той же
+        транзакции, что сами строки, поэтому повтор задачи их не посчитает дважды. False —
+        job уже завершена: чанк надо откатить."""
+
+        def counter(name: str, add: int) -> ColumnElement[Any]:
+            return func.coalesce(BulkJob.result[name].as_integer(), 0) + add
+
+        result = await self.session.execute(
+            update(BulkJob)
+            .where(BulkJob.id == job_id, BulkJob.status.in_(ACTIVE_STATUSES))
+            .values(
+                processed=BulkJob.processed + created + updated,
+                failed_rows=BulkJob.failed_rows + failed,
+                result=func.jsonb_build_object(
+                    literal_column("'created'"),
+                    counter("created", created),
+                    literal_column("'updated'"),
+                    counter("updated", updated),
+                ),
+                updated_at=func.now(),
+            )
+        )
+        return cast(CursorResult[Any], result).rowcount > 0
+
+    async def finish_import(
+        self, job_id: uuid.UUID, error: str | None = None
+    ) -> FinishedJob | None:
+        """Финал импорта — свой условный UPDATE (FINALIZE импорт не трогает): отменяли —
+        cancelled; есть причина провала (error или уже записанная) — failed; есть ошибки
+        строк — partial_failed; иначе done. None — job уже завершена или не импорт."""
+        failed = BulkJob.error.is_not(None) if error is None else true()
+        values: dict[str, Any] = {
+            "status": case(
+                (BulkJob.status == BulkJobStatus.CANCELLING, BulkJobStatus.CANCELLED.value),
+                (failed, BulkJobStatus.FAILED.value),
+                (BulkJob.failed_rows > 0, BulkJobStatus.PARTIAL_FAILED.value),
+                else_=BulkJobStatus.DONE.value,
+            ),
+            "finished_at": func.now(),
+            "updated_at": func.now(),
+        }
+        if error is not None:
+            values["error"] = func.coalesce(BulkJob.error, error)  # причина — первая
+        return await self._finish(
+            update(BulkJob)
+            .where(
+                BulkJob.id == job_id,
+                BulkJob.kind == IMPORT_KIND,
+                BulkJob.status.in_(ACTIVE_STATUSES),
+            )
+            .values(**values)
         )
 
     async def _finish(self, statement: Any) -> FinishedJob | None:

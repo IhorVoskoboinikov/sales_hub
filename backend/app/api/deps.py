@@ -27,11 +27,13 @@ from app.services.contacts import CompanyService, ContactService
 from app.services.deals import DealService, PipelineService
 from app.services.failed_tasks import FailedTaskService
 from app.services.fx import FxService, NbuClient
+from app.services.imports import ImportService
 from app.services.invites import InviteService
 from app.services.members import MemberService
 from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
 from app.services.reports import ReportService
+from app.storage import FileStorage
 from app.uow import UnitOfWork
 from app.workers.celery_app import celery_app
 from app.workers.queue import CeleryTaskQueue, CeleryTaskSender, TaskQueue, TaskSender
@@ -63,6 +65,11 @@ def get_opa(request: Request) -> OpaClient:
 
 def get_roles(request: Request) -> RoleCatalog:
     return cast(RoleCatalog, request.app.state.roles)
+
+
+def get_storage(request: Request) -> FileStorage:
+    """Хранилище файлов (S3) процесса. В тестах API — фейк в памяти."""
+    return cast(FileStorage, request.app.state.storage)
 
 
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
@@ -217,6 +224,12 @@ def get_bulk_service(
     settings: Settings = Depends(get_app_settings),
 ) -> BulkService:
     return BulkService(uow, roles, queue, chunk_size=settings.bulk_chunk_size)
+
+
+def get_import_service(
+    bulk: BulkService = Depends(get_bulk_service), storage: FileStorage = Depends(get_storage)
+) -> ImportService:
+    return ImportService(bulk, storage)
 
 
 def get_failed_task_service(

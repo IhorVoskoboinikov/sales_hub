@@ -38,9 +38,19 @@ class ReassignOwnerIn(BaseModel):
     )
 
 
+class ImportInfo(BaseModel):
+    """Как прочитан файл импорта: разделитель и колонки заголовка (имена — в нижнем регистре)."""
+
+    delimiter: str = Field(description="Разделитель: «,» или «;»")
+    columns: list[str] = Field(description="Распознанные колонки в порядке файла")
+    ignored_columns: list[str] = Field(
+        description="Незнакомые колонки (id, created_at из выгрузки…) — их значения не читаются"
+    )
+
+
 class BulkJobOut(BaseModel):
     """Прогресс job: processed из total строк. Финальные статусы — done, partial_failed,
-    failed, cancelled; причина провала — в error."""
+    failed, cancelled; причина провала — в error. У импорта CSV ещё import_info."""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -57,3 +67,18 @@ class BulkJobOut(BaseModel):
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    import_info: ImportInfo | None = None
+
+
+class ImportErrorOut(BaseModel):
+    """Ошибка строки импорта: у строки одна, первая."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    row_no: int = Field(description="Номер строки файла")
+    code: str = Field(
+        description="validation, email_required, duplicate_in_file, owner_invalid, "
+        "owner_out_of_scope, duplicate_outside_scope…"
+    )
+    field: str | None = Field(description="Колонка, если ошибка в одном поле")
+    raw: Any | None = Field(description="Ячейки строки файла")

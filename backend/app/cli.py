@@ -3,6 +3,7 @@
 generate-jwt-key   создать приватный RS256-ключ для JWT (make keys)
 create-superadmin  создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD
 ensure-partitions  месячные партиции activities и audit_log на 2 месяца вперёд
+ensure-bucket      бакет S3_BUCKET в хранилище файлов (RustFS сам бакетов не создаёт)
 refresh-reports    обновить отчёты (REFRESH MATERIALIZED VIEW CONCURRENTLY deal_stats)
 """
 
@@ -19,6 +20,7 @@ from app.core.jwt import generate_private_key, private_key_to_pem
 from app.db.session import create_engine, create_session_factory
 from app.errors import AppError
 from app.services.users import create_superadmin
+from app.storage import S3FileStorage
 from app.uow import UnitOfWork
 
 
@@ -92,6 +94,21 @@ async def ensure_partitions_command(settings: Settings) -> int:
     return 0
 
 
+async def ensure_bucket_command(settings: Settings) -> int:
+    """Идемпотентно: бакет уже есть — ничего. Запускается после миграций (сервис migrate) и ждёт
+    хранилище до 30 секунд: в compose RustFS может ещё стартовать."""
+    storage = S3FileStorage.from_settings(settings)
+    try:
+        await storage.ensure_bucket()
+    except AppError as exc:  # хранилище так и не ответило
+        print(f"{exc.title}: {settings.s3_endpoint_url}", file=sys.stderr)
+        return 1
+    finally:
+        await storage.aclose()
+    print(f"бакет {settings.s3_bucket} готов")
+    return 0
+
+
 async def refresh_reports_command(settings: Settings) -> int:
     """Отчёты читают materialized view — он обновляется этой командой (с этапа 5 — задачей
     beat reports.refresh каждые 5 минут)."""
@@ -116,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         "create-superadmin", help="создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD"
     )
     commands.add_parser("ensure-partitions", help="месячные партиции на 2 месяца вперёд")
+    commands.add_parser("ensure-bucket", help="создать бакет S3_BUCKET, если его нет")
     commands.add_parser("refresh-reports", help="обновить materialized view отчётов")
 
     args = parser.parse_args(argv)
@@ -125,6 +143,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "ensure-partitions":
         return asyncio.run(ensure_partitions_command(settings))
+    if args.command == "ensure-bucket":
+        return asyncio.run(ensure_bucket_command(settings))
     if args.command == "refresh-reports":
         return asyncio.run(refresh_reports_command(settings))
     return asyncio.run(create_superadmin_command(settings))

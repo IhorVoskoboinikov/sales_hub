@@ -3,9 +3,11 @@
 Изоляция (раздел 10): каждый тест работает во внешней транзакции, которая откатывается после
 него. Коммиты сервисов внутри теста становятся SAVEPOINT-ами — таблицы чистить не нужно.
 Задачи Celery выполняет настоящий воркер в потоке (фикстура celery_worker, маркер worker).
+Хранилище файлов в тестах API — фейк в памяти (file_storage), RustFS — у тестов хранилища и воркера.
 Outbox внутри транзакции теста доставляет фикстура deliver_outbox, письма читает inbox.
 """
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
@@ -13,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 
 import httpx
 import pytest
@@ -24,6 +26,7 @@ from celery.contrib.testing.worker import start_worker
 from celery.worker import WorkController
 from fastapi import FastAPI
 from httpx import AsyncClient
+from pydantic import SecretStr
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -36,6 +39,7 @@ from app.api.deps import (
     SessionScope,
     get_session,
     get_session_scope,
+    get_storage,
     get_task_queue,
     get_task_sender,
 )
@@ -43,7 +47,7 @@ from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.core.resources import smtp_sender
 from app.core.security import hash_password
-from app.errors import ServiceUnavailable
+from app.errors import NotFound, ServiceUnavailable
 from app.events.relay import publish_batch
 from app.models import (
     Activity,
@@ -60,6 +64,7 @@ from app.models import (
 )
 from app.services.bulk import BulkService
 from app.services.notifications import NotificationService
+from app.storage import S3FileStorage
 from app.uow import UnitOfWork
 from app.workers import runtime
 from app.workers.celery_app import celery_app
@@ -73,6 +78,9 @@ POSTGRES_IMAGE = "postgres:18.6"
 REDIS_IMAGE = "redis:8.10"
 MAILPIT_IMAGE = "axllent/mailpit:v1.31.6"
 OPA_IMAGE = "openpolicyagent/opa:1.21.3"
+RUSTFS_IMAGE = "rustfs/rustfs:1.0.3"
+RUSTFS_ACCESS_KEY = "saleshub"
+RUSTFS_SECRET_KEY = "saleshub-secret"
 
 
 def alembic_config(database_url: str) -> Config:
@@ -150,6 +158,99 @@ def opa_url() -> Iterator[str]:
         yield f"http://{container.get_container_host_ip()}:{container.get_exposed_port(8181)}"
 
 
+@dataclass(frozen=True)
+class RustFs:
+    endpoint_url: str
+
+
+@pytest.fixture(scope="session")
+def rustfs() -> Iterator[RustFs]:
+    """Настоящий RustFS (S3 API) — как сервис rustfs в compose. Для тестов хранилища и воркера:
+    API-тесты работают с фейком в памяти (FakeFileStorage)."""
+    container = (
+        DockerContainer(RUSTFS_IMAGE)
+        .with_env("RUSTFS_ACCESS_KEY", RUSTFS_ACCESS_KEY)
+        .with_env("RUSTFS_SECRET_KEY", RUSTFS_SECRET_KEY)
+        .with_exposed_ports(9000)
+        .waiting_for(HttpWaitStrategy(9000, "/health"))
+    )
+    with container:
+        host = container.get_container_host_ip()
+        yield RustFs(f"http://{host}:{container.get_exposed_port(9000)}")
+
+
+TEST_BUCKET = "saleshub-test"
+
+
+def s3_settings(rustfs: RustFs) -> dict[str, Any]:
+    """Настройки S3 для RustFS контейнера — у воркера и у приложения конец-в-конец теста."""
+    return {
+        "s3_endpoint_url": rustfs.endpoint_url,
+        "s3_access_key": RUSTFS_ACCESS_KEY,
+        "s3_secret_key": SecretStr(RUSTFS_SECRET_KEY),  # model_copy не проверяет типы
+        "s3_bucket": TEST_BUCKET,
+    }
+
+
+def s3_storage(rustfs: RustFs, bucket: str = TEST_BUCKET) -> S3FileStorage:
+    return S3FileStorage(
+        endpoint_url=rustfs.endpoint_url,
+        access_key=RUSTFS_ACCESS_KEY,
+        secret_key=RUSTFS_SECRET_KEY,
+        bucket=bucket,
+        region="us-east-1",
+    )
+
+
+@pytest.fixture
+async def storage(rustfs: RustFs) -> AsyncIterator[S3FileStorage]:
+    """S3FileStorage на бакете RustFS контейнера; бакет — ensure_bucket, как в migrate. Клиент —
+    свой на тест: он привязан к event loop, а loop у каждого теста свой."""
+    s3 = s3_storage(rustfs)
+    await s3.ensure_bucket()
+    try:
+        yield s3
+    finally:
+        await s3.aclose()
+
+
+class FakeFileStorage:
+    """Подмена FileStorage в тестах API: файлы — в памяти (ключ → байты и тип). down —
+    хранилище недоступно (503)."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, tuple[bytes, str]] = {}
+        self.deleted: list[str] = []
+        self.down = False
+
+    async def put(self, key: str, fileobj: BinaryIO, size: int, content_type: str) -> None:
+        if self.down:
+            raise ServiceUnavailable(service="storage")
+        data = fileobj.read()
+        assert len(data) == size, "size не совпал с файлом"
+        self.files[key] = (data, content_type)
+
+    async def download_to(self, key: str, path: Path) -> None:
+        if key not in self.files:
+            raise NotFound(entity="file", key=key)
+        await asyncio.to_thread(path.write_bytes, self.files[key][0])
+
+    async def delete(self, key: str) -> None:
+        self.files.pop(key, None)
+        self.deleted.append(key)
+
+    async def ensure_bucket(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.fixture
+def file_storage() -> FakeFileStorage:
+    return FakeFileStorage()
+
+
 @pytest.fixture
 def settings(
     settings: Settings,
@@ -181,8 +282,10 @@ def celery_worker(
     celery_broker_url: str,
     celery_broker: None,
     mailpit: Mailpit,
+    rustfs: RustFs,
 ) -> Iterator[WorkController]:
     """Настоящий воркер нашего celery_app в потоке этого процесса (раздел 10), один на запуск.
+    Хранилище воркера — RustFS контейнера, бакет TEST_BUCKET (его создаёт фикстура storage).
 
     pool=solo: задачи выполняются в потоке воркера со своим event loop (runtime.py).
     perform_ping_check=False: ping-задаче нужен result backend, а его нет. Тест ждёт результат
@@ -200,6 +303,7 @@ def celery_worker(
             policies_dir=POLICIES_DIR,
             jwt_private_key_file=jwt_key_file,
             nbu_url=NBU_URL,
+            **s3_settings(rustfs),
         )
     )
     try:
@@ -285,6 +389,7 @@ def app(
     db_session: AsyncSession,
     task_queue: FakeTaskQueue,
     task_sender: FakeTaskSender,
+    file_storage: FakeFileStorage,
 ) -> FastAPI:
     # Запросы API идут в ту же транзакцию теста: после теста всё откатится.
     async def test_session() -> AsyncIterator[AsyncSession]:
@@ -307,6 +412,7 @@ def app(
     app.dependency_overrides[get_session_scope] = session_scope
     app.dependency_overrides[get_task_queue] = lambda: task_queue
     app.dependency_overrides[get_task_sender] = lambda: task_sender
+    app.dependency_overrides[get_storage] = lambda: file_storage
     return app
 
 
@@ -665,3 +771,32 @@ def make_failed_task(uow: UnitOfWork) -> MakeFailedTask:
         return task
 
     return make
+
+
+# (имя поля, содержимое, имя файла: None — обычное поле формы)
+FormPart = tuple[str, bytes, str | None]
+BOUNDARY = "saleshub-test-boundary"
+
+
+def multipart_body(parts: list[FormPart]) -> tuple[bytes, dict[str, str]]:
+    """Тело multipart/form-data «руками» и его Content-Type: тесты импорта отправляют и то, что
+    httpx собрать не даст (два файла, файл без имени поля, битую форму)."""
+    chunks: list[bytes] = []
+    for name, content, filename in parts:
+        disposition = f'form-data; name="{name}"'
+        if filename is not None:
+            disposition += f'; filename="{filename}"'
+        head = f"--{BOUNDARY}\r\nContent-Disposition: {disposition}\r\n"
+        if filename is not None:
+            head += "Content-Type: text/csv\r\n"
+        chunks.append(head.encode() + b"\r\n" + content + b"\r\n")
+    chunks.append(f"--{BOUNDARY}--\r\n".encode())
+    return b"".join(chunks), {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
+
+
+def import_form(csv: bytes, owner_id: uuid.UUID | str | None = None) -> list[FormPart]:
+    """Форма POST /contacts/import: файл contacts.csv и необязательный owner_id."""
+    parts: list[FormPart] = [("file", csv, "contacts.csv")]
+    if owner_id is not None:
+        parts.append(("owner_id", str(owner_id).encode(), None))
+    return parts

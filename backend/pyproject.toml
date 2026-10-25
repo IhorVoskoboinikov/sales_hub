@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "SalesHub CRM — учебный бэкенд"
 requires-python = ">=3.13,<3.14"
 dependencies = [
+    # S3 API (RustFS локально): тянет aiohttp 3.14 — раздел 1, «Версии этапа 5».
+    "aiobotocore>=3.10.0",
     "aiosmtplib>=5.1.3",
     "alembic>=1.20.0",
     "asyncpg>=0.32.0",
@@ -37,6 +39,7 @@ dev = [
     "ruff==0.17.1",
     # Без экстры redis: она требует redis-py >= 7, а модулю Redis-контейнера хватает основного redis.
     "testcontainers[postgres]>=4.15.0",
+    "types-aiobotocore-s3>=3.10.0",  # типы клиента S3 для mypy
     "types-pyyaml>=6.0.12.20260906",
 ]
 
@@ -63,7 +66,9 @@ plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 # Без аннотаций. asyncpg напрямую нужен только relay — для LISTEN (app/events/relay.py).
-module = ["testcontainers.*", "asyncpg.*"]
+# aiobotocore и botocore: типы есть только у клиента S3 (types-aiobotocore-s3), сессия, конфиг
+# и исключения — без них (app/storage/s3.py).
+module = ["testcontainers.*", "asyncpg.*", "aiobotocore.*", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

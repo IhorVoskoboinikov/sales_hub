@@ -17,6 +17,7 @@ from app.models.deals import Deal, DealStatus, Pipeline, PipelineStage
 from app.models.email_token import EmailToken, EmailTokenPurpose
 from app.models.failed_tasks import FailedTask
 from app.models.fx import FxRate
+from app.models.imports import ContactStaging, ImportRowError
 from app.models.notifications import NotificationChannel, SentNotification
 from app.models.organization import Organization, Team
 from app.models.outbox import OutboxEvent
@@ -38,6 +39,7 @@ __all__ = [
     "ChunkStatus",
     "Company",
     "Contact",
+    "ContactStaging",
     "ContactStatus",
     "Deal",
     "DealStatus",
@@ -45,6 +47,7 @@ __all__ = [
     "EmailTokenPurpose",
     "FailedTask",
     "FxRate",
+    "ImportRowError",
     "Note",
     "NotificationChannel",
     "Organization",

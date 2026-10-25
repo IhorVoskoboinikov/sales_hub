@@ -244,6 +244,30 @@ test_viewer_exports_but_cannot_run_bulk if {
 	not authz.allow with input as req(viewer, "POST", "/api/v1/bulk/reassign-owner")
 }
 
+# Импорт CSV — массовая операция (bulk:run): админ и руководитель запускают, менеджер и
+# наблюдатель — нет (импорт создаёт и меняет контакты, как bulk:run к contact:write).
+test_contacts_import_is_bulk_run if {
+	every user in [org_admin, team_lead] {
+		d := authz.decision with input as req(user, "POST", "/api/v1/contacts/import")
+		d.allow
+		d.action == "bulk:run"
+	}
+	every user in [sales_rep, viewer, super_admin] {
+		not authz.allow with input as req(user, "POST", "/api/v1/contacts/import")
+	}
+}
+
+# Ошибки строк импорта видит тот, кто видит job (bulk_job:read); у менеджера job нет.
+test_import_errors_follow_job_read if {
+	every user in [org_admin, team_lead, viewer] {
+		d := authz.decision with input as req(user, "GET", "/api/v1/bulk-jobs/{job_id}/errors")
+		d.allow
+		d.action == "bulk_job:read"
+	}
+	not authz.allow with input as req(sales_rep, "GET", "/api/v1/bulk-jobs/{job_id}/errors")
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/bulk-jobs/{job_id}/errors")
+}
+
 # Наблюдатель видит только свои job (выгрузки в S3 — этап 10).
 test_viewer_reads_own_jobs if {
 	data.saleshub.roles.viewer.permissions["bulk_job:read"] == "own"

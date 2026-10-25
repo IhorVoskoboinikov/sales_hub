@@ -29,7 +29,15 @@ from sqlalchemy.exc import IntegrityError
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.errors import Conflict, NotFound, ValidationFailed
-from app.models import BulkEntity, BulkJob, BulkJobKind, BulkJobStatus, ChunkStatus, User
+from app.models import (
+    BulkEntity,
+    BulkJob,
+    BulkJobKind,
+    BulkJobStatus,
+    ChunkStatus,
+    ImportRowError,
+    User,
+)
 from app.models.bulk import ACTIVE_JOB_INDEX, FINAL_STATUSES, IDEMPOTENCY_CONSTRAINT
 from app.repositories.bulk import (
     ENTITY_MODELS,
@@ -43,6 +51,7 @@ from app.repositories.bulk import (
     stalled_chunks,
     stalled_import,
 )
+from app.repositories.pagination import Page, PageResult
 from app.services.crm import Owner, can_own, resolve_owner
 from app.uow import UnitOfWork
 from app.workers.queue import TaskQueue
@@ -59,7 +68,7 @@ REASSIGN_INCLUDE: dict[str, BulkEntity] = {
 
 PLAN_TASK = "bulk.plan"
 CHUNK_TASK = "bulk.chunk"
-# Задача импорта появится в шаге 5.6; reaper ставит её по имени, как API — bulk.plan.
+# Задача импорта (шаг 5.6): API и reaper ставят её по имени, как bulk.plan.
 IMPORT_TASK = "imports.import_contacts"
 BULK_QUEUE = "bulk"  # очередь чанков: её длину reaper смотрит перед повторной отправкой
 
@@ -160,6 +169,13 @@ class BulkService:
         """Job в уровне bulk_job:read (автор — owner_id) или своя, иначе 404."""
         return await self.uow.bulk_jobs.get_visible_or_404(job_id, access)
 
+    async def import_errors(
+        self, access: Access, job_id: uuid.UUID, page: Page
+    ) -> PageResult[ImportRowError]:
+        """Ошибки строк импорта (keyset по row_no). Job — как в get: не видна — 404."""
+        await self.uow.bulk_jobs.get_visible_or_404(job_id, access)
+        return await self.uow.import_errors.list(job_id, page)
+
     async def cancel(self, access: Access, job_id: uuid.UUID) -> BulkJob:
         """Отменить job (раздел 15, «Жизненный цикл bulk job»). access — bulk_job:cancel.
 
@@ -233,9 +249,42 @@ class BulkService:
     ) -> BulkJob:
         digest = request_hash(kind, params)
         if key is not None:
-            existing = await self.uow.bulk_jobs.find_by_key(access.user_id, key)
+            existing = await self.find_replay(access, key, digest)
             if existing is not None:
-                return self._replay(existing, digest)
+                return existing
+        job, created = await self.insert(access, kind, params, key, digest)
+        if not created:
+            return job  # гонка двух одинаковых запросов: job первого
+        await self.uow.commit()
+        logger.info("bulk_job_created", job_id=str(job.id), kind=kind)
+        # После коммита и best-effort: ошибку брокера порт только логирует.
+        await self.queue.enqueue(PLAN_TASK, str(job.id))
+        return job
+
+    async def find_replay(self, access: Access, key: str, digest: str) -> BulkJob | None:
+        """Повтор по Idempotency-Key: моя job с этим ключом (в любом статусе) или None. Ключ
+        тот же, а запрос другой (digest) — 422 bulk.idempotency_key_reused."""
+        existing = await self.uow.bulk_jobs.find_by_key(access.user_id, key)
+        return self._replay(existing, digest) if existing is not None else None
+
+    async def ensure_not_running(self, access: Access, kind: BulkJobKind) -> None:
+        """Заранее, до тяжёлой работы запроса (импорт — до приёма файла): job вида уже идёт в
+        организации — 409 bulk.already_running. Гонку двух запросов всё равно ловит частичный
+        UNIQUE при вставке (insert)."""
+        if await self.uow.bulk_jobs.has_active(access.org_id, kind):
+            raise await self._already_running(access, kind)
+
+    async def insert(
+        self,
+        access: Access,
+        kind: BulkJobKind,
+        params: dict[str, Any],
+        key: str | None,
+        digest: str,
+    ) -> tuple[BulkJob, bool]:
+        """Строка bulk_jobs (pending) в транзакции запроса, без коммита. True — job новая;
+        False — гонка с тем же Idempotency-Key, это job первого запроса (транзакция откачена).
+        Активная job вида уже есть — 409 bulk.already_running."""
         job = BulkJob(
             org_id=access.org_id,
             team_id=access.team_id,
@@ -251,12 +300,8 @@ class BulkService:
             await self.uow.flush()
         except IntegrityError as exc:
             await self.uow.rollback()
-            return await self._after_conflict(exc, access, kind, key, digest)
-        await self.uow.commit()
-        logger.info("bulk_job_created", job_id=str(job.id), kind=kind)
-        # После коммита и best-effort: ошибку брокера порт только логирует.
-        await self.queue.enqueue(PLAN_TASK, str(job.id))
-        return job
+            return await self._after_conflict(exc, access, kind, key, digest), False
+        return job, True
 
     def _replay(self, job: BulkJob, digest: str) -> BulkJob:
         """Тот же ключ и то же тело — та же job в любом статусе; другое тело — 422."""
@@ -281,11 +326,15 @@ class BulkService:
             if existing is not None:
                 return self._replay(existing, digest)
         if constraint == ACTIVE_JOB_INDEX:
-            # job_id — только видимой мне job (bulk_job:read): чужая дала бы ссылку на 404.
-            read = access.for_action("bulk_job:read", self.roles)
-            active = await self.uow.bulk_jobs.find_active(kind, read) if read else None
-            raise Conflict("bulk.already_running", job_id=str(active.id) if active else None)
+            raise await self._already_running(access, kind)
         raise exc
+
+    async def _already_running(self, access: Access, kind: BulkJobKind) -> Conflict:
+        """409 bulk.already_running. job_id — только видимой мне job (bulk_job:read): чужая
+        дала бы ссылку на 404, а успевшая закончиться — на уже не активную."""
+        read = access.for_action("bulk_job:read", self.roles)
+        active = await self.uow.bulk_jobs.find_active(kind, read) if read else None
+        return Conflict("bulk.already_running", job_id=str(active.id) if active else None)
 
     # --- воркер
 
@@ -460,13 +509,12 @@ class BulkService:
 
     async def _record_final(self, job_id: uuid.UUID, finished: FinishedJob) -> None:
         """Итог job и одна строка журнала — в транзакции того, кто сделал финальный переход:
-        finalize, отмена pending-job или reaper, который сдался. Переход — условный UPDATE,
-        поэтому итог пишется ровно один раз."""
-        rows: dict[str, int] = {}
-        if finished.kind != BulkJobKind.IMPORT_CONTACTS:
-            # У импорта чанков нет: его итоги (result.created / updated) пишет сам импорт, а
-            # строки staging удаляются в той же транзакции, что любой финальный переход, — это
-            # место для них (шаг 5.6).
+        finalize, отмена pending-job, reaper, который сдался, или финал импорта. Переход —
+        условный UPDATE, поэтому итог пишется ровно один раз. У импорта здесь же удаляются
+        строки staging (_import_final)."""
+        if finished.kind == BulkJobKind.IMPORT_CONTACTS:
+            rows = await self._import_final(job_id)
+        else:
             done = await self.uow.bulk_chunks.rows_by_entity(job_id)
             entities = self._entities(finished.kind, finished.params)
             rows = {e.value: done.get(e, 0) for e in entities}
@@ -480,6 +528,22 @@ class BulkService:
             changes=self._audit_changes(finished, rows),
         )
         logger.info("bulk_job_finished", job_id=str(job_id), status=finished.status, rows=rows)
+
+    async def _import_final(self, job_id: uuid.UUID) -> dict[str, int]:
+        """Финальный переход импорта — любой: его собственный финал, отмена pending, reaper,
+        который сдался. Строки staging удаляются здесь, в той же транзакции. Итог created /
+        updated копит сам импорт (чанки merge); до merge его нет — нули. В журнал — итог и
+        число ошибок строк."""
+        await self.uow.imports.delete_staging(job_id)
+        job = await self._reload(job_id)
+        result = job.result or {"created": 0, "updated": 0}
+        if job.result is None:
+            await self.uow.bulk_jobs.set_result(job_id, result)
+        return {
+            "created": result["created"],
+            "updated": result["updated"],
+            "failed": job.failed_rows,
+        }
 
     # --- bulk.reap_stuck (раздел 15, «Жизненный цикл bulk job»)
 

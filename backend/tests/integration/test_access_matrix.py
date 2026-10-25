@@ -25,6 +25,9 @@ job уже завершена, поэтому SSE сразу отдаёт сни
 У POST /bulk-jobs/{job_id}/cancel те же цели, но job идут (running) — у каждой свой вид: в
 организации одна активная job вида (частичный UNIQUE). Упавшие задачи (/admin/failed-tasks) —
 только супер-админ: цель system — строка failed_tasks, TaskSender — фейк (conftest).
+POST /contacts/import — форма multipart с маленьким CSV (хранилище и TaskQueue — фейки), у
+админа и руководителя owner_id — менеджер отдела 1; GET /bulk-jobs/{job_id}/errors — цели как у
+GET /bulk-jobs/{job_id}.
 """
 
 import uuid
@@ -51,7 +54,9 @@ from tests.integration.conftest import (
     MakeRecord,
     MakeUser,
     OrgFixture,
+    import_form,
     member,
+    multipart_body,
 )
 
 ROLES = ["org_admin", "team_lead", "sales_rep", "viewer", "super_admin"]
@@ -87,6 +92,7 @@ class World:
 
 Body = Callable[[World, str], dict[str, Any]]
 TargetBody = Callable[[World, str, str | None], dict[str, Any]]  # тело зависит и от цели
+Form = Callable[[World, str], tuple[bytes, dict[str, str]]]  # тело multipart и Content-Type
 
 
 @dataclass(frozen=True)
@@ -107,6 +113,7 @@ class Case:
     org_object: bool = False  # объект организации (воронка): чужая — 404, своя видна всем
     target_body: TargetBody | None = None
     invisible: int = 404  # ответ, когда цель вне уровня read (у ссылки в теле — 422)
+    form: Form | None = None  # тело multipart/form-data вместо JSON
 
 
 def company_body(world: World, role: str) -> dict[str, Any]:
@@ -133,6 +140,11 @@ def reassign_body(world: World, role: str, target: str | None) -> dict[str, Any]
         "from_user_id": str(world.people[target]),
         "to_user_id": str(world.users["sales_rep"].id),
     }
+
+
+def import_body(world: World, role: str) -> tuple[bytes, dict[str, str]]:
+    csv = f"email,first_name\n{unique('c')}@example.com,Іван\n".encode()
+    return multipart_body(import_form(csv, world.owner_for(role).get("owner_id")))
 
 
 # Описание каждого маршрута routes.rego: тело запроса и какие объекты подставлять в путь.
@@ -250,6 +262,8 @@ CASES: dict[str, Case] = {
     "POST /api/v1/bulk-jobs/{job_id}/cancel": Case(
         "bulk_job:cancel", None, CRM_TARGETS, "bulk_job:read"
     ),
+    "POST /api/v1/contacts/import": Case("bulk:run", form=import_body),
+    "GET /api/v1/bulk-jobs/{job_id}/errors": Case("bulk_job:read", None, CRM_TARGETS),
     "GET /api/v1/admin/failed-tasks": Case("admin:system"),
     "GET /api/v1/admin/failed-tasks/{failed_task_id}": Case("admin:system", None, ("system",)),
     "POST /api/v1/admin/failed-tasks/{failed_task_id}/replay": Case(
@@ -429,6 +443,7 @@ ACCEPTED = {
     "POST /api/v1/invites",
     "POST /api/v1/admin/orgs/{org_id}/invites",
     "POST /api/v1/bulk/reassign-owner",
+    "POST /api/v1/contacts/import",
     CANCEL_ROUTE,
     "POST /api/v1/admin/failed-tasks/{failed_task_id}/replay",
 }
@@ -488,12 +503,18 @@ async def test_access(
         success = RESTORE
 
     path = url_for(route, target, world) if case.query is None else route.split(" ", 1)[1]
+    headers = {"Authorization": f"Bearer {token}"}
+    content: bytes | None = None
+    if case.form is not None:
+        content, form_headers = case.form(world, role)
+        headers |= form_headers
     resp = await client.request(
         method,
         path,
         params=case.query(world, target) if case.query else None,
         json=body_for(case, world, role, target),
-        headers={"Authorization": f"Bearer {token}"},
+        content=content,
+        headers=headers,
     )
 
     expected = expected_status(role, case, target, success)

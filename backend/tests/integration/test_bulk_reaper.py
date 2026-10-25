@@ -17,7 +17,7 @@ from sqlalchemy import func, select, update
 
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
-from app.models import AuditEntry, BulkJob, BulkJobChunk, User
+from app.models import AuditEntry, BulkJob, BulkJobChunk, ContactStaging, User
 from app.services.bulk import BulkService, ReapPolicy, ReapReport, ReassignOwnerRequest
 from app.uow import UnitOfWork
 from app.workers.queue import broker_queue_length
@@ -395,6 +395,9 @@ async def test_import_gives_up_after_max_reaps(
         )
     ).id
     await age(uow, job_id, 16 * MINUTE, reaps=POLICY.max_reaps)
+    # Строки staging недоделанного импорта: финал reaper удаляет их в своей транзакции.
+    uow.session.add(ContactStaging(job_id=job_id, row_no=2, email="a@b.c", first_name="A"))
+    await uow.commit()
 
     report = await reap(bulk)
 
@@ -406,8 +409,16 @@ async def test_import_gives_up_after_max_reaps(
     [entry] = await audit_of(uow, job_id)
     assert (entry.action, entry.changes) == (
         "bulk.import_contacts",
-        {"file_name": "clients.csv", "status": "failed", "rows": {}},
+        {
+            "file_name": "clients.csv",
+            "status": "failed",
+            "rows": {"created": 10, "updated": 2, "failed": 0},
+        },
     )
+    staged = await uow.session.scalar(
+        select(func.count()).select_from(ContactStaging).where(ContactStaging.job_id == job_id)
+    )
+    assert staged == 0
 
 
 async def test_import_is_never_finalized_by_chunk_rules(

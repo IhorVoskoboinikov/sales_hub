@@ -16,6 +16,9 @@ dist/
 coverage.xml
 htmlcov/
 
+# Сгенерированные файлы (make import-csv)
+backend/tmp/
+
 # Секреты и локальные настройки
 .env
 backend/secrets/

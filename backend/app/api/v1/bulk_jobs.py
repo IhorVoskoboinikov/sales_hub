@@ -1,4 +1,4 @@
-"""Прогресс bulk job (разделы 6 и 15): снимок, поток SSE и отмена.
+"""Прогресс bulk job (разделы 6 и 15): снимок, поток SSE, ошибки строк импорта и отмена.
 
 Видимость — по уровню bulk_job:read, где owner_id job — её автор: руководитель видит job
 своего отдела, наблюдатель — только свои. Чужая job — 404.
@@ -13,15 +13,17 @@ from fastapi import Depends, status
 from fastapi.responses import StreamingResponse
 from fastapi.sse import KEEPALIVE_COMMENT, EventSourceResponse, format_sse_event
 
-from app.api.deps import SessionScope, get_bulk_service, get_session_scope, get_uow
+from app.api.deps import SessionScope, get_bulk_service, get_page, get_session_scope, get_uow
 from app.api.v1 import protected_router
-from app.api.v1.errors import CONFLICT, NOT_FOUND, PROTECTED, Responses
+from app.api.v1.errors import CONFLICT, NOT_FOUND, PROTECTED, VALIDATION, Responses
 from app.authz.access import Access
 from app.authz.deps import authorize
 from app.errors import NotFound
 from app.models import FINAL_STATUSES
 from app.repositories.bulk import BulkJobRepository
-from app.schemas.bulk import BulkJobOut
+from app.repositories.pagination import Page
+from app.schemas.bulk import BulkJobOut, ImportErrorOut
+from app.schemas.common import PageOut
 from app.services.bulk import BulkService
 from app.uow import UnitOfWork
 
@@ -40,6 +42,27 @@ async def get_bulk_job(
     bulk: BulkService = Depends(get_bulk_service),
 ) -> BulkJobOut:
     return BulkJobOut.model_validate(await bulk.get(access, job_id))
+
+
+@protected_router.get(
+    "/bulk-jobs/{job_id}/errors",
+    tags=["bulk"],
+    responses={**PROTECTED, **NOT_FOUND, **VALIDATION},
+)
+async def bulk_job_errors(
+    job_id: uuid.UUID,
+    page: Page = Depends(get_page),
+    access: Access = Depends(authorize),
+    bulk: BulkService = Depends(get_bulk_service),
+) -> PageOut[ImportErrorOut]:
+    """Ошибки строк импорта CSV по порядку файла: у строки одна, первая ошибка. Job ищется
+    так же, как в `GET /bulk-jobs/{job_id}`: не видна — 404. У других видов job — пустой
+    список."""
+    result = await bulk.import_errors(access, job_id, page)
+    return PageOut(
+        items=[ImportErrorOut.model_validate(e) for e in result.items],
+        next_cursor=result.next_cursor,
+    )
 
 
 @protected_router.post(

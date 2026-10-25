@@ -12,6 +12,7 @@ from app.repositories.deals import DealRepository, PipelineRepository
 from app.repositories.email_tokens import EmailTokenRepository
 from app.repositories.failed_tasks import FailedTaskRepository
 from app.repositories.fx import FxRateRepository
+from app.repositories.imports import ImportErrorRepository, ImportRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
 from app.repositories.outbox import OutboxRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
@@ -45,6 +46,8 @@ class UnitOfWork:
         self.bulk_chunks = BulkChunkRepository(session)
         self.bulk = BulkRepository(session)
         self.failed_tasks = FailedTaskRepository(session)
+        self.import_errors = ImportErrorRepository(session)
+        self.imports = ImportRepository(session)  # staging и шаги задачи импорта
 
     async def flush(self) -> None:
         """Отправить изменения в базу без коммита: проверить ограничения, получить значения

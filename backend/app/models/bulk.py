@@ -32,6 +32,7 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+from app.models.imports import IMPORT_COLUMNS
 
 
 class BulkJobKind(StrEnum):
@@ -133,6 +134,19 @@ class BulkJob(Base):
     # Время последнего прогресса: по нему bulk.reap_stuck находит зависшие job (шаг 5.5).
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    @property
+    def import_info(self) -> dict[str, Any] | None:
+        """Как прочитан файл импорта (раздел 6): разделитель, распознанные колонки в порядке
+        файла и проигнорированные. Его отдаёт BulkJobOut; у других видов job — None."""
+        if self.kind != BulkJobKind.IMPORT_CONTACTS:
+            return None
+        columns: list[str] = self.params["columns"]  # заголовок файла целиком, по порядку
+        return {
+            "delimiter": self.params["delimiter"],
+            "columns": [c for c in columns if c in IMPORT_COLUMNS],
+            "ignored_columns": [c for c in columns if c and c not in IMPORT_COLUMNS],
+        }
 
     # Значения по умолчанию из базы (status, счётчики, created_at) — тем же INSERT … RETURNING:
     # иначе их пришлось бы дочитывать, а ленивая загрузка в async — ошибка.

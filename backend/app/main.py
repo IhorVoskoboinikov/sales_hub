@@ -56,6 +56,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.redis = resources.redis
         app.state.opa = resources.opa
         app.state.nbu = resources.nbu
+        app.state.storage = resources.storage
         try:
             if settings.show_docs:
                 app.state.route_actions = await fetch_route_actions(

@@ -37,6 +37,17 @@ class Settings(BaseSettings):
     import_reap_stall_seconds: int = Field(900, ge=1)
     bulk_max_reaps: int = Field(3, ge=1)
 
+    # --- Файлы (разделы 11 и 12): S3 API; локально — RustFS из compose (ключи — оттуда же).
+    s3_endpoint_url: str = "http://localhost:9000"
+    s3_access_key: str = "saleshub"
+    s3_secret_key: SecretStr = SecretStr("saleshub-secret")
+    s3_bucket: str = "saleshub"
+    s3_region: str = "us-east-1"
+    # Импорт контактов из CSV (раздел 6): размер файла в байтах (больше — 413) и строк (больше —
+    # job failed с import.too_many_rows).
+    import_max_bytes: int = Field(100 * 1024 * 1024, ge=1)
+    import_max_rows: int = Field(1_000_000, ge=1)
+
     # --- Вход по почте (раздел 4)
     # Путь относительно backend/ (в контейнере — /app). В dev файл создаёт make keys.
     jwt_private_key_file: Path = Path("secrets/jwt_private.pem")

@@ -17,6 +17,8 @@ ERRORS: dict[str, str] = {
     "conflict": "Конфлікт даних",
     "validation": "Помилка валідації",
     "rate_limited": "Забагато запитів, спробуйте пізніше",
+    "length_required": "Потрібен заголовок Content-Length",
+    "payload_too_large": "Завеликий запит",
     "unavailable": "Сервіс тимчасово недоступний",
     "http_error": "Помилка запиту",
     # Приглашения и токены из писем
@@ -59,6 +61,19 @@ ERRORS: dict[str, str] = {
     "ваших прав",
     "bulk.not_cancellable": "Операцію вже завершено або її не можна скасувати",
     "bulk.stuck": "Операція зависла: завдання кілька разів надсилали повторно без результату",
+    # Імпорт контактів з CSV
+    "import.length_required": "Потрібен заголовок Content-Length: завантаження частинами "
+    "(chunked) не приймається",
+    "import.file_too_large": "Файл перевищує дозволений розмір",
+    "import.invalid_form": "Очікується форма multipart/form-data з полем file (CSV) і "
+    "необов'язковим owner_id",
+    "import.invalid_encoding": "Файл має бути в кодуванні UTF-8",
+    "import.invalid_header": "Некоректний заголовок CSV: потрібні колонки email і first_name, "
+    "без повторів",
+    "import.empty_file": "Файл порожній",
+    "import.too_many_rows": "У файлі забагато рядків",
+    "import.malformed_csv": "Файл CSV пошкоджено: незакрита або зайва лапка, поле довше "
+    "10 000 символів чи надто довгий рядок",
     # Задачі, що впали після всіх повторів
     "failed_task.already_replayed": "Це завдання вже перезапущено",
     "failed_task.unknown_task": "Такого завдання більше немає серед зареєстрованих",

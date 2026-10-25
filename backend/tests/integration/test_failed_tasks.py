@@ -297,6 +297,7 @@ async def test_replay_sends_task_by_name_and_marks_row(
         ("tests.renamed_long_ago", "failed_task.unknown_task"),
         ("bulk.chunk", "failed_task.not_replayable"),
         ("bulk.plan", "failed_task.not_replayable"),
+        ("imports.import_contacts", "failed_task.not_replayable"),
     ],
 )
 async def test_replay_conflicts(

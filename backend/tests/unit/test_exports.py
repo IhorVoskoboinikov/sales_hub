@@ -14,6 +14,7 @@ import pytest
 from fastapi import Depends, FastAPI
 from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy.dialects.postgresql import asyncpg as pg_asyncpg
 
 from app.api.deps import export_slot, get_app_settings
@@ -23,7 +24,7 @@ from app.errors.handlers import register_error_handlers
 from app.models import ContactStatus
 from app.repositories.bulk import tag_filter
 from app.repositories.contacts import ContactFilters, ContactRepository
-from app.schemas.crm import ContactImportRow
+from app.schemas.crm import ContactImportRow, Tag
 from app.services.bulk import filter_params, filters_from_params
 from app.services.exports import BUSY_RETRY_AFTER, ExportSlots, csv_cell, csv_lines
 
@@ -64,10 +65,21 @@ def test_import_unescapes_one_apostrophe_before_formula() -> None:
     assert imported("'abc") == "'abc"
 
 
-def test_tag_with_comma_does_not_survive_round_trip() -> None:
-    """Известное ограничение (раздел 6): тег может содержать запятую, а в ячейке теги — через
-    запятую, поэтому «a,b» после обратной загрузки — два тега."""
-    assert imported(csv_cell(["a,b", "vip"]), "tags") == ["a", "b", "vip"]
+def test_tags_survive_round_trip() -> None:
+    # Запятая и пробелы по краям в теге запрещены (тип Tag), поэтому теги из выгрузки
+    # загружаются обратно теми же.
+    assert imported(csv_cell(["клієнт VIP", "b2b"]), "tags") == ["клієнт VIP", "b2b"]
+
+
+@pytest.mark.parametrize("tag", ["a,b", " vip", "vip ", ",", " "])
+def test_tag_with_comma_or_edge_spaces_is_rejected(tag: str) -> None:
+    with pytest.raises(ValidationError):
+        TypeAdapter(Tag).validate_python(tag)
+
+
+@pytest.mark.parametrize("tag", ["v", "vip", "клієнт VIP", "a-b_c.d"])
+def test_ordinary_tags_are_accepted(tag: str) -> None:
+    assert TypeAdapter(Tag).validate_python(tag) == tag
 
 
 def test_export_slots_limit_and_release() -> None:

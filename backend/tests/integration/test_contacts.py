@@ -4,6 +4,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,6 +78,22 @@ async def test_owner_rules(client: AsyncClient, make_user: MakeUser, make_org: M
     assert (await create("lead", owner_id=p["rep"]["id"]))[0] == 201
     assert await create("lead", owner_id=p["rep2"]["id"]) == (403, "forbidden")
     assert await create("rep", owner_id=p["peer"]["id"]) == (403, "forbidden")
+
+
+@pytest.mark.parametrize("tag", ["a,b", "vip ", ""])
+async def test_tag_with_comma_or_edge_spaces_is_422(
+    tag: str, client: AsyncClient, make_user: MakeUser, make_org: MakeOrg
+) -> None:
+    org = await make_org()
+    p = await people(client, make_user, org)
+
+    resp = await client.post(
+        "/api/v1/contacts",
+        json={"first_name": "Іван", "email": email(), "tags": ["vip", tag]},
+        headers=p["rep"]["auth"],
+    )
+
+    assert resp.status_code == 422, resp.text
 
 
 async def test_team_lead_reassigns_inside_team_and_team_follows_owner(

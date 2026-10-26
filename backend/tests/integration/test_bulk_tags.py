@@ -271,6 +271,8 @@ async def test_empty_filter_is_whole_level_and_other_org_untouched(
     [
         {"tag": "", "filter": {}},
         {"tag": "x" * 65, "filter": {}},
+        {"tag": "a,b", "filter": {}},  # запятая разделяет теги в ячейке CSV
+        {"tag": " vip", "filter": {}},
         {"tag": "vip"},  # сегмент обязателен: весь уровень — только явным {}
         {"tag": "vip", "filter": {"tags": "vip"}},  # опечатка не превращается во весь уровень
         {"tag": "vip", "filter": {}, "segment": {"status": "lead"}},  # лишнее поле тела

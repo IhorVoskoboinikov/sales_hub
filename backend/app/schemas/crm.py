@@ -18,7 +18,9 @@ from app.schemas.common import MAX_ID
 
 BigId = Annotated[int, Field(ge=1, le=MAX_ID)]  # ссылка на CRM-запись в теле
 Text200 = Annotated[str, Field(min_length=1, max_length=200)]
-Tag = Annotated[str, Field(min_length=1, max_length=64)]
+# Без запятой и пробелов по краям: в ячейке CSV теги — через запятую, и тег «a,b» после
+# выгрузки и загрузки обратно стал бы двумя (раздел 6). Уже сохранённые теги не меняются.
+Tag = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[^,\s](?:[^,]*[^,\s])?$")]
 TagList = Annotated[list[Tag], Field(max_length=20)]  # тегов у контакта — не больше 20
 FirstName = Annotated[str, Field(min_length=1, max_length=100)]
 LastName = Annotated[str, Field(max_length=100)]

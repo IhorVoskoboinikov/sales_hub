@@ -5,7 +5,7 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs logs-workers restart-workers urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates
+.PHONY: help up infra down clean ps logs logs-workers restart-workers urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -70,6 +70,10 @@ experiments:  ## замеры индексов «без / с» на seed-дан�
 BENCH ?=
 bench-updates:  ## замеры способов UPDATE на копии contacts, ~2 ч (BENCH="--methods U2,U3 --volumes 1m")
 	$(BACKEND) uv run python scripts/bench_updates.py $(BENCH)
+
+CHAOS ?=
+chaos:  ## chaos-тест bulk на стенде make up: kill воркера посреди job, ~21 мин (CHAOS="--scenario a")
+	$(BACKEND) uv run python scripts/chaos.py $(CHAOS)
 
 refresh-reports:  ## обновить отчёты (materialized view deal_stats) в compose
 	$(COMPOSE) exec api python -m app.cli refresh-reports

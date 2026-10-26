@@ -27,16 +27,17 @@ class Decision:
 
 
 class OpaClient:
-    def __init__(self, http: httpx.AsyncClient, url: str) -> None:
+    def __init__(self, http: httpx.AsyncClient, url: str, timeout: float = TIMEOUT_SECONDS) -> None:
         self.http = http
         self.url = url.rstrip("/")
+        self.timeout = timeout
 
     async def query(self, path: str, input: dict[str, Any] | None = None) -> Any:
         try:
             resp = await self.http.post(
                 f"{self.url}/v1/data/{path}",
                 json={"input": input} if input is not None else {},
-                timeout=TIMEOUT_SECONDS,
+                timeout=self.timeout,
             )
             resp.raise_for_status()
         except httpx.HTTPError as exc:

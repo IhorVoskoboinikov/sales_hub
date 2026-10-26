@@ -69,7 +69,7 @@ class Resources:
                 socket_timeout=REDIS_TIMEOUT_SECONDS,
             ),
             http=http,
-            opa=OpaClient(http, settings.opa_url),
+            opa=OpaClient(http, settings.opa_url, settings.opa_timeout_seconds),
             nbu=NbuClient(http, settings.nbu_url),  # тот же пул: OPA и НБУ — разные хосты
             roles=roles,
             storage=S3FileStorage.from_settings(settings),

@@ -81,6 +81,9 @@ class Settings(BaseSettings):
 
     # --- Права (раздел 5): OPA и файл ролей policies/saleshub/data.yaml, который читают оба.
     opa_url: str = "http://localhost:8181"
+    # Ответ сайдкара — ~1 мс. В тестах больше: паузы сборщика мусора полного прогона pytest
+    # (тысячи тестов в памяти) иначе роняли бы запрос к OPA по таймауту в 503.
+    opa_timeout_seconds: float = 0.5
     policies_dir: Path = Path("../policies")  # относительно backend/; в контейнере — /policies
     # Сколько раз при старте спросить у OPA маршруты для Swagger (раз в секунду).
     opa_startup_attempts: int = 5

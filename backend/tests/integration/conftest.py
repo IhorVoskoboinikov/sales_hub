@@ -282,6 +282,7 @@ def settings(
             "smtp_host": mailpit.smtp_host,
             "smtp_port": mailpit.smtp_port,
             "opa_url": opa_url,
+            "opa_timeout_seconds": 5.0,  # пауза GC в полном прогоне не должна давать 503
             "nbu_url": NBU_URL,
         }
     )

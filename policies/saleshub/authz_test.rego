@@ -291,3 +291,30 @@ test_bulk_job_cancel if {
 	not authz.allow with input as req(sales_rep, "POST", "/api/v1/bulk-jobs/{job_id}/cancel")
 	not authz.allow with input as req(super_admin, "POST", "/api/v1/bulk-jobs/{job_id}/cancel")
 }
+
+# Закрытие просроченных сделок и теги сегмента — массовые операции (bulk:run): админ и
+# руководитель запускают, менеджер и наблюдатель — нет.
+test_close_overdue_and_tags_are_bulk_run if {
+	routes := ["/api/v1/bulk/close-overdue-deals", "/api/v1/bulk/add-tags", "/api/v1/bulk/remove-tags"]
+	every route in routes {
+		every user in [org_admin, team_lead] {
+			d := authz.decision with input as req(user, "POST", route)
+			d.allow
+			d.action == "bulk:run"
+		}
+		every user in [sales_rep, viewer, super_admin] {
+			not authz.allow with input as req(user, "POST", route)
+		}
+	}
+}
+
+# Выгрузка — export:run: наблюдатель выгружает, менеджер — нет (раздел 5).
+test_contacts_export if {
+	every user in [org_admin, team_lead, viewer] {
+		d := authz.decision with input as req(user, "GET", "/api/v1/contacts/export")
+		d.allow
+		d.action == "export:run"
+	}
+	not authz.allow with input as req(sales_rep, "GET", "/api/v1/contacts/export")
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/contacts/export")
+}

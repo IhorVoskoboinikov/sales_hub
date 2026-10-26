@@ -13,8 +13,9 @@
 """
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from itertools import pairwise
 from typing import Any, cast
 
@@ -22,6 +23,7 @@ from sqlalchemy import (
     BindParameter,
     ColumnElement,
     CursorResult,
+    Select,
     Uuid,
     and_,
     bindparam,
@@ -53,8 +55,10 @@ from app.models import (
     Company,
     Contact,
     Deal,
+    DealStatus,
 )
 from app.models.bulk import ACTIVE_JOB
+from app.repositories.imports import MAX_TAGS
 
 ENTITY_MODELS: dict[BulkEntity, Any] = {
     BulkEntity.COMPANIES: Company,
@@ -82,6 +86,36 @@ def reassign_owner_filter(
     """Выборка reassign_owner — одна для plan и для чанка: записи прежнего ответственного в
     уровне автора (bulk:run), только живые и открытые."""
     return and_(model.owner_id == from_user_id, access.sql_filter(model), transferable(model))
+
+
+def close_overdue_filter(
+    access: Access, before: date, pipeline_id: int | None
+) -> ColumnElement[bool]:
+    """Выборка close_overdue_deals (раздел 6): то же, что у GET /deals?overdue=true, —
+    открытые живые сделки (предикат частичного индекса ix_deals_overdue литералом) с
+    expected_close_date раньше before, в уровне автора; pipeline_id — только эта воронка.
+    Повтор чанка ничего не находит: закрытые сделки уже не open."""
+    conditions = [access.sql_filter(Deal), transferable(Deal), Deal.expected_close_date < before]
+    if pipeline_id is not None:
+        conditions.append(Deal.pipeline_id == pipeline_id)
+    return and_(*conditions)
+
+
+def tag_filter(
+    access: Access, tag: str, add: bool, segment: Sequence[ColumnElement[bool]]
+) -> ColumnElement[bool]:
+    """Выборка add_tags / remove_tags (раздел 6): живые контакты уровня автора, условия
+    сегмента — фильтры GET /contacts (ContactRepository.filter_conditions, их передаёт
+    сервис), и только те, у кого тега ещё нет (add) или он есть (remove), — поэтому повтор
+    чанка ничего не находит. Тег — типизированным массивом (tags @> $1::VARCHAR(64)[]): иначе
+    не сработал бы GIN-индекс ix_contacts_tags."""
+    has_tag = Contact.tags.contains([tag])
+    return and_(
+        Contact.deleted_at.is_(None),
+        access.sql_filter(Contact),
+        *segment,
+        ~has_tag if add else has_tag,
+    )
 
 
 def visible_jobs(access: Access) -> ColumnElement[bool]:
@@ -297,17 +331,20 @@ class BulkJobRepository:
             )
         )
 
-    async def add_progress(self, job_id: uuid.UUID, rows: int) -> None:
+    async def add_progress(self, job_id: uuid.UUID, rows: int, failed: int = 0) -> None:
         """Последний шаг чанка: прогресс и время прогресса (по нему reaper ищет зависшие).
-        total не меньше processed: чанк мог обновить и запись, которая вошла в выборку после
-        plan (см. docstring модуля)."""
+        failed — строки выборки, которые чанк пропустил (у контакта уже 20 тегов): они идут в
+        failed_rows, и finalize даст partial_failed. total не меньше processed + failed: чанк
+        мог обновить и запись, которая вошла в выборку после plan (см. docstring модуля)."""
         processed = BulkJob.processed + rows
+        failed_rows = BulkJob.failed_rows + failed
         await self.session.execute(
             update(BulkJob)
             .where(BulkJob.id == job_id)
             .values(
                 processed=processed,
-                total=func.greatest(BulkJob.total, processed),
+                failed_rows=failed_rows,
+                total=func.greatest(BulkJob.total, processed + failed_rows),
                 updated_at=func.now(),
             )
         )
@@ -602,6 +639,26 @@ class BulkRepository:
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
 
+    @staticmethod
+    def chunk_bounds_query(model: Any, where: ColumnElement[bool], size: int) -> Select[Any]:
+        """Запрос chunk_bounds отдельно — его план проверяет make explain (scripts/
+        explain_lists.py)."""
+        numbered = (
+            select(
+                model.id.label("id"),
+                func.row_number().over(order_by=model.id).label("rn"),
+                func.count().over().label("cnt"),
+            )
+            .where(where)
+            .subquery()
+        )
+        size_param: BindParameter[int] = bindparam("size", size)
+        return (
+            select(numbered.c.id, numbered.c.rn, numbered.c.cnt)
+            .where(or_((numbered.c.rn - 1) % size_param == 0, numbered.c.rn == numbered.c.cnt))
+            .order_by(numbered.c.id)
+        )
+
     async def chunk_bounds(
         self, model: Any, where: ColumnElement[bool], size: int
     ) -> tuple[list[tuple[int, int]], int]:
@@ -613,23 +670,7 @@ class BulkRepository:
         строк выборки (в последнем — остаток), сколько бы чужих id ни лежало между ними: у
         менеджера со 100 тыс. клиентов среди 5 млн равные диапазоны id дали бы сотни почти
         пустых чанков."""
-        numbered = (
-            select(
-                model.id.label("id"),
-                func.row_number().over(order_by=model.id).label("rn"),
-                func.count().over().label("cnt"),
-            )
-            .where(where)
-            .subquery()
-        )
-        size_param: BindParameter[int] = bindparam("size", size)
-        rows = (
-            await self.session.execute(
-                select(numbered.c.id, numbered.c.rn, numbered.c.cnt)
-                .where(or_((numbered.c.rn - 1) % size_param == 0, numbered.c.rn == numbered.c.cnt))
-                .order_by(numbered.c.id)
-            )
-        ).all()
+        rows = (await self.session.execute(self.chunk_bounds_query(model, where, size))).all()
         if not rows:
             return [], 0
         starts = [row.id for row in rows if (row.rn - 1) % size == 0]
@@ -657,6 +698,47 @@ class BulkRepository:
     ) -> int:
         """UPDATE одного чанка move_team: записи догоняют текущий отдел своего ответственного."""
         return await self._update_chunk(model, lo, hi, where, {"team_id": team_id})
+
+    async def close_deals(self, lo: int, hi: int, where: ColumnElement[bool]) -> int:
+        """UPDATE одного чанка close_overdue_deals: lost и closed_at, этап не меняется."""
+        values = {"status": DealStatus.LOST.value, "closed_at": func.now()}
+        return await self._update_chunk(Deal, lo, hi, where, values)
+
+    @staticmethod
+    def add_tag_query(lo: int, hi: int, where: ColumnElement[bool], tag: str) -> Select[Any]:
+        """Чанк add_tags одним запросом: UPDATE контактов, у которых меньше MAX_TAGS тегов, в
+        CTE, и рядом — сколько строк выборки пропущено (тегов уже 20). Оба счёта — из одного
+        снимка: строка, которую UPDATE изменил, в пропущенные не попадёт."""
+        in_chunk = and_(Contact.id.between(lo, hi), where)
+        full = func.cardinality(Contact.tags) >= MAX_TAGS
+        updated = (
+            update(Contact)
+            .where(in_chunk, ~full)
+            .values(
+                tags=func.array_append(Contact.tags, bindparam("tag", tag, type_=String(64))),
+                version=Contact.version + 1,
+                updated_at=func.now(),
+            )
+            .returning(Contact.id)
+            .cte("updated")
+        )
+        skipped = select(func.count()).select_from(Contact).where(in_chunk, full)
+        return select(
+            select(func.count()).select_from(updated).scalar_subquery().label("rows"),
+            skipped.scalar_subquery().label("skipped"),
+        )
+
+    async def add_tag(
+        self, lo: int, hi: int, where: ColumnElement[bool], tag: str
+    ) -> tuple[int, int]:
+        """Возвращает (изменено строк, пропущено — у контакта уже 20 тегов)."""
+        row = (await self.session.execute(self.add_tag_query(lo, hi, where, tag))).one()
+        return int(row.rows), int(row.skipped)
+
+    async def remove_tag(self, lo: int, hi: int, where: ColumnElement[bool], tag: str) -> int:
+        """UPDATE одного чанка remove_tags: выборка — только контакты с этим тегом."""
+        tags = func.array_remove(Contact.tags, bindparam("tag", tag, type_=String(64)))
+        return await self._update_chunk(Contact, lo, hi, where, {"tags": tags})
 
     async def _update_chunk(
         self, model: Any, lo: int, hi: int, where: ColumnElement[bool], values: dict[str, Any]

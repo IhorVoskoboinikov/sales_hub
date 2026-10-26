@@ -126,6 +126,14 @@ class ContactUpdate(NotNullFields):
 FORMULA_PREFIXES = ("=", "+", "-", "@")
 
 
+def looks_like_formula(text: str) -> bool:
+    """Начинается ли текст — после ведущих апострофов — с = + - @. Общее правило выгрузки и
+    импорта: выгрузка добавляет такому значению апостроф, импорт снимает ровно один. Поэтому и
+    значение, которое само начинается с «'=», переживает обратную загрузку: «'=1» выгружается
+    как «''=1» и возвращается как «'=1»."""
+    return text.lstrip("'").startswith(FORMULA_PREFIXES)
+
+
 class ContactImportRow(BaseModel):
     """Строка CSV импорта: те же типы полей, что у ContactIn, но email обязателен — иначе
     повторная загрузка того же файла плодила бы дубли. Пустая ячейка — None: у существующего
@@ -149,7 +157,7 @@ class ContactImportRow(BaseModel):
         if not isinstance(value, str):
             return value
         value = value.strip()
-        if value[:1] == "'" and value[1:2] in FORMULA_PREFIXES:
+        if value[:1] == "'" and looks_like_formula(value[1:]):
             value = value[1:]
         if not value:
             return None

@@ -38,6 +38,13 @@ CENT = Decimal("0.01")
 RATE_PLACES = Decimal("0.000001")
 
 
+async def org_today(uow: UnitOfWork, org_id: uuid.UUID) -> date:
+    """Сегодня по часовому поясу организации — одно правило для курса НБУ, ?overdue=true и
+    bulk «закрыть просроченные» (граница before по умолчанию)."""
+    org = await uow.organizations.get(org_id)
+    return datetime.now(ZoneInfo(org.timezone if org else "UTC")).date()
+
+
 @dataclass(frozen=True)
 class Rate:
     currency: str
@@ -128,8 +135,7 @@ class FxService:
 
     async def org_today(self, org_id: uuid.UUID) -> date:
         """Сегодня по часовому поясу организации: курс НБУ — на её календарную дату."""
-        org = await self.uow.organizations.get(org_id)
-        return datetime.now(ZoneInfo(org.timezone if org else "UTC")).date()
+        return await org_today(self.uow, org_id)
 
     async def display_for(self, org_id: uuid.UUID, currency: str | None) -> Display:
         """Курс для ответа: ?currency= или валюта организации по умолчанию, на её сегодня."""

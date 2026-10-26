@@ -35,6 +35,7 @@ from app.errors.handlers import register_error_handlers
 from app.middleware.access_log import AccessLogMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.middleware.unhandled_errors import UnhandledErrorMiddleware
+from app.services.exports import ExportSlots
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -76,6 +77,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.roles = roles
+    app.state.export_slots = ExportSlots()  # идущие выгрузки CSV процесса (раздел 6)
 
     register_error_handlers(app)
     install_openapi(app, app.state.roles)

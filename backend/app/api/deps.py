@@ -25,6 +25,7 @@ from app.services.auth import AuthService, ClientInfo, CurrentUser
 from app.services.bulk import BulkService
 from app.services.contacts import CompanyService, ContactService
 from app.services.deals import DealService, PipelineService
+from app.services.exports import ExportService, ExportSlots
 from app.services.failed_tasks import FailedTaskService
 from app.services.fx import FxService, NbuClient
 from app.services.imports import ImportService
@@ -175,6 +176,29 @@ def get_contact_service(
     uow: UnitOfWork = Depends(get_uow), roles: RoleCatalog = Depends(get_roles)
 ) -> ContactService:
     return ContactService(uow, roles)
+
+
+def get_export_service(
+    uow: UnitOfWork = Depends(get_uow),
+    limiter: RateLimiter = Depends(get_rate_limiter),
+    settings: Settings = Depends(get_app_settings),
+) -> ExportService:
+    return ExportService(
+        uow,
+        limiter,
+        max_rows=settings.export_max_rows,
+        rate_per_hour=settings.export_rate_per_hour,
+    )
+
+
+async def export_slot(
+    request: Request, settings: Settings = Depends(get_app_settings)
+) -> AsyncIterator[None]:
+    """Слот выгрузки CSV на всё время запроса — пока тело не отдано (как и сессия запроса):
+    больше EXPORT_MAX_CONCURRENT выгрузок на процесс — 429 export.busy."""
+    slots = cast(ExportSlots, request.app.state.export_slots)
+    with slots.hold(settings.export_max_concurrent):
+        yield
 
 
 def get_pipeline_service(uow: UnitOfWork = Depends(get_uow)) -> PipelineService:

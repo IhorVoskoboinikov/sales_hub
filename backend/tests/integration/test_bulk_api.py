@@ -291,7 +291,7 @@ async def test_bad_idempotency_key_is_422(
     assert resp.json()["details"]["errors"][0]["loc"] == ["header", "Idempotency-Key"]
 
 
-async def test_empty_include_is_422(
+async def test_empty_include_or_unknown_field_is_422(
     client: AsyncClient, make_user: MakeUser, org: OrgFixture
 ) -> None:
     admin = await member(make_user, org, "org_admin")
@@ -299,6 +299,8 @@ async def test_empty_include_is_422(
 
     headers = await tokens_for(client, admin)
     bodies = [body(a, b, include=include) for include in ([], ["deals"])]  # пусто, неизвестное
+    # Опечатка в имени поля: без extra=forbid передалось бы всё, а не только контакты.
+    bodies.append({**body(a, b), "includes": ["contacts"]})
 
     for request in bodies:
         resp = await post(client, headers, request)

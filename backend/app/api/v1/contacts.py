@@ -7,13 +7,22 @@
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, Query, Request, Response, status
+from fastapi.responses import StreamingResponse
 from starlette.datastructures import FormData, UploadFile
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.api.deps import get_app_settings, get_contact_service, get_import_service, get_page
+from app.api.deps import (
+    export_slot,
+    get_app_settings,
+    get_contact_service,
+    get_export_service,
+    get_import_service,
+    get_page,
+)
 from app.api.v1 import protected_router
 from app.api.v1.bulk import IdempotencyKey, job_location
 from app.api.v1.errors import (
@@ -22,6 +31,7 @@ from app.api.v1.errors import (
     NOT_FOUND,
     PAYLOAD_TOO_LARGE,
     PROTECTED,
+    RATE_LIMITED,
     VALIDATION,
 )
 from app.authz.access import Access
@@ -35,6 +45,7 @@ from app.schemas.bulk import BulkJobOut
 from app.schemas.common import MAX_ID, PageOut, RecordId
 from app.schemas.crm import ContactIn, ContactOut, ContactUpdate, DeletedContactOut
 from app.services.contacts import ContactService
+from app.services.exports import ExportService
 from app.services.imports import HEADER_BYTES, ImportService, ImportUpload, read_header
 
 Search = Annotated[
@@ -47,19 +58,25 @@ Search = Annotated[
 ]
 
 
-@protected_router.get("/contacts", tags=["contacts"], responses={**PROTECTED, **VALIDATION})
-async def list_contacts(
+def contact_filters(
     q: Search = None,
     status_: Annotated[ContactStatus | None, Query(alias="status")] = None,
     tag: Annotated[str | None, Query(max_length=64)] = None,
     owner_id: uuid.UUID | None = None,
     company_id: Annotated[int | None, Query(ge=1, le=MAX_ID)] = None,
+) -> ContactFilters:
+    """Фильтры списка контактов — одни у GET /contacts и GET /contacts/export (раздел 6)."""
+    return ContactFilters(q, status_, tag, owner_id, company_id)
+
+
+@protected_router.get("/contacts", tags=["contacts"], responses={**PROTECTED, **VALIDATION})
+async def list_contacts(
+    filters: ContactFilters = Depends(contact_filters),
     page: Page = Depends(get_page),
     access: Access = Depends(authorize),
     contacts: ContactService = Depends(get_contact_service),
 ) -> PageOut[ContactOut]:
     """Контакты в моём уровне, новые сначала."""
-    filters = ContactFilters(q, status_, tag, owner_id, company_id)
     result = await contacts.list(access, filters, page)
     return PageOut(
         items=[ContactOut.model_validate(c) for c in result.items], next_cursor=result.next_cursor
@@ -79,6 +96,48 @@ async def list_trash(
         items=[DeletedContactOut.model_validate(c) for c in result.items],
         next_cursor=result.next_cursor,
     )
+
+
+# --- Выгрузка в CSV (раздел 6, «Остальные массовые операции и выгрузка»)
+
+
+class CsvResponse(StreamingResponse):
+    media_type = "text/csv"  # Starlette допишет «; charset=utf-8» — у текстовых типов сам
+
+
+EXPORT_RESPONSE: dict[int | str, dict[str, Any]] = {
+    200: {
+        "description": "CSV в UTF-8 с BOM, разделитель «,»: id, email, first_name, last_name, "
+        "phone, status, source, tags (через запятую), owner_email, company_id, created_at, "
+        "updated_at. Значения, начинающиеся с = + - @, табуляции или возврата каретки, — с "
+        "апострофом (CSV-инъекция). Файл принимает обратно POST /contacts/import",
+        "content": {"text/csv": {"schema": {"type": "string"}}},
+    }
+}
+
+
+# Раньше /contacts/{contact_id}: иначе Starlette сопоставил бы «export» с {contact_id}.
+@protected_router.get(
+    "/contacts/export",
+    tags=["contacts"],
+    response_class=CsvResponse,
+    responses={**EXPORT_RESPONSE, **PROTECTED, **VALIDATION, **RATE_LIMITED},
+)
+async def export_contacts(
+    filters: ContactFilters = Depends(contact_filters),
+    access: Access = Depends(authorize),
+    _slot: None = Depends(export_slot),  # после authorize: без прав — 401/403, а не 429
+    exports: ExportService = Depends(get_export_service),
+) -> CsvResponse:
+    """Выгрузить контакты в CSV потоком: те же фильтры, строки и порядок, что у
+    `GET /contacts`, только без страниц.
+
+    - больше 1 млн строк — 422 `export.too_large`: сузьте фильтр;
+    - больше 10 выгрузок в час — 429 (`Retry-After`);
+    - сервер уже отдаёт много выгрузок — 429 `export.busy` (`Retry-After`), час не засчитан."""
+    body = await exports.contacts(access, filters)
+    name = f"contacts-{datetime.now(UTC):%Y-%m-%d}.csv"
+    return CsvResponse(body, headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 # --- Импорт CSV (раздел 6, «Поток: импорт контактов из CSV»)

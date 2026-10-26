@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     # job failed с import.too_many_rows).
     import_max_bytes: int = Field(100 * 1024 * 1024, ge=1)
     import_max_rows: int = Field(1_000_000, ge=1)
+    # Выгрузка контактов в CSV (раздел 6): строк в одном файле (больше — 422 export.too_large,
+    # «сузьте фильтр»), выгрузок в час на пользователя (больше — 429) и одновременных выгрузок
+    # на процесс API (больше — 429 export.busy): каждая держит соединение из пула 5 + 10.
+    export_max_rows: int = Field(1_000_000, ge=1)
+    export_rate_per_hour: int = Field(10, ge=1)
+    export_max_concurrent: int = Field(3, ge=1)
 
     # --- Вход по почте (раздел 4)
     # Путь относительно backend/ (в контейнере — /app). В dev файл создаёт make keys.

@@ -24,6 +24,10 @@ x-app-env: &app-env
   # Импорт контактов из CSV (раздел 6): 100 МиБ и 1 млн строк на файл.
   IMPORT_MAX_BYTES: 104857600
   IMPORT_MAX_ROWS: 1000000
+  # Выгрузка в CSV: до 1 млн строк, 10 выгрузок в час на пользователя, 3 одновременно на процесс.
+  EXPORT_MAX_ROWS: 1000000
+  EXPORT_RATE_PER_HOUR: 10
+  EXPORT_MAX_CONCURRENT: 3
   SMTP_HOST: mailpit  # письма видно на localhost:8025
   OPA_URL: http://opa:8181
   POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA

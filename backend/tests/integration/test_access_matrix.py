@@ -28,8 +28,13 @@ job уже завершена, поэтому SSE сразу отдаёт сни
 POST /contacts/import — форма multipart с маленьким CSV (хранилище и TaskQueue — фейки), у
 админа и руководителя owner_id — менеджер отдела 1; GET /bulk-jobs/{job_id}/errors — цели как у
 GET /bulk-jobs/{job_id}.
+Шаг 5.7: close-overdue-deals, add-tags и remove-tags — без цели (сегмент — весь уровень автора),
+202 у bulk:run; GET /contacts/export — 200 text/csv, и в файле ровно контакты уровня export:run
+(чужих строк нет — как у списков).
 """
 
+import csv
+import io
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -264,6 +269,10 @@ CASES: dict[str, Case] = {
     ),
     "POST /api/v1/contacts/import": Case("bulk:run", form=import_body),
     "GET /api/v1/bulk-jobs/{job_id}/errors": Case("bulk_job:read", None, CRM_TARGETS),
+    "POST /api/v1/bulk/close-overdue-deals": Case("bulk:run", lambda w, r: {}),
+    "POST /api/v1/bulk/add-tags": Case("bulk:run", lambda w, r: {"tag": "vip", "filter": {}}),
+    "POST /api/v1/bulk/remove-tags": Case("bulk:run", lambda w, r: {"tag": "vip", "filter": {}}),
+    "GET /api/v1/contacts/export": Case("export:run", lists="contact"),
     "GET /api/v1/admin/failed-tasks": Case("admin:system"),
     "GET /api/v1/admin/failed-tasks/{failed_task_id}": Case("admin:system", None, ("system",)),
     "POST /api/v1/admin/failed-tasks/{failed_task_id}/replay": Case(
@@ -431,6 +440,14 @@ def url_for(route: str, target: str | None, world: World) -> str:
     return path
 
 
+def listed_ids(resp: httpx.Response) -> set[int]:
+    """id строк ответа-списка: страница JSON или файл выгрузки CSV."""
+    if resp.headers["content-type"].startswith("text/csv"):
+        text = resp.content.decode("utf-8").removeprefix("\ufeff")
+        return {int(row["id"]) for row in csv.DictReader(io.StringIO(text, newline=""))}
+    return {item["id"] for item in resp.json()["items"]}
+
+
 def body_for(case: Case, world: World, role: str, target: str | None) -> dict[str, Any] | None:
     if case.target_body is not None:
         return case.target_body(world, role, target)
@@ -444,6 +461,9 @@ ACCEPTED = {
     "POST /api/v1/admin/orgs/{org_id}/invites",
     "POST /api/v1/bulk/reassign-owner",
     "POST /api/v1/contacts/import",
+    "POST /api/v1/bulk/close-overdue-deals",
+    "POST /api/v1/bulk/add-tags",
+    "POST /api/v1/bulk/remove-tags",
     CANCEL_ROUTE,
     "POST /api/v1/admin/failed-tasks/{failed_task_id}/replay",
 }
@@ -522,6 +542,6 @@ async def test_access(
     if case.lists and resp.status_code == 200:
         # Список — 200 у всех, у кого есть действие, но без строк вне уровня (раздел 10).
         ids = world.ids[case.lists]
-        listed = {item["id"] for item in resp.json()["items"]} & set(ids.values())
+        listed = listed_ids(resp) & set(ids.values())
         scope = CATALOG.permissions(role)[case.action]
         assert listed == {ids[t] for t in CRM_TARGETS if in_scope(t, scope)}

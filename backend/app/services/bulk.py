@@ -8,6 +8,10 @@
 4. finalize_if_complete: условный UPDATE завершает job ровно один раз, победитель пишет итог и
    одну строку журнала.
 
+Закрытие просроченных сделок и теги сегмента (шаг 5.7) — те же шаги: start_close_overdue_deals
+и start_tags проверяют параметры, дальше общие plan / чанк / finalize; выборка вида — одна
+функция (close_overdue_filter, tag_filter) для plan и для чанка.
+
 Смена отдела человека (move_team): job вставляет сервис людей в транзакции перевода
 (new_move_team_job), дальше — те же plan, чанки и finalize. Проверки автора у неё нет: это
 следствие уже сделанного изменения, а не операция от имени автора.
@@ -19,7 +23,8 @@ import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import date
 from typing import Any
 
 import structlog
@@ -35,6 +40,7 @@ from app.models import (
     BulkJobKind,
     BulkJobStatus,
     ChunkStatus,
+    Contact,
     ImportRowError,
     User,
 )
@@ -44,15 +50,19 @@ from app.repositories.bulk import (
     STUCK_ERROR,
     ChunkPlan,
     FinishedJob,
+    close_overdue_filter,
     lost_finalize,
     move_team_filter,
     reassign_owner_filter,
     stale_pending,
     stalled_chunks,
     stalled_import,
+    tag_filter,
 )
+from app.repositories.contacts import ContactFilters, ContactRepository
 from app.repositories.pagination import Page, PageResult
 from app.services.crm import Owner, can_own, resolve_owner
+from app.services.fx import org_today
 from app.uow import UnitOfWork
 from app.workers.queue import TaskQueue
 
@@ -74,6 +84,7 @@ BULK_QUEUE = "bulk"  # очередь чанков: её длину reaper см�
 
 # move_team догоняет все живые и открытые записи человека — во всех четырёх таблицах.
 MOVE_TEAM_ENTITIES = list(BulkEntity)
+TAG_KINDS = (BulkJobKind.ADD_TAGS, BulkJobKind.REMOVE_TAGS)
 
 
 @dataclass(frozen=True)
@@ -81,6 +92,29 @@ class ReassignOwnerRequest:
     from_user_id: uuid.UUID
     to_user_id: uuid.UUID
     include: tuple[str, ...] = tuple(REASSIGN_INCLUDE)
+
+
+def filter_params(filters: ContactFilters) -> dict[str, Any]:
+    """Фильтр сегмента для bulk_jobs.params: только заданные поля и только JSON-типы. Пустое
+    значение — то же, что не заданное (как в GET /contacts), поэтому одинаковые сегменты дают
+    один хэш запроса."""
+    return {
+        name: value if isinstance(value, int) else str(value)
+        for name, value in asdict(filters).items()
+        if value
+    }
+
+
+def filters_from_params(params: dict[str, Any]) -> ContactFilters:
+    """Обратно из filter_params: чанк строит то же условие, что видел plan."""
+    owner_id = params.get("owner_id")
+    return ContactFilters(
+        q=params.get("q"),
+        status=params.get("status"),
+        tag=params.get("tag"),
+        owner_id=uuid.UUID(owner_id) if owner_id else None,
+        company_id=params.get("company_id"),
+    )
 
 
 def request_hash(kind: str, body: dict[str, Any]) -> str:
@@ -244,10 +278,61 @@ class BulkService:
         }
         return await self._start(access, BulkJobKind.REASSIGN_OWNER, params, idempotency_key)
 
-    async def _start(
-        self, access: Access, kind: BulkJobKind, params: dict[str, Any], key: str | None
+    async def start_close_overdue_deals(
+        self,
+        access: Access,
+        before: date | None,
+        pipeline_id: int | None,
+        idempotency_key: str | None,
     ) -> BulkJob:
-        digest = request_hash(kind, params)
+        """Закрыть просроченные открытые сделки как lost (раздел 6, «Остальные массовые
+        операции»). «Просрочена» — как у GET /deals?overdue=true: expected_close_date раньше
+        before; before по умолчанию — сегодня по часовому поясу организации, позже сегодня —
+        422 validation (поле before). Воронка не своей организации — 422 (поле pipeline_id).
+        Дата фиксируется в params: все чанки работают с одной границей. Хэш повтора — от тела
+        как пришло: before не передан — тот же запрос и завтра (в params — дата первого)."""
+        today = await org_today(self.uow, access.org_id)
+        if before is not None and before > today:
+            raise ValidationFailed(field="before", today=today.isoformat())
+        if (
+            pipeline_id is not None
+            and await self.uow.pipelines.get(pipeline_id, access.org_id) is None
+        ):
+            raise ValidationFailed(field="pipeline_id")
+        request = {"before": before.isoformat() if before else None, "pipeline_id": pipeline_id}
+        params = {**request, "before": (before or today).isoformat()}
+        return await self._start(
+            access, BulkJobKind.CLOSE_OVERDUE_DEALS, params, idempotency_key, request=request
+        )
+
+    async def start_tags(
+        self,
+        access: Access,
+        kind: BulkJobKind,
+        tag: str,
+        filters: ContactFilters,
+        idempotency_key: str | None,
+    ) -> BulkJob:
+        """Добавить (add_tags) или снять (remove_tags) тег у сегмента контактов. Сегмент —
+        фильтры GET /contacts в уровне автора (bulk:run), пустой фильтр — весь уровень.
+        Контакты, у которых уже 20 тегов, add_tags пропускает и считает в failed_rows — job
+        закончится partial_failed."""
+        assert kind in TAG_KINDS
+        params = {"tag": tag, "filter": filter_params(filters)}
+        return await self._start(access, kind, params, idempotency_key)
+
+    async def _start(
+        self,
+        access: Access,
+        kind: BulkJobKind,
+        params: dict[str, Any],
+        key: str | None,
+        *,
+        request: dict[str, Any] | None = None,
+    ) -> BulkJob:
+        """request — тело для хэша повтора, если оно не совпадает с params (у
+        close_overdue_deals в params уже подставлена дата по умолчанию)."""
+        digest = request_hash(kind, params if request is None else request)
         if key is not None:
             existing = await self.find_replay(access, key, digest)
             if existing is not None:
@@ -399,31 +484,50 @@ class BulkService:
         if job.status == BulkJobStatus.CANCELLING or job.error is not None:
             await self._skip(job_id, no, job.error or "cancelled")
             return
+        failed = 0  # строки выборки, которые чанк пропустил (у контакта уже 20 тегов)
         if job.kind == BulkJobKind.MOVE_TEAM:
             rows: int | None = await self._move_team_rows(job, entity, lo, hi)
+        elif not await self._author_still_allowed(job, no):
+            return  # чанк пропущен: автор больше не может запускать эту job
         elif job.kind == BulkJobKind.REASSIGN_OWNER:
             rows = await self._reassign_rows(job, no, entity, lo, hi)
+        elif job.kind == BulkJobKind.CLOSE_OVERDUE_DEALS:
+            rows = await self.uow.bulk.close_deals(lo, hi, self._selection(job, entity))
+        elif job.kind == BulkJobKind.ADD_TAGS:
+            where = self._selection(job, entity)
+            rows, failed = await self.uow.bulk.add_tag(lo, hi, where, job.params["tag"])
+        elif job.kind == BulkJobKind.REMOVE_TAGS:
+            where = self._selection(job, entity)
+            rows = await self.uow.bulk.remove_tag(lo, hi, where, job.params["tag"])
         else:
             raise ValueError(f"нет чанков для вида job: {job.kind}")
         if rows is None:
-            return  # чанк пропущен: автор или получатель больше не подходят
+            return  # чанк пропущен: получатель больше не подходит
         await self.uow.bulk_chunks.finish(job_id, no, ChunkStatus.DONE, rows=rows)
-        await self.uow.bulk_jobs.add_progress(job_id, rows)  # последним — строка job
-        logger.info("bulk_chunk_done", job_id=str(job_id), no=no, entity=entity, rows=rows)
+        await self.uow.bulk_jobs.add_progress(job_id, rows, failed)  # последним — строка job
+        logger.info(
+            "bulk_chunk_done", job_id=str(job_id), no=no, entity=entity, rows=rows, failed=failed
+        )
+
+    async def _author_still_allowed(self, job: BulkJob, no: int) -> bool:
+        """Автор FOR SHARE и всё ещё может запускать эту job (раздел 6, шаг 4 чанка) — у всех
+        видов, кроме move_team. Иначе причина в job.error, свой чанк skipped и False."""
+        access = Access.from_params(job.params["access"])
+        author = await self.uow.users.get_for_share(access.user_id)
+        if self._author_unchanged(author, access):
+            return True
+        # Чужие строки чанков не трогаем: иначе два чанка ждали бы друг друга. Остальные
+        # увидят error в начале своего чанка.
+        await self.uow.bulk_jobs.set_error(job.id, "bulk.author_changed")
+        await self._skip(job.id, no, "bulk.author_changed")
+        return False
 
     async def _reassign_rows(
         self, job: BulkJob, no: int, entity: BulkEntity, lo: int, hi: int
     ) -> int | None:
-        """Чанк reassign_owner: автор и получатель FOR SHARE и всё ещё подходят — UPDATE.
-        Иначе причина в job.error, свой чанк skipped и None."""
+        """Чанк reassign_owner (автора уже проверил _author_still_allowed): получатель FOR SHARE
+        и всё ещё подходит — UPDATE. Иначе причина в job.error, свой чанк skipped и None."""
         access = Access.from_params(job.params["access"])
-        author = await self.uow.users.get_for_share(access.user_id)
-        if not self._author_unchanged(author, access):
-            # Чужие строки чанков не трогаем: иначе два чанка ждали бы друг друга. Остальные
-            # увидят error в начале своего чанка.
-            await self.uow.bulk_jobs.set_error(job.id, "bulk.author_changed")
-            await self._skip(job.id, no, "bulk.author_changed")
-            return None
         target = await self.uow.users.get_for_share(uuid.UUID(job.params["to_user_id"]))
         if not self._target_unchanged(target, access):
             await self.uow.bulk_jobs.set_error(job.id, "bulk.target_changed")
@@ -518,6 +622,9 @@ class BulkService:
             done = await self.uow.bulk_chunks.rows_by_entity(job_id)
             entities = self._entities(finished.kind, finished.params)
             rows = {e.value: done.get(e, 0) for e in entities}
+            if finished.kind == BulkJobKind.ADD_TAGS:
+                # Контакты, пропущенные из-за предела в 20 тегов, — в итоге и журнале.
+                rows["failed"] = (await self._reload(job_id)).failed_rows
             await self.uow.bulk_jobs.set_result(job_id, {"rows": rows})
         self.uow.audit.record(
             actor_id=finished.owner_id,
@@ -689,6 +796,10 @@ class BulkService:
             return [REASSIGN_INCLUDE[name] for name in params["include"]]
         if kind == BulkJobKind.MOVE_TEAM:
             return MOVE_TEAM_ENTITIES
+        if kind == BulkJobKind.CLOSE_OVERDUE_DEALS:
+            return [BulkEntity.DEALS]
+        if kind in TAG_KINDS:
+            return [BulkEntity.CONTACTS]
         raise ValueError(f"нет выборки для вида job: {kind}")
 
     @staticmethod
@@ -704,4 +815,13 @@ class BulkService:
         if job.kind == BulkJobKind.MOVE_TEAM:
             user_id = uuid.UUID(job.params["user_id"])
             return and_(model.org_id == job.org_id, move_team_filter(model, user_id, team_id))
+        access = Access.from_params(job.params["access"])
+        if job.kind == BulkJobKind.CLOSE_OVERDUE_DEALS:
+            before = date.fromisoformat(job.params["before"])
+            return close_overdue_filter(access, before, job.params["pipeline_id"])
+        if job.kind in TAG_KINDS:
+            assert model is Contact
+            segment = ContactRepository.filter_conditions(filters_from_params(job.params["filter"]))
+            add = job.kind == BulkJobKind.ADD_TAGS
+            return tag_filter(access, job.params["tag"], add, segment)
         raise ValueError(f"нет выборки для вида job: {job.kind}")

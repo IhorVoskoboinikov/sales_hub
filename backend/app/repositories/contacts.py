@@ -1,14 +1,17 @@
-"""Компании и контакты: списки с фильтрами и keyset-пагинацией, поиск дубля email."""
+"""Компании и контакты: списки с фильтрами и keyset-пагинацией, поиск дубля email, выгрузка."""
 
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import (
     BindParameter,
     ColumnElement,
+    Row,
     Select,
     String,
     bindparam,
+    func,
     literal_column,
     select,
 )
@@ -25,6 +28,9 @@ CONTACT_ORDER = (Key(Contact.created_at, desc=True), Key(Contact.id, desc=True))
 COMPANY_ORDER = (Key(Company.name), Key(Company.id))
 # Корзина: удалённые недавно — сначала. Тот же порядок — в индексе ix_contacts_trash.
 TRASH_ORDER = (Key(Contact.deleted_at, desc=True), Key(Contact.id, desc=True))
+# Выгрузка (раздел 6): строк за одно чтение серверного курсора — память API не зависит от
+# размера файла.
+EXPORT_BATCH = 2000
 
 
 # Поиск по подстроке идёт через триграммы pg_trgm: из запроса без трёх букв или цифр подряд
@@ -63,19 +69,88 @@ class ContactRepository(SoftDeleteRepository[Contact]):
     model = Contact
     entity = "contact"
 
-    def list_query(self, access: Access, filters: ContactFilters, page: Page) -> Select[Any]:
-        query = self.visible_query(access)
+    @staticmethod
+    def filter_conditions(filters: ContactFilters) -> list[ColumnElement[bool]]:
+        """Условия фильтров GET /contacts — одни для списка, выгрузки и тегов сегмента (раздел 6):
+        выгрузка и bulk не шире и не уже того, что человек видит в списке. Тег — типизированным
+        массивом (tags @> $1::VARCHAR(64)[]): с text[] Postgres не применил бы GIN-индекс."""
+        conditions: list[ColumnElement[bool]] = []
         if filters.q:
-            query = query.where(contact_search_text().like(like_pattern(filters.q)))
+            conditions.append(contact_search_text().like(like_pattern(filters.q)))
         if filters.status:
-            query = query.where(Contact.status == filters.status)
+            conditions.append(Contact.status == filters.status)
         if filters.tag:
-            query = query.where(Contact.tags.contains([filters.tag]))
+            conditions.append(Contact.tags.contains([filters.tag]))
         if filters.owner_id:
-            query = query.where(Contact.owner_id == filters.owner_id)
+            conditions.append(Contact.owner_id == filters.owner_id)
         if filters.company_id:
-            query = query.where(Contact.company_id == filters.company_id)
+            conditions.append(Contact.company_id == filters.company_id)
+        return conditions
+
+    def list_query(self, access: Access, filters: ContactFilters, page: Page) -> Select[Any]:
+        query = self.visible_query(access).where(*self.filter_conditions(filters))
         return paginate(query, CONTACT_ORDER, page)
+
+    def export_query(self, access: Access, filters: ContactFilters) -> Select[Any]:
+        """Выгрузка (раздел 6): те же строки и тот же порядок, что у списка, но без страниц.
+        Порядок по индексу уровня (…, created_at, id) — первые строки уходят клиенту сразу, без
+        сортировки миллиона. email ответственного — подзапросом по первичному ключу users: JOIN
+        мог бы стать hash join, и тогда планировщику пришлось бы сортировать всё заново."""
+        owner_email = select(User.email).where(User.id == Contact.owner_id).scalar_subquery()
+        order = [k.column.desc() if k.desc else k.column.asc() for k in CONTACT_ORDER]
+        return (
+            select(
+                Contact.id,
+                Contact.email,
+                Contact.first_name,
+                Contact.last_name,
+                Contact.phone,
+                Contact.status,
+                Contact.source,
+                Contact.tags,
+                owner_email.label("owner_email"),
+                Contact.company_id,
+                Contact.created_at,
+                Contact.updated_at,
+            )
+            .where(
+                Contact.deleted_at.is_(None),
+                access.sql_filter(Contact),
+                *self.filter_conditions(filters),
+            )
+            .order_by(*order)
+        )
+
+    def export_count_query(
+        self, access: Access, filters: ContactFilters, limit: int
+    ) -> Select[Any]:
+        """Сколько строк выгрузит export_query, но не больше limit: count по сегменту дальше
+        предела не идёт — EXPORT_MAX_ROWS + 1 строк уже значит «слишком много»."""
+        rows = (
+            select(Contact.id)
+            .where(
+                Contact.deleted_at.is_(None),
+                access.sql_filter(Contact),
+                *self.filter_conditions(filters),
+            )
+            .limit(limit)
+            .subquery()
+        )
+        return select(func.count()).select_from(rows)
+
+    async def export_count(self, access: Access, filters: ContactFilters, limit: int) -> int:
+        return int(await self.session.scalar(self.export_count_query(access, filters, limit)) or 0)
+
+    async def export_rows(
+        self, access: Access, filters: ContactFilters
+    ) -> AsyncIterator[Sequence[Row[Any]]]:
+        """Строки выгрузки пачками по EXPORT_BATCH — серверный курсор (session.stream с
+        yield_per): курсор живёт в транзакции сессии запроса, пока ответ не отдан целиком."""
+        result = await self.session.stream(
+            self.export_query(access, filters), execution_options={"yield_per": EXPORT_BATCH}
+        )
+        async for batch in result.partitions():
+            yield batch
 
     async def list(
         self, access: Access, filters: ContactFilters, page: Page

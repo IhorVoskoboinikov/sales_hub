@@ -11,6 +11,11 @@ seed-организации, включая менеджера с наиболь
   частичный индекс с условием status = $1 он применить не может — поэтому такие условия
   в запросах записаны литералами.
 
+С шага 5.7 — и запросы выгрузки (первая пачка серверного курсора и count с пределом) и
+массовых операций: нарезка на чанки (plan) тегов сегмента и закрытия просроченных сделок и сам
+чанк add-tags (UPDATE в CTE). Каждый EXPLAIN ANALYZE идёт в транзакции, которая откатывается:
+у чанка он действительно выполняет UPDATE.
+
 Ошибка — Seq Scan по большой таблице (companies, contacts, deals, activities и её партиции)
 больше SEQ_SCAN_PAGES страниц: код выхода 1. Запрос дольше SLOW_MS — предупреждение: индекс
 используется, но данных слишком много (например, частая подстрока в ?q= — см.
@@ -38,8 +43,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # чтобы им�
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.core.config import get_settings
+from app.models import Contact, Deal
 from app.repositories.activities import ActivityRepository, AuditFilters, AuditQueries, TaskWindow
-from app.repositories.contacts import CompanyRepository, ContactFilters, ContactRepository
+from app.repositories.bulk import BulkRepository, close_overdue_filter, tag_filter
+from app.repositories.contacts import (
+    EXPORT_BATCH,
+    CompanyRepository,
+    ContactFilters,
+    ContactRepository,
+)
 from app.repositories.deals import DealFilters, DealRepository
 from app.repositories.pagination import Page, encode_cursor
 from app.repositories.reports import ReportRepository
@@ -47,6 +59,18 @@ from app.repositories.reports import ReportRepository
 BIG = re.compile(r"^(companies|contacts|deals|activities)(_p\d{4}_\d{2})?$")
 SEQ_SCAN_PAGES = 1000  # маленькие партиции и пустые таблицы честно читаются целиком
 SLOW_MS = 300.0
+# Запросы воркера (plan и чанк массовых операций), а не API: они и должны прочитать весь
+# сегмент, а на сегменте в 20 % организации Seq Scan бывает честным выбором планировщика —
+# для них это предупреждение, а не ошибка. Чанк меняет 10 000 строк с GIN-индексом — его время
+# секундами тоже ожидаемо.
+BACKGROUND = frozenset(
+    {
+        "plan add-tags ?status=churned",
+        "plan remove-tags vip",
+        "plan close-overdue-deals",
+        "чанк add-tags",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +92,7 @@ class Result:
     scans: str
     problems: list[str]
     slow: bool
+    warnings: list[str]  # Seq Scan в фоновом запросе (BACKGROUND)
 
 
 def render(statement: Select[Any]) -> tuple[str, list[str]]:
@@ -100,10 +125,16 @@ async def explain(
 ) -> tuple[float, int, str, list[str]]:
     sql, values = render(statement)
     await conn.execute(f"SET plan_cache_mode = force_{mode}_plan")
-    await conn.execute(f"PREPARE q AS {sql}")
+    await conn.execute(f"PREPARE q AS {sql}")  # PREPARE не транзакционен — DEALLOCATE в конце
     try:
         args = f"({', '.join(values)})" if values else ""
-        raw = await conn.fetchval(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE q{args}")
+        # Откат после замера: у чанка add-tags EXPLAIN ANALYZE выполняет UPDATE по-настоящему.
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            raw = await conn.fetchval(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE q{args}")
+        finally:
+            await transaction.rollback()
     finally:
         await conn.execute("DEALLOCATE q")
     plan = json.loads(raw)[0]
@@ -171,6 +202,27 @@ async def deep_cursor(conn: asyncpg.Connection, query: Select[Any]) -> str | Non
     return encode_cursor([row["created_at"], row["id"]]) if row else None
 
 
+async def first_chunk(conn: asyncpg.Connection, bounds: Select[Any]) -> tuple[int, int] | None:
+    """Границы первого чанка — тем же запросом, что строит plan (chunk_bounds_query)."""
+    sql, values = render(bounds)
+    await conn.execute(f"PREPARE b AS {sql}")
+    try:
+        args = f"({', '.join(values)})" if values else ""
+        rows = await conn.fetch(f"EXECUTE b{args}")
+    finally:
+        await conn.execute("DEALLOCATE b")
+    if not rows:
+        return None
+    hi = rows[1]["id"] - 1 if len(rows) > 1 else rows[0]["id"]
+    return rows[0]["id"], hi
+
+
+def add_tags_where(a: Access) -> Any:
+    """Выборка add-tags «vip» сегменту ?status=churned — как у job (tag_filter)."""
+    segment = ContactRepository.filter_conditions(ContactFilters(status="churned"))
+    return tag_filter(a, "vip", True, segment)
+
+
 async def main() -> int:
     settings = get_settings()
     roles = RoleCatalog.load(settings.policies_dir)
@@ -190,6 +242,8 @@ async def main() -> int:
         audit, reports = AuditQueries(None), ReportRepository(None)  # type: ignore[arg-type]
         today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         page = Page(limit=50)
+        size = settings.bulk_chunk_size
+        no_filter = ContactRepository.filter_conditions(ContactFilters())
 
         Builder = Callable[[Access], Any]  # Select с разными колонками
         checks: list[tuple[str, str, Builder]] = [
@@ -294,6 +348,44 @@ async def main() -> int:
                     a, today.date().replace(month=1, day=1), today.date()
                 ),
             ),
+            # --- шаг 5.7: выгрузка — первая пачка серверного курсора и count с пределом.
+            (
+                "выгрузка: первая пачка",
+                "export:run",
+                lambda a: contacts.export_query(a, ContactFilters()).limit(EXPORT_BATCH),
+            ),
+            (
+                "выгрузка ?tag=vip: первая пачка",
+                "export:run",
+                lambda a: contacts.export_query(a, ContactFilters(tag="vip")).limit(EXPORT_BATCH),
+            ),
+            (
+                "выгрузка: count",
+                "export:run",
+                lambda a: contacts.export_count_query(
+                    a, ContactFilters(), settings.export_max_rows + 1
+                ),
+            ),
+            # --- шаг 5.7: plan массовых операций (нарезка на чанки по строкам выборки).
+            (
+                "plan add-tags ?status=churned",
+                "bulk:run",
+                lambda a: BulkRepository.chunk_bounds_query(Contact, add_tags_where(a), size),
+            ),
+            (
+                "plan remove-tags vip",
+                "bulk:run",
+                lambda a: BulkRepository.chunk_bounds_query(
+                    Contact, tag_filter(a, "vip", False, no_filter), size
+                ),
+            ),
+            (
+                "plan close-overdue-deals",
+                "bulk:run",
+                lambda a: BulkRepository.chunk_bounds_query(
+                    Deal, close_overdue_filter(a, today.date(), None), size
+                ),
+            ),
         ]
 
         results: list[Result] = []
@@ -312,9 +404,18 @@ async def main() -> int:
                             acc, ContactFilters(), Page(limit=50, cursor=cursor)
                         )
                         queries.append(("контакты, 101-я страница (keyset)", deep))
+                if name == "plan add-tags ?status=churned":
+                    # Сам чанк: UPDATE первого диапазона plan в CTE (в транзакции с откатом).
+                    bounds = await first_chunk(conn, build(acc))
+                    if bounds:
+                        chunk = BulkRepository.add_tag_query(*bounds, add_tags_where(acc), "vip")
+                        queries.append(("чанк add-tags", chunk))
                 for query_name, query in queries:
                     for mode in ("custom", "generic"):
                         ms, buffers, scans, problems = await explain(conn, query, mode, pages)
+                        warnings: list[str] = []
+                        if query_name in BACKGROUND:
+                            problems, warnings = [], problems
                         results.append(
                             Result(
                                 person.title,
@@ -325,6 +426,7 @@ async def main() -> int:
                                 scans,
                                 problems,
                                 ms > SLOW_MS,
+                                warnings,
                             )
                         )
     finally:
@@ -333,7 +435,7 @@ async def main() -> int:
     print("| Кто | Запрос | План | мс | Буферы | Как читает |")
     print("| --- | --- | --- | ---: | ---: | --- |")
     for r in results:
-        flag = " ❌" if r.problems else " ⚠" if r.slow else ""
+        flag = " ❌" if r.problems else " ⚠" if r.slow or r.warnings else ""
         print(f"| {r.who} | {r.query} | {r.mode}{flag} | {r.ms:.1f} | {r.buffers} | {r.scans} |")
     bad = [r for r in results if r.problems]
     slow = [r for r in results if r.slow]
@@ -342,6 +444,9 @@ async def main() -> int:
         print(f"- ❌ {r.who} / {r.query} / {r.mode}: {'; '.join(r.problems)}")
     for r in slow:
         print(f"- ⚠ дольше {SLOW_MS:.0f} мс: {r.who} / {r.query} / {r.mode}: {r.ms:.0f} мс")
+    for r in results:
+        if r.warnings:
+            print(f"- ⚠ фоновый запрос: {r.who} / {r.query} / {r.mode}: {'; '.join(r.warnings)}")
     return 1 if bad else 0
 
 

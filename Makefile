@@ -5,7 +5,7 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs logs-workers restart-workers urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments
+.PHONY: help up infra down clean ps logs logs-workers restart-workers urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -66,6 +66,10 @@ explain:  ## планы всех списков и отчётов на seed-да
 
 experiments:  ## замеры индексов «без / с» на seed-данных (результаты — docs/experiments.md)
 	$(COMPOSE) exec -T postgres psql -U saleshub -d saleshub < backend/scripts/experiments.sql
+
+BENCH ?=
+bench-updates:  ## замеры способов UPDATE на копии contacts, ~2 ч (BENCH="--methods U2,U3 --volumes 1m")
+	$(BACKEND) uv run python scripts/bench_updates.py $(BENCH)
 
 refresh-reports:  ## обновить отчёты (materialized view deal_stats) в compose
 	$(COMPOSE) exec api python -m app.cli refresh-reports

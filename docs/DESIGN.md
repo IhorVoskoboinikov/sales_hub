@@ -160,6 +160,7 @@ sales_hub/
 │   ├── tests/{unit,integration,e2e}/
 │   ├── scripts/seed_big.sql     # генерация миллионов строк
 │   ├── scripts/gen_import_csv.py # CSV для импорта (make import-csv), пишет в backend/tmp/
+│   ├── scripts/bench_updates.py # замеры способов UPDATE на копии contacts (make bench-updates)
 │   ├── Dockerfile
 │   ├── .env.example             # переменные для запуска API без Docker (make run)
 │   ├── secrets/                 # dev-ключ JWT (make keys), в .gitignore
@@ -1043,7 +1044,9 @@ class Access:
 | `COPY` в staging → `INSERT … ON CONFLICT DO UPDATE` | импорт, сотни тысяч+ | максимум | нужен файл или поток |
 | SQLAlchemy 2.0 bulk `update()` со списком dict-ов | средние объёмы | средняя | следить за размером батча |
 
-Каждый способ замеряется на 1 и 5 млн контактов (шаг 5.9): `make bench-updates` (`scripts/bench_updates.py`) после `make seed-big` копирует `contacts` в `bench_contacts (LIKE contacts INCLUDING ALL)` — рабочая таблица не трогается, в конце копия удаляется. Меняется то же, что при передаче клиентов (`owner_id`, `team_id`, `version`); ORM в цикле — только на 10 тыс. строк с экстраполяцией. Метрики: время, строк в секунду, объём WAL (`pg_wal_lsn_diff`), HOT- и мёртвые строки (`pg_stat_user_tables`) и задержка «пробника» — параллельной сессии, которая каждые 100 мс правит одну строку сегмента (сколько bulk держит ручную правку). Отдельно: `SET owner_id` (индексированная колонка — не HOT, обновляются все индексы, включая GIN) против `SET source` (HOT) и границы чанков «равные диапазоны id» против «по строкам». Результаты — в `docs/experiments.md`.
+Каждый способ замеряется на 1 и 5 млн контактов (шаг 5.9): `make bench-updates` (`scripts/bench_updates.py`) после `make seed-big` копирует `contacts` в `bench_contacts (LIKE contacts INCLUDING ALL)` — рабочая таблица не трогается, в конце копия удаляется. Меняется то же, что при передаче клиентов (`owner_id`, `team_id`, `version`); ORM в цикле — только на 10 тыс. строк с экстраполяцией. Метрики: время, строк в секунду, объём WAL (`pg_wal_lsn_diff`), HOT- и мёртвые строки (`pg_stat_user_tables`) и «пробник» — параллельная сессия, которая каждые 100 мс правит строку из тех, что bulk меняет прямо сейчас (сколько правок ждали блокировку и сколько); каждый замер — на свежей копии, U2–U6 на 1 млн — трижды. Отдельно: `SET owner_id` (индексированная колонка — не HOT, обновляются все индексы, включая GIN) против `SET source` (HOT) и границы чанков «равные диапазоны id» против «по строкам». Результаты — в `docs/experiments.md`.
+
+Итог замеров (шаг 5.9, `docs/experiments.md`, «Замеры способов UPDATE»): все set-based способы упираются в одну скорость — 13,5–14,5 тыс. строк/с (новая версия строки и записи в индексах, ~2,4 КБ WAL на строку; передача клиентов меняет индексированные `owner_id` / `team_id` и HOT не бывает никогда), поэтому способ выбирается по блокировкам. Один `UPDATE` на 5,47 млн держит ручную правку 6 минут, чанк в 10 000 строк — до 0,9 с при той же скорости (1 000 — на 7–12 % медленнее, 50 000 — не быстрее, но до 3,8 с блокировки): чанки по `BULK_CHUNK_SIZE = 10000` подтверждены. `COPY` + один `UPDATE FROM` на больших объёмах получает Hash Join — вдвое больше WAL: импорт переносит из staging чанками. ORM в цикле — в 7–30 раз медленнее чанка и с `version_id_col` срывается `StaleDataError` от любой параллельной правки. Равные диапазоны id у менеджера с разбросанными записями дают 547 чанков по ~200 строк (+29 % времени) — границы по строкам подтверждены.
 
 ### Поток: «передать клиентов уволенного менеджера»
 
@@ -1772,7 +1775,7 @@ deploy/
 - [x] 5.6 S3 (`FileStorage`, `ensure-bucket`, RustFS в testcontainers); генератор CSV на 500 тыс. строк (`make import-csv`); импорт CSV: загрузка → parse → `COPY` в staging → stage → merge → `import_errors` и `GET /bulk-jobs/{id}/errors` + строки в `routes.rego`.
 - [x] 5.7 Закрытие просроченных сделок, добавление и снятие тегов, потоковый экспорт в CSV + строки в `routes.rego`.
 - [x] 5.8 Периодическое обслуживание в beat (раздел 15): НБУ, корзина (+ индексы корзины сделок и компаний), партиции, отчёты, очистка.
-- [ ] 5.9 Замеры способов UPDATE → `docs/experiments.md`.
+- [x] 5.9 Замеры способов UPDATE → `docs/experiments.md`.
 - [ ] 5.10 Chaos-тест: убить воркер посреди job (`make chaos` сам создаёт менеджеру 100 тыс. контактов через `generate_series`): job завершается, строки не посчитаны дважды.
 - [ ] 5.11 Telegram-бот на aiogram (polling), привязка через `/start <token>` (миграция: `telegram_link` в CHECK `email_tokens.purpose`, `telegram_links`), роутер `/api/v1/me` и `/me/telegram`.
 - [ ] 5.12 Доменные события (`record.assigned`, `deal.closed`, `bulk_job.completed`), notifier, `notification_settings` и `/me/notifications`, отправка в Telegram.

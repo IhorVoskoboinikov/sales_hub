@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from redis.asyncio import Redis
 from sqlalchemy import func, select, update
+from structlog.testing import capture_logs
 
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
@@ -141,6 +142,14 @@ async def reap(bulk: BulkService, length: int = 0) -> ReapReport:
     return await bulk.reap_stuck(POLICY, FakeQueueLength(length))
 
 
+def reaped_logs(logs: list[dict[str, Any]], job_id: uuid.UUID) -> list[int]:
+    """reaps из строк bulk_job_reaped этой job. Chaos-тест (5.10) поймал лог на единицу больше
+    базы: ORM-update переносил reaps + 1 в объект, а лог прибавлял единицу ещё раз."""
+    return [
+        e["reaps"] for e in logs if e["event"] == "bulk_job_reaped" and e["job_id"] == str(job_id)
+    ]
+
+
 # --- (1) pending дольше 2 минут
 
 
@@ -156,12 +165,14 @@ async def test_stale_pending_job_gets_plan_again(
     job_id = (await make_job(people.admin, kind=kind, status="pending")).id
     await age(uow, job_id, 3 * MINUTE)
 
-    report = await reap(bulk)
+    with capture_logs() as logs:
+        report = await reap(bulk)
 
     assert job_id in report.replanned
     assert sent_for(task_queue, job_id) == [("bulk.plan", (str(job_id),))]
     job = await job_of(uow, job_id)
     assert (job.status, job.reaps) == ("pending", 1)
+    assert reaped_logs(logs, job_id) == [1]  # номер попытки в логе — тот же, что в базе
     # Повторная отправка начинает отсчёт заново: следующий проход сразу же ничего не шлёт.
     await reap(bulk)
     assert len(sent_for(task_queue, job_id)) == 1
@@ -243,7 +254,8 @@ async def test_stalled_chunks_are_sent_again(
     task_queue.enqueued.clear()
     length = FakeQueueLength(0)
 
-    report = await bulk.reap_stuck(POLICY, length)
+    with capture_logs() as logs:
+        report = await bulk.reap_stuck(POLICY, length)
 
     assert report.resent[job_id] == [1, 2]
     assert sent_for(task_queue, job_id) == [
@@ -252,8 +264,36 @@ async def test_stalled_chunks_are_sent_again(
     ]
     assert "bulk" in length.calls  # LLEN очереди чанков
     assert (await job_of(uow, job_id)).reaps == 1
+    assert reaped_logs(logs, job_id) == [1]
     await reap(bulk)  # updated_at свежий — второй раз не шлёт
     assert len(sent_for(task_queue, job_id)) == 2
+
+
+async def test_plan_lost_before_enqueue_is_resent_only_by_rule_3(
+    bulk: BulkService,
+    uow: UnitOfWork,
+    people: People,
+    make_contact: MakeRecord,
+    task_queue: FakeTaskQueue,
+) -> None:
+    # Воркер plan убит после коммита plan, но до group(...).apply_async(): job running,
+    # чанки pending, их сообщений нет. Повторная доставка plan ничего не ставит (job уже не
+    # pending), правило (1) — только для pending: подбирает правило (3), через 5 минут.
+    job_id = await planned_job(bulk, people, make_contact, 4)
+    assert await bulk.plan(job_id) == []  # повторно доставленный bulk.plan
+    await age(uow, job_id, 3 * MINUTE)  # правило (1) уже сработало бы на pending
+    task_queue.enqueued.clear()  # bulk.plan, который поставил запуск job
+
+    report = await reap(bulk)
+
+    assert job_id not in report.replanned and job_id not in report.resent
+    assert sent_for(task_queue, job_id) == []
+    await age(uow, job_id, 6 * MINUTE)
+
+    report = await reap(bulk)
+
+    assert report.resent[job_id] == [0, 1]
+    assert (await job_of(uow, job_id)).processed == 0
 
 
 async def test_busy_bulk_queue_postpones_resend(

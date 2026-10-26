@@ -734,12 +734,15 @@ class BulkService:
                 await self.uow.commit()
                 self._stuck(job, report)
                 return False
+            # Номер попытки — до UPDATE: ORM-update сам переносит reaps + 1 в объект job
+            # (synchronize_session), и job.reaps + 1 после него дал бы на единицу больше.
+            reaps = job.reaps + 1
             await self.uow.bulk_jobs.mark_reaped(job_id)
             await self.uow.commit()
         except BaseException:
             await self.uow.rollback()
             raise
-        logger.warning("bulk_job_reaped", job_id=str(job_id), reaps=job.reaps + 1)
+        logger.warning("bulk_job_reaped", job_id=str(job_id), reaps=reaps)
         return True
 
     async def _resend_chunks(
@@ -765,14 +768,13 @@ class BulkService:
                 await self.finalize_if_complete(job_id)
                 return []
             numbers = await self.uow.bulk_chunks.pending_numbers(job_id)
+            reaps = job.reaps + 1  # до UPDATE — см. _resend
             await self.uow.bulk_jobs.mark_reaped(job_id)
             await self.uow.commit()
         except BaseException:
             await self.uow.rollback()
             raise
-        logger.warning(
-            "bulk_job_reaped", job_id=str(job_id), reaps=job.reaps + 1, chunks=len(numbers)
-        )
+        logger.warning("bulk_job_reaped", job_id=str(job_id), reaps=reaps, chunks=len(numbers))
         return numbers
 
     @staticmethod

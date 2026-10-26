@@ -16,6 +16,11 @@ seed-организации, включая менеджера с наиболь
 чанк add-tags (UPDATE в CTE). Каждый EXPLAIN ANALYZE идёт в транзакции, которая откатывается:
 у чанка он действительно выполняет UPDATE.
 
+С шага 5.8 — запросы trash.purge (один раз, у org_admin: они не зависят от роли): чанк корзины
+сделок, контактов и компаний (частичные индексы ix_*_trash) и удаление заметок и активностей
+контакта без сделки. Это фоновые запросы, но они читают маленькую корзину — Seq Scan в них
+ошибка.
+
 Ошибка — Seq Scan по большой таблице (companies, contacts, deals, activities и её партиции)
 больше SEQ_SCAN_PAGES страниц: код выхода 1. Запрос дольше SLOW_MS — предупреждение: индекс
 используется, но данных слишком много (например, частая подстрока в ?q= — см.
@@ -34,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
-from sqlalchemy import Select, literal
+from sqlalchemy import ClauseElement, Select, literal
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import asyncpg as pg_asyncpg
 
@@ -43,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # чтобы им�
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.core.config import get_settings
-from app.models import Contact, Deal
+from app.models import Company, Contact, Deal
 from app.repositories.activities import ActivityRepository, AuditFilters, AuditQueries, TaskWindow
 from app.repositories.bulk import BulkRepository, close_overdue_filter, tag_filter
 from app.repositories.contacts import (
@@ -55,6 +60,8 @@ from app.repositories.contacts import (
 from app.repositories.deals import DealFilters, DealRepository
 from app.repositories.pagination import Page, encode_cursor
 from app.repositories.reports import ReportRepository
+from app.repositories.trash import TrashRepository
+from app.services.trash import PURGE_CHUNK
 
 BIG = re.compile(r"^(companies|contacts|deals|activities)(_p\d{4}_\d{2})?$")
 SEQ_SCAN_PAGES = 1000  # маленькие партиции и пустые таблицы честно читаются целиком
@@ -69,6 +76,16 @@ BACKGROUND = frozenset(
         "plan remove-tags vip",
         "plan close-overdue-deals",
         "чанк add-tags",
+    }
+)
+# Запросы trash.purge не зависят от роли — проверяются один раз, у org_admin.
+PURGE = frozenset(
+    {
+        "purge: чанк корзины сделок",
+        "purge: чанк корзины контактов",
+        "purge: чанк корзины компаний",
+        "purge: заметки контакта",
+        "purge: активности контакта без сделки",
     }
 )
 
@@ -95,7 +112,7 @@ class Result:
     warnings: list[str]  # Seq Scan в фоновом запросе (BACKGROUND)
 
 
-def render(statement: Select[Any]) -> tuple[str, list[str]]:
+def render(statement: ClauseElement) -> tuple[str, list[str]]:
     """SQL с $1, $2… (как его готовит asyncpg) и значения параметров литералами SQL."""
     compiled = statement.compile(
         dialect=pg_asyncpg.dialect(), compile_kwargs={"render_postcompile": True}
@@ -121,7 +138,7 @@ def walk(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 async def explain(
-    conn: asyncpg.Connection, statement: Select[Any], mode: str, pages: dict[str, int]
+    conn: asyncpg.Connection, statement: ClauseElement, mode: str, pages: dict[str, int]
 ) -> tuple[float, int, str, list[str]]:
     sql, values = render(statement)
     await conn.execute(f"SET plan_cache_mode = force_{mode}_plan")
@@ -244,6 +261,7 @@ async def main() -> int:
         page = Page(limit=50)
         size = settings.bulk_chunk_size
         no_filter = ContactRepository.filter_conditions(ContactFilters())
+        purge_before = datetime.now(UTC) - timedelta(days=settings.trash_retention_days)
 
         Builder = Callable[[Access], Any]  # Select с разными колонками
         checks: list[tuple[str, str, Builder]] = [
@@ -386,6 +404,36 @@ async def main() -> int:
                     Deal, close_overdue_filter(a, today.date(), None), size
                 ),
             ),
+            # --- шаг 5.8: trash.purge — чанк корзины по частичному индексу ix_*_trash и дети.
+            (
+                "purge: чанк корзины сделок",
+                "contact:read",
+                lambda a: TrashRepository.doomed_query(Deal, a.org_id, purge_before, PURGE_CHUNK),
+            ),
+            (
+                "purge: чанк корзины контактов",
+                "contact:read",
+                lambda a: TrashRepository.doomed_query(
+                    Contact, a.org_id, purge_before, PURGE_CHUNK
+                ),
+            ),
+            (
+                "purge: чанк корзины компаний",
+                "contact:read",
+                lambda a: TrashRepository.doomed_query(
+                    Company, a.org_id, purge_before, PURGE_CHUNK
+                ),
+            ),
+            (
+                "purge: заметки контакта",
+                "contact:read",
+                lambda a: TrashRepository.notes_query("contact", [sample["contact_id"]]),
+            ),
+            (
+                "purge: активности контакта без сделки",
+                "contact:read",
+                lambda a: TrashRepository.contact_activities_query([sample["contact_id"]]),
+            ),
         ]
 
         results: list[Result] = []
@@ -394,6 +442,8 @@ async def main() -> int:
                 acc = access(person, action, roles)
                 if acc is None:
                     continue  # у роли нет действия — в API это 403 от OPA
+                if name in PURGE and person.role != "org_admin":
+                    continue
                 queries = [(name, build(acc))]
                 if name == "контакты":
                     cursor = await deep_cursor(

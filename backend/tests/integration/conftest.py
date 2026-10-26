@@ -64,7 +64,7 @@ from app.models import (
 )
 from app.services.bulk import BulkService
 from app.services.notifications import NotificationService
-from app.storage import S3FileStorage
+from app.storage import S3FileStorage, StoredFile
 from app.uow import UnitOfWork
 from app.workers import runtime
 from app.workers.celery_app import celery_app
@@ -216,10 +216,12 @@ async def storage(rustfs: RustFs) -> AsyncIterator[S3FileStorage]:
 
 class FakeFileStorage:
     """Подмена FileStorage в тестах API: файлы — в памяти (ключ → байты и тип). down —
-    хранилище недоступно (503)."""
+    хранилище недоступно (503). modified — время загрузки файла: тесты очистки сдвигают его
+    назад."""
 
     def __init__(self) -> None:
         self.files: dict[str, tuple[bytes, str]] = {}
+        self.modified: dict[str, datetime] = {}
         self.deleted: list[str] = []
         self.down = False
 
@@ -229,6 +231,14 @@ class FakeFileStorage:
         data = fileobj.read()
         assert len(data) == size, "size не совпал с файлом"
         self.files[key] = (data, content_type)
+        self.modified[key] = datetime.now(UTC)
+
+    async def list_files(self, prefix: str) -> AsyncIterator[list[StoredFile]]:
+        if self.down:
+            raise ServiceUnavailable(service="storage")
+        keys = sorted(key for key in self.files if key.startswith(prefix))
+        for start in range(0, len(keys), 2):  # страницы по 2 — чтобы их было несколько
+            yield [StoredFile(key, self.modified[key]) for key in keys[start : start + 2]]
 
     async def download_to(self, key: str, path: Path) -> None:
         if key not in self.files:
@@ -236,7 +246,10 @@ class FakeFileStorage:
         await asyncio.to_thread(path.write_bytes, self.files[key][0])
 
     async def delete(self, key: str) -> None:
+        if self.down:
+            raise ServiceUnavailable(service="storage")
         self.files.pop(key, None)
+        self.modified.pop(key, None)
         self.deleted.append(key)
 
     async def ensure_bucket(self) -> None:
@@ -664,16 +677,22 @@ NBU_RATES = {"USD": Decimal("41.488"), "EUR": Decimal("46.5"), "PLN": Decimal("1
 @dataclass
 class FakeNbu:
     """Подмена API НБУ (respx): тесты не ходят в интернет. rates — курсы на любую дату;
-    down — НБУ не отвечает; dates — за какие даты спрашивали."""
+    down — НБУ не отвечает (failing — только на эти даты, YYYYMMDD); empty — даты, на которые
+    курса ещё нет (пустой список, как НБУ отвечает на будущую дату); dates — за какие даты
+    спрашивали."""
 
     rates: dict[str, Decimal]
     down: bool = False
+    failing: set[str] = field(default_factory=set)
+    empty: set[str] = field(default_factory=set)
     dates: list[str] = field(default_factory=list)
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         self.dates.append(request.url.params["date"])
-        if self.down:
+        if self.down or request.url.params["date"] in self.failing:
             return httpx.Response(503)
+        if request.url.params["date"] in self.empty:
+            return httpx.Response(200, json=[])
         return httpx.Response(
             200, json=[{"cc": cc, "rate": float(rate)} for cc, rate in self.rates.items()]
         )

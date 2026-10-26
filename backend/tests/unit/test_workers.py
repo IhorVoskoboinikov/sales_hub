@@ -412,3 +412,30 @@ def test_reaper_runs_every_minute() -> None:
     assert entry["task"] == "bulk.reap_stuck"
     assert entry["schedule"] == crontab()
     assert entry["options"] == {"expires": 60}  # пропущенные запуски не копятся
+
+
+def test_beat_schedule_has_all_maintenance_rows_with_expires_on_default_queue() -> None:
+    """Шаг 5.8: все строки таблицы «Расписание beat» (кроме напоминаний и дайджеста — 5.14).
+    Время — по Киеву; expires — интервал между запусками; очередь — default."""
+    hour, day = 3600, 86400
+    expected = {
+        "workers.heartbeat": (crontab(), 60),
+        "bulk.reap_stuck": (crontab(), 60),
+        "reports.refresh": (crontab(minute="*/5"), 300),
+        "fx.fetch_nbu_rates": (crontab(minute=30, hour="18,19"), hour),
+        "maintenance.create_partitions": (crontab(minute=0, hour=1), day),
+        "trash.purge": (crontab(minute=0, hour=3), day),
+        "maintenance.cleanup": (crontab(minute=0, hour=4), day),
+    }
+    celery_app.loader.import_default_modules()  # задачи регистрируются при импорте модулей
+
+    assert set(BEAT_SCHEDULE) == set(expected)
+    assert celery_app.conf.timezone == "Europe/Kyiv"
+    for name, (schedule, expires) in expected.items():
+        entry = BEAT_SCHEDULE[name]
+        assert entry["task"] == name
+        assert entry["schedule"] == schedule, name
+        assert entry["options"] == {"expires": expires}, name
+        assert name in celery_app.tasks, f"задачи {name} нет в celery_app"
+        assert name not in TASK_ROUTES  # → task_default_queue
+    assert celery_app.conf.task_default_queue == "default"

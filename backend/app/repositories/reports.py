@@ -18,6 +18,8 @@ from app.models import User
 from app.models.reports import deal_stats
 
 STATS = deal_stats.c
+# Ключ — 64-битный хэш имени, как у остальных advisory lock приложения (app/db/locks.py).
+REFRESH_LOCK = text("SELECT pg_try_advisory_xact_lock(hashtextextended('reports.refresh', 0))")
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,14 @@ class ReportRepository:
             for owner, email, o, ou, w, wu, lo, lu in rows
         ]
 
-    async def refresh(self) -> None:
-        """CONCURRENTLY: читатели не ждут обновления (нужен UNIQUE-индекс на view)."""
+    async def refresh(self) -> bool:
+        """Обновить deal_stats. CONCURRENTLY: читатели не ждут обновления (нужен UNIQUE-индекс
+        на view).
+
+        Под pg_try_advisory_xact_lock: обновление уже идёт (медленный прошлый запуск beat или
+        make refresh-reports) — False и пропуск, а не второй REFRESH в очередь за первым.
+        Блокировка транзакционная — отпускается коммитом или откатом вызывающего."""
+        if not await self.session.scalar(REFRESH_LOCK):
+            return False
         await self.session.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY deal_stats"))
+        return True

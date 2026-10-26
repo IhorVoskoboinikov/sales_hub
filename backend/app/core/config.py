@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     bulk_reap_stall_seconds: int = Field(300, ge=1)
     import_reap_stall_seconds: int = Field(900, ge=1)
     bulk_max_reaps: int = Field(3, ge=1)
+    # trash.purge (раздел 3): через сколько дней корзина удаляется насовсем.
+    trash_retention_days: int = Field(30, ge=1)
 
     # --- Файлы (разделы 11 и 12): S3 API; локально — RustFS из compose (ключи — оттуда же).
     s3_endpoint_url: str = "http://localhost:9000"

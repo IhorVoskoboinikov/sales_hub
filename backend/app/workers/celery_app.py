@@ -25,6 +25,7 @@ celery_app = Celery(
     "saleshub",
     include=[
         "app.workers.tasks.bulk",
+        "app.workers.tasks.fx",
         "app.workers.tasks.imports",
         "app.workers.tasks.maintenance",
         "app.workers.tasks.notifications",

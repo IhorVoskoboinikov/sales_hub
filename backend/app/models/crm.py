@@ -36,6 +36,16 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
 ALIVE = text("deleted_at IS NULL")
+# Корзина: предикат частичных индексов «наоборот» — список корзины и trash.purge (раздел 3).
+TRASH = "deleted_at IS NOT NULL"
+
+
+def trash_index(table: str) -> Index:
+    """(org_id, deleted_at, id) WHERE deleted_at IS NOT NULL: удалённые строки организации по
+    времени удаления. Маленький — в корзине доли процента строк."""
+    return Index(f"ix_{table}_trash", "org_id", "deleted_at", "id", postgresql_where=text(TRASH))
+
+
 # Текст поиска контакта: имя, фамилия и email одной строкой в нижнем регистре.
 # first_name и last_name NOT NULL, email может быть NULL — поэтому coalesce только у него.
 # Записано так, как Postgres хранит выражение индекса (со скобками и ::text), — тогда
@@ -105,6 +115,8 @@ class Company(CrmRecord, Base):
             postgresql_ops={"name": "gin_trgm_ops"},
             postgresql_where=ALIVE,
         ),
+        # Корзина: trash.purge (с этапа 5, миграция — CONCURRENTLY).
+        trash_index("companies"),
     )
 
     name: Mapped[str] = mapped_column(String(200))
@@ -143,14 +155,8 @@ class Contact(CrmRecord, Base):
         ),
         # Сегмент по тегу: tags @> ARRAY['vip'].
         Index("ix_contacts_tags", "tags", postgresql_using="gin", postgresql_where=ALIVE),
-        # Корзина: удалённые, новые сначала.
-        Index(
-            "ix_contacts_trash",
-            "org_id",
-            "deleted_at",
-            "id",
-            postgresql_where=text("deleted_at IS NOT NULL"),
-        ),
+        # Корзина: удалённые, новые сначала; и trash.purge.
+        trash_index("contacts"),
     )
 
     company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id", ondelete="SET NULL"))

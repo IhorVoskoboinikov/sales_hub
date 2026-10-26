@@ -16,7 +16,10 @@ ServiceUnavailable: API ответит 503, а BaseTask воркера повт�
 """
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, NoReturn, Protocol, cast
 
@@ -53,6 +56,12 @@ BUCKET_MISSING = frozenset({"NoSuchBucket", "404"})  # HEAD без тела: к�
 RETRYABLE_CODES = frozenset({"SlowDown", "RequestTimeout", "ServiceUnavailable", "InternalError"})
 
 
+@dataclass(frozen=True)
+class StoredFile:
+    key: str
+    modified_at: datetime  # когда файл загружен (aware, UTC)
+
+
 class FileStorage(Protocol):
     """Файлы по ключу (imports/{org_id}/{uuid}.csv). В тестах API — фейк в памяти."""
 
@@ -66,6 +75,11 @@ class FileStorage(Protocol):
 
     async def delete(self, key: str) -> None:
         """Удалить файл. Нет файла — не ошибка."""
+        ...
+
+    def list_files(self, prefix: str) -> AsyncIterator[list[StoredFile]]:
+        """Файлы, чей ключ начинается с prefix, — страницами (S3 отдаёт до 1 000 ключей за
+        запрос): очистка ищет сирот imports/*, не держа весь список в памяти."""
         ...
 
     async def ensure_bucket(self) -> None:
@@ -195,6 +209,21 @@ class S3FileStorage:
             await s3.delete_object(Bucket=self.bucket, Key=key)
         except Exception as exc:
             reraise(exc, "delete", key)
+
+    async def list_files(self, prefix: str) -> AsyncIterator[list[StoredFile]]:
+        s3 = await self._s3()
+        try:
+            async for page in s3.get_paginator("list_objects_v2").paginate(
+                Bucket=self.bucket, Prefix=prefix
+            ):
+                files = [
+                    StoredFile(item["Key"], item["LastModified"])
+                    for item in page.get("Contents", [])
+                ]
+                if files:
+                    yield files
+        except Exception as exc:
+            reraise(exc, "list", prefix)
 
     async def ensure_bucket(self) -> None:
         """Создать бакет, если его нет. Пока хранилище не отвечает (RustFS стартует), повторять

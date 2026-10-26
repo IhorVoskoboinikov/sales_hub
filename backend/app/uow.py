@@ -13,11 +13,13 @@ from app.repositories.email_tokens import EmailTokenRepository
 from app.repositories.failed_tasks import FailedTaskRepository
 from app.repositories.fx import FxRateRepository
 from app.repositories.imports import ImportErrorRepository, ImportRepository
+from app.repositories.maintenance import CleanupRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
 from app.repositories.outbox import OutboxRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.reports import ReportRepository
 from app.repositories.sent_notifications import SentNotificationRepository
+from app.repositories.trash import TrashRepository
 from app.repositories.users import UserRepository
 
 
@@ -48,6 +50,8 @@ class UnitOfWork:
         self.failed_tasks = FailedTaskRepository(session)
         self.import_errors = ImportErrorRepository(session)
         self.imports = ImportRepository(session)  # staging и шаги задачи импорта
+        self.trash = TrashRepository(session)  # trash.purge
+        self.cleanup = CleanupRepository(session)  # maintenance.cleanup
 
     async def flush(self) -> None:
         """Отправить изменения в базу без коммита: проверить ограничения, получить значения

@@ -12,12 +12,15 @@ get_rate(валюта, дата):
    нет — 422 fx.unknown_currency;
 4. НБУ недоступен или ответил пусто — последняя известная строка и stale=true (не кэшируется);
 5. строк нет совсем — 503 fx.unavailable.
+
+load_rates — задача beat fx.fetch_nbu_rates (18:30 и 19:30 по Киеву, раздел 15): курсы на
+сегодня и завтра заранее, чтобы первый запрос дня не ходил в НБУ.
 """
 
 import contextlib
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_EVEN, Decimal
 from zoneinfo import ZoneInfo
 
@@ -36,6 +39,12 @@ NBU_TIMEOUT = 3.0
 CACHE_TTL = 3600
 CENT = Decimal("0.01")
 RATE_PLACES = Decimal("0.000001")
+# Курс НБУ — на календарный день Украины: «завтра» задачи beat считается по Киеву.
+KYIV = ZoneInfo("Europe/Kyiv")
+
+
+def kyiv_today() -> date:
+    return datetime.now(KYIV).date()
 
 
 async def org_today(uow: UnitOfWork, org_id: uuid.UUID) -> date:
@@ -159,6 +168,36 @@ class FxService:
         fx_rate = cross_rate(rate, usd)
         amount_usd = (amount / fx_rate).quantize(CENT, ROUND_HALF_EVEN)
         return Converted(amount_usd, fx_rate, rate_date(rate, usd), rate.stale or usd.stale)
+
+    async def load_rates(self, today: date | None = None) -> dict[date, int]:
+        """Курсы НБУ на сегодня и завтра (по Киеву) → fx_rates; каждый день — своя транзакция.
+        Возвращает, сколько валют загружено на каждую дату.
+
+        НБУ устанавливает курс на следующий рабочий день до 18:00, поэтому вечером он уже есть;
+        на выходные НБУ отдаёт курс пятницы. Пустой ответ на завтра — не ошибка: курс ещё не
+        опубликован (его подтянет повтор в 19:30 или первый запрос дня). Ошибка НБУ или пустой
+        ответ на сегодня — 503 fx.unavailable: BaseTask повторит задачу. Upsert идемпотентен —
+        повтор безопасен."""
+        today = today or kyiv_today()
+        loaded: dict[date, int] = {}
+        for on in (today, today + timedelta(days=1)):
+            try:
+                rates = await self.nbu.rates(on)
+            except (httpx.HTTPError, ValueError, KeyError) as exc:
+                logger.warning("nbu_unavailable", on=on.isoformat(), error=repr(exc))
+                raise ServiceUnavailable("fx.unavailable", failed=["nbu"]) from exc
+            if not rates:
+                if on == today:  # курс на сегодня НБУ установил ещё вчера — пусто быть не должно
+                    logger.warning("nbu_empty", on=on.isoformat())
+                    raise ServiceUnavailable("fx.unavailable", failed=["nbu"])
+                logger.info("fx_rates_not_published", on=on.isoformat())
+                loaded[on] = 0
+                continue
+            await self.uow.fx_rates.upsert(on, rates, datetime.now(UTC))
+            await self.uow.commit()  # курс сегодня сохранён, даже если завтра упадёт
+            loaded[on] = len(rates)
+        logger.info("fx_rates_loaded", **{on.isoformat(): n for on, n in loaded.items()})
+        return loaded
 
     async def _fetch(self, on: date) -> dict[str, Decimal]:
         """Курсы НБУ на дату → fx_rates. Пусто — НБУ недоступен или курса на дату ещё нет.

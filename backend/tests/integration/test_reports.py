@@ -1,10 +1,18 @@
-"""Отчёты из materialized view deal_stats — шаг 4.7."""
+"""Отчёты из materialized view deal_stats — шаг 4.7; обновление под advisory lock (задача beat
+reports.refresh и make refresh-reports) — шаг 5.8."""
 
 from datetime import UTC, datetime
 from decimal import Decimal
 
+import pytest
 from httpx import AsyncClient
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 
+from app.cli import refresh_reports_command
+from app.core.config import Settings
+from app.services.reports import refresh_reports
 from app.uow import UnitOfWork
 from tests.integration.conftest import MakeOrg, MakeRecord, MakeUser, member, tokens_for
 
@@ -75,3 +83,37 @@ async def test_managers_period_and_foreign_pipeline(
 
     assert (bad_period.status_code, bad_month.status_code, hidden.status_code) == (422, 422, 404)
     assert year_zero.status_code == 422  # года 0 в календаре Python нет — не 500
+
+
+LOCK = text("SELECT pg_advisory_xact_lock(hashtextextended('reports.refresh', 0))")
+
+
+async def test_refresh_is_skipped_while_another_session_refreshes(
+    uow: UnitOfWork,
+    postgres_url: str,
+    make_user: MakeUser,
+    make_org: MakeOrg,
+    make_pipeline: MakeRecord,
+    make_deal: MakeRecord,
+    settings: Settings,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    org = await make_org()
+    rep = await member(make_user, org, "sales_rep")
+    await make_deal(rep, (await make_pipeline(org.id)).stages[0])
+    stats = text("SELECT count(*) FROM deal_stats WHERE org_id = :org")
+    engine = create_async_engine(postgres_url, poolclass=NullPool)
+    try:
+        async with engine.connect() as other:
+            await other.execute(LOCK)  # другая сессия сейчас обновляет отчёты
+            skipped = await refresh_reports(uow)
+            assert await refresh_reports_command(settings) == 0  # CLI — тот же путь
+            assert await uow.session.scalar(stats, {"org": org.id}) == 0  # REFRESH не было
+            await other.rollback()  # обновление закончилось — блокировка отпущена
+        refreshed = await refresh_reports(uow)
+    finally:
+        await engine.dispose()
+
+    assert (skipped, refreshed) == (False, True)
+    assert await uow.session.scalar(stats, {"org": org.id}) == 1
+    assert "отчёты уже обновляются — пропуск" in capsys.readouterr().out

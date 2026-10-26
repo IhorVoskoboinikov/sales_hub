@@ -109,7 +109,9 @@ class CrmService[R: Record]:
         await self.uow.commit()
 
     async def restore(self, access: Access, entity_id: int) -> R:
-        obj = await self.repo.get_deleted_or_404(entity_id, access)
+        # FOR UPDATE до коммита: trash.purge (SKIP LOCKED) такую строку пропустит, а restore,
+        # который ждал чанк purge, после его коммита строки уже не найдёт — 404.
+        obj = await self.repo.get_deleted_or_404(entity_id, access, for_update=True)
         await self._before_restore(access, obj)
         owner = await owner_for_restore(self.uow, obj)
         access.ensure_allowed(owner)  # ответственный мог перейти в чужой для меня отдел

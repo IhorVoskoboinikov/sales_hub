@@ -7,11 +7,12 @@
 Redis (visibility_timeout) и Postgres с транзакцией процесса, который умер на середине UPDATE.
 
 Данные — свои: скрипт создаёт организацию chaos-<id>, отдел, org_admin (вход через API тем же
-паролем, что задаёт hash_password приложения) и на каждый сценарий — двух менеджеров (sales_rep):
-прежнему ответственному generate_series даёт --contacts контактов (по умолчанию 100 000). Seed-
-данные не трогаются. В конце всё созданное удаляется — и при ошибке, и по Ctrl+C / SIGTERM:
-контакты, job и их чанки, строки журнала и failed_tasks, люди, отдел, организация; потом VACUUM
-(ANALYZE) contacts.
+паролем, что задаёт hash_password приложения) и на каждый сценарий — своего org_admin-автора job и
+двух менеджеров (sales_rep): прежнему ответственному generate_series даёт --contacts контактов (по
+умолчанию 100 000). Seed-данные не трогаются. В конце всё созданное удаляется — и при ошибке, и по
+Ctrl+C / SIGTERM: контакты, job и их чанки, строки журнала и failed_tasks, outbox организации и
+sent_notifications её людей, люди, отдел, организация, письма в Mailpit; потом VACUUM (ANALYZE)
+contacts.
 
 Сценарии (--scenario a | b | all):
 
@@ -63,6 +64,17 @@ UPDATE до этой строки и ждут: у каждого процесс�
 - в B у каждой копии исходного сообщения — bulk_chunk_already_finished и ни одного
   bulk_chunk_done: копия не выполняла чанк, а не просто ничего не изменила.
 
+Уведомления (приёмка этапа 5, шаг 5.15). Автор job — свой org_admin на каждый сценарий, получатель
+— новый менеджер; оба с подтверждённым email и настройками по умолчанию. После финала (в B — уже
+после повторной выдачи исходных сообщений: копия чанка ещё раз вызывает finalize) по HTTP API
+Mailpit стенда: автору ровно одно письмо с итогом, получателю — ровно одно «вам передано N
+клієнтів»; в базе одно событие bulk_job.completed этой job и по строке sent_notifications на
+письмо. Telegram — только если у стенда задан TELEGRAM_BOT_TOKEN и указаны два чата
+(--telegram-chats): Bot API настоящий, сообщения не перехватить, поэтому проверяется строка
+sent_notifications канала telegram у каждого и что привязка цела (403 / «chat not found» её бы
+удалили). Иначе скрипт пишет, почему Telegram пропущен. Письма этих адресов в конце удаляются из
+Mailpit вместе с остальными данными.
+
 Таймлайн — из трёх источников: действия скрипта, строки базы (started_at, finished_at чанков и
 job, рост reaps) и логи контейнеров (docker compose logs: выдача сообщений, bulk_chunk_done,
 bulk_chunk_already_finished, bulk_job_reaped, гибель процесса пула, откат транзакции убитого
@@ -92,6 +104,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # чтобы им�
 
 from app.core.config import get_settings
 from app.core.security import hash_password
+from app.texts import uk
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE = ("docker", "compose", "-f", str(ROOT / "deploy/compose/docker-compose.yml"))
@@ -103,6 +116,10 @@ CONCURRENCY = 4  # -c у worker-bulk в compose: столько чанков в�
 HOLD_WATCHDOG_SECONDS = 40  # меньше soft_time_limit чанка (60 с)
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 FINAL = ("done", "partial_failed", "failed", "cancelled")
+NOTIFY_WAIT_SECONDS = 60  # от финала job до писем: relay → notify → relay → send_email
+NOTIFY_SETTLE_SECONDS = 10  # после писем: лишнее письмо, если бы оно было, успело бы прийти
+SUMMARY_SUBJECT = uk.EMAIL_SUBJECTS["bulk_job_completed"]
+TRANSFER_SUBJECT = uk.EMAIL_SUBJECTS["bulk_reassigned"]
 
 
 def log(message: str) -> None:
@@ -154,6 +171,15 @@ async def redis_text(*args: str) -> str:
     return await compose("exec", "-T", "redis", "redis-cli", "-n", "1", "--raw", *args)
 
 
+async def stack_has_telegram_token() -> bool:
+    """Задан ли TELEGRAM_BOT_TOKEN у воркеров стенда (compose берёт его из deploy/compose/.env),
+    а не у этого процесса: отправляет worker, у скрипта свои настройки."""
+    out = await compose(
+        "exec", "-T", "worker", "sh", "-c", '[ -n "$TELEGRAM_BOT_TOKEN" ] && echo yes || echo no'
+    )
+    return out.strip() == "yes"
+
+
 async def broker_messages() -> str:
     """Все сообщения брокера, где может лежать задача чанка: неподтверждённые (hash unacked) и
     ждущие в очереди bulk."""
@@ -171,6 +197,7 @@ class Org:
     admin_id: uuid.UUID
     admin_email: str
     users: list[uuid.UUID] = field(default_factory=list)
+    emails: list[str] = field(default_factory=list)  # адреса людей — их письма в Mailpit
     jobs: list[uuid.UUID] = field(default_factory=list)
 
 
@@ -204,21 +231,35 @@ async def create_org(conn: asyncpg.Connection, run_id: str) -> Org:
             org.id,
         )
     org.users.append(org.admin_id)
+    org.emails.append(org.admin_email)
     return org
 
 
-async def create_manager(conn: asyncpg.Connection, org: Org, name: str) -> uuid.UUID:
-    user_id = uuid.uuid4()
+@dataclass(frozen=True)
+class Person:
+    id: uuid.UUID
+    email: str
+
+
+async def create_member(
+    conn: asyncpg.Connection, org: Org, name: str, role: str = "sales_rep"
+) -> Person:
+    """Человек организации с тем же паролем, что у org_admin (вход через API), подтверждённым
+    email и настройками уведомлений по умолчанию (строк notification_settings нет) — письма
+    notifier ему уходят. Менеджер — в отделе, org_admin — без отдела."""
+    person = Person(uuid.uuid4(), f"{org.slug}-{name}@{EMAIL_DOMAIN}")
     await conn.execute(
         "INSERT INTO users (id, email, password_hash, org_id, team_id, role, email_verified_at) "
-        "SELECT $1, $2, password_hash, org_id, $3, 'sales_rep', now() FROM users WHERE id = $4",
-        user_id,
-        f"{org.slug}-{name}@{EMAIL_DOMAIN}",
-        org.team_id,
+        "SELECT $1, $2, password_hash, org_id, $3, $4, now() FROM users WHERE id = $5",
+        person.id,
+        person.email,
+        org.team_id if role == "sales_rep" else None,
+        role,
         org.admin_id,
     )
-    org.users.append(user_id)
-    return user_id
+    org.users.append(person.id)
+    org.emails.append(person.email)
+    return person
 
 
 async def create_contacts(conn: asyncpg.Connection, org: Org, owner: uuid.UUID, n: int) -> None:
@@ -238,10 +279,12 @@ async def create_contacts(conn: asyncpg.Connection, org: Org, owner: uuid.UUID, 
     )
 
 
-async def cleanup(conn: asyncpg.Connection, org: Org) -> None:
+async def cleanup(conn: asyncpg.Connection, mail: httpx.AsyncClient, org: Org) -> None:
     """Удалить всё, что создал скрипт. Порядок — по FK: job (чанки — каскадом), контакты, люди
-    (refresh-токены — каскадом), отдел, организация. Строки журнала и failed_tasks — по org_id,
-    авторам и id job."""
+    (refresh-токены, привязки Telegram, настройки уведомлений — каскадом), отдел, организация.
+    Строки журнала и failed_tasks — по org_id, авторам и id job; outbox (события и команды
+    notifier) — по org_id; sent_notifications внешнего ключа на users нет — по людям. Письма
+    адресов скрипта — из Mailpit."""
     jobs = [str(j) for j in org.jobs]
     async with conn.transaction():
         failed = await conn.execute(
@@ -252,13 +295,26 @@ async def cleanup(conn: asyncpg.Connection, org: Org) -> None:
         audit = await conn.execute(
             "DELETE FROM audit_log WHERE org_id = $1 OR actor_id = ANY($2)", org.id, org.users
         )
-        await conn.execute("DELETE FROM outbox_events WHERE org_id = $1", org.id)
+        outbox = await conn.execute("DELETE FROM outbox_events WHERE org_id = $1", org.id)
+        sent = await conn.execute(
+            "DELETE FROM sent_notifications WHERE user_id = ANY($1)", org.users
+        )
         await conn.execute("DELETE FROM bulk_jobs WHERE org_id = $1", org.id)
         contacts = await conn.execute("DELETE FROM contacts WHERE org_id = $1", org.id)
         await conn.execute("DELETE FROM users WHERE org_id = $1", org.id)
         await conn.execute("DELETE FROM teams WHERE org_id = $1", org.id)
         await conn.execute("DELETE FROM organizations WHERE id = $1", org.id)
-    log(f"очистка: {contacts}, audit_log {audit.split()[-1]}, failed_tasks {failed.split()[-1]}")
+    log(
+        f"очистка: {contacts}, audit_log {audit.split()[-1]}, failed_tasks {failed.split()[-1]},"
+        f" outbox_events {outbox.split()[-1]}, sent_notifications {sent.split()[-1]}"
+    )
+    try:
+        ids = [m["ID"] for email in org.emails for m in await mailbox(mail, email)]
+        if ids:
+            (await mail.request("DELETE", "/messages", json={"IDs": ids})).raise_for_status()
+        log(f"очистка: писем в Mailpit {len(ids)}")
+    except httpx.HTTPError as error:  # стенд без Mailpit не повод оставить данные в базе
+        log(f"очистка: Mailpit недоступен ({error!r}) — письма остались")
     started = time.perf_counter()
     await conn.execute("VACUUM (ANALYZE) contacts, bulk_jobs, bulk_job_chunks, users")
     log(f"очистка: VACUUM (ANALYZE) contacts — {time.perf_counter() - started:.0f} с")
@@ -343,9 +399,9 @@ async def login(api: httpx.AsyncClient, email: str) -> dict[str, str]:
 
 
 async def start_job(
-    api: httpx.AsyncClient, org: Org, from_id: uuid.UUID, to_id: uuid.UUID
+    api: httpx.AsyncClient, author: Person, from_id: uuid.UUID, to_id: uuid.UUID
 ) -> uuid.UUID:
-    headers = await login(api, org.admin_email)
+    headers = await login(api, author.email)
     response = await api.post(
         "/api/v1/bulk/reassign-owner",
         json={"from_user_id": str(from_id), "to_user_id": str(to_id), "include": ["contacts"]},
@@ -354,6 +410,21 @@ async def start_job(
     if response.status_code != 202:
         raise RuntimeError(f"POST /bulk/reassign-owner: {response.status_code} {response.text}")
     return uuid.UUID(response.json()["id"])
+
+
+async def mailbox(mail: httpx.AsyncClient, to: str) -> list[dict[str, Any]]:
+    """Письма Mailpit стенда для адреса to (HTTP API, от новых к старым): ID, Subject, Created —
+    без текста."""
+    response = await mail.get("/search", params={"query": f'to:"{to}"', "limit": 50})
+    response.raise_for_status()
+    found: list[dict[str, Any]] = response.json()["messages"]
+    return found
+
+
+async def letter_text(mail: httpx.AsyncClient, message_id: str) -> str:
+    response = await mail.get(f"/message/{message_id}")
+    response.raise_for_status()
+    return str(response.json()["Text"])
 
 
 # --- сценарий
@@ -389,11 +460,15 @@ class Check:
 class Outcome:
     scenario: str
     job_id: uuid.UUID | None = None
+    author: Person | None = None  # кто запустил job: ему — письмо с итогом
+    recipient: Person | None = None  # новый ответственный: ему — «вам передано N клієнтів»
     created: datetime | None = None
     events: list[Event] = field(default_factory=list)
     checks: list[Check] = field(default_factory=list)
     summary: list[tuple[str, str]] = field(default_factory=list)
     chunk_logs: list[ChunkLog] = field(default_factory=list)
+    # B: лог убитого контейнера worker-bulk до up -d — см. kill_logs.
+    killed_logs: str = ""
     missed: bool = False
 
     def miss(self, text: str) -> None:
@@ -436,15 +511,24 @@ class Ctx:
     dsn: str
     conn: asyncpg.Connection
     api: httpx.AsyncClient
+    mail: httpx.AsyncClient  # HTTP API Mailpit стенда
     org: Org
     hold: Hold | None = None
+    # Чаты для автора и получателя, если Telegram проверяется; иначе — почему нет.
+    telegram_chats: tuple[int, int] | None = None
+    telegram_skip: str = ""
 
 
 async def run_scenario(ctx: Ctx, scenario: str) -> Outcome:
     args, conn, org = ctx.args, ctx.conn, ctx.org
     out = Outcome(scenario)
-    from_id = await create_manager(conn, org, f"{scenario}-from")
-    to_id = await create_manager(conn, org, f"{scenario}-to")
+    # Свой автор на сценарий: письма автору сценария A и B не смешиваются в одном ящике.
+    out.author = await create_member(conn, org, f"{scenario}-author", "org_admin")
+    from_id = (await create_member(conn, org, f"{scenario}-from")).id
+    out.recipient = await create_member(conn, org, f"{scenario}-to")
+    to_id = out.recipient.id
+    if ctx.telegram_chats is not None:
+        await link_telegram(ctx, out, ctx.telegram_chats)
     started = time.perf_counter()
     await create_contacts(conn, org, from_id, args.contacts)
     log(f"{scenario}: {args.contacts} контактов — {time.perf_counter() - started:.1f} с")
@@ -457,7 +541,7 @@ async def run_scenario(ctx: Ctx, scenario: str) -> Outcome:
         await ctx.hold.acquire(await hold_ids(conn, from_id, args.chunk_size, first_held))
         out.event(f"блокировка строк в чанках {first_held}…{chunks_expected - 1}")
 
-    job_id = await start_job(ctx.api, org, from_id, to_id)
+    job_id = await start_job(ctx.api, out.author, from_id, to_id)
     org.jobs.append(job_id)
     out.job_id = job_id
     out.event(f"POST /bulk/reassign-owner → 202, job {job_id}", "post")
@@ -565,6 +649,7 @@ async def run_scenario(ctx: Ctx, scenario: str) -> Outcome:
         (stats,) = await inspect("stats")
         out.event(f"пул после kill: {stats['pool']['processes']}")
     else:
+        out.killed_logs = await kill_logs(out)  # после блокировки: она не ждёт лишнего
         await asyncio.sleep(args.down_seconds)
         await compose("up", "-d", "--wait", "worker-bulk")
         out.event("docker compose up -d --wait worker-bulk — воркер healthy", "worker_up")
@@ -660,6 +745,8 @@ async def finish(
         "unacked и очередь bulk пусты по этим задачам" if not left else f"остались: {left}",
     )
     await api_check(ctx, out, job_id)
+    # В B — уже после повторной выдачи: копии чанков ещё раз вызвали finalize.
+    await check_notifications(ctx, out, job_id)
     await collect_logs(out, job_id, killed)
     chunk_rows = {no: rows for no, _, rows in snapshot[1]}
     check_chunk_logs(out, killed, chunk_rows, copies=redelivered)
@@ -793,7 +880,8 @@ async def wait_redelivery(out: Outcome, killed: dict[str, int], wait: int) -> No
 
 async def api_check(ctx: Ctx, out: Outcome, job_id: uuid.UUID) -> None:
     """Тот же итог через GET /bulk-jobs/{id} — как его видит пользователь."""
-    headers = await login(ctx.api, ctx.org.admin_email)
+    assert out.author is not None
+    headers = await login(ctx.api, out.author.email)
     response = await ctx.api.get(f"/api/v1/bulk-jobs/{job_id}", headers=headers)
     body = response.json()
     ok = response.status_code == 200 and body["status"] == "done"
@@ -803,6 +891,127 @@ async def api_check(ctx: Ctx, out: Outcome, job_id: uuid.UUID) -> None:
         ok,
         f"{response.status_code}: {body.get('status')},"
         f" {body.get('processed')}/{body.get('total')}",
+    )
+
+
+async def link_telegram(ctx: Ctx, out: Outcome, chats: tuple[int, int]) -> None:
+    """Привязать автора и получателя сценария к чатам --telegram-chats. chat_id уникален, поэтому
+    привязки людей прошлого сценария к этим чатам снимаются. Чат, привязанный к человеку не из
+    организации скрипта (например, к своему аккаунту на стенде), не трогаем — ошибка."""
+    assert out.author is not None and out.recipient is not None
+    taken = await ctx.conn.fetchval(
+        "SELECT count(*) FROM telegram_links WHERE chat_id = ANY($1::bigint[])"
+        " AND user_id <> ALL($2::uuid[])",
+        list(chats),
+        ctx.org.users,
+    )
+    if taken:
+        raise RuntimeError(
+            "--telegram-chats: чат уже привязан к пользователю стенда — отвяжите его (/stop)"
+        )
+    async with ctx.conn.transaction():
+        await ctx.conn.execute("DELETE FROM telegram_links WHERE chat_id = ANY($1)", list(chats))
+        for person, chat in zip((out.author, out.recipient), chats, strict=True):
+            await ctx.conn.execute(
+                "INSERT INTO telegram_links (user_id, chat_id) VALUES ($1, $2)", person.id, chat
+            )
+    out.event(f"Telegram: автор → чат {chats[0]}, получатель → чат {chats[1]}")
+
+
+async def check_notifications(ctx: Ctx, out: Outcome, job_id: uuid.UUID) -> None:
+    """Уведомления bulk_job.completed (шаг 5.15, см. docstring модуля): ровно одно письмо автору
+    (итог) и одно получателю («вам передано N клієнтів») в Mailpit стенда, одно событие этой job,
+    по строке sent_notifications на письмо; Telegram — если проверяется (ctx.telegram_chats)."""
+    assert out.author is not None and out.recipient is not None
+    n = ctx.args.contacts
+    expected = {
+        "автору": (out.author, SUMMARY_SUBJECT, f"Оброблено записів: {n} з {n}."),
+        "получателю": (
+            out.recipient,
+            TRANSFER_SUBJECT,
+            f"Вам передано клієнтів: {n} (контакти — {n}).",
+        ),
+    }
+
+    async def arrived() -> bool:
+        for person, _, _ in expected.values():
+            if not await mailbox(ctx.mail, person.email):
+                return False
+        return True
+
+    async def published() -> bool:
+        left = await ctx.conn.fetchval(
+            "SELECT count(*) FROM outbox_events WHERE org_id = $1 AND published_at IS NULL",
+            ctx.org.id,
+        )
+        return not left
+
+    try:
+        await wait_for(arrived, NOTIFY_WAIT_SECONDS, "письма автору и получателю", step=1)
+        await wait_for(published, NOTIFY_WAIT_SECONDS, "публикация outbox организации", step=1)
+    except TimeoutError as error:
+        log(f"{out.scenario}: {error}")  # проверки ниже покажут, чего не хватает
+    # Команды notifier опубликованы; пауза — лишнее письмо, если бы оно было, успело бы прийти.
+    await asyncio.sleep(NOTIFY_SETTLE_SECONDS)
+
+    for whom, (person, subject, line) in expected.items():
+        letters = await mailbox(ctx.mail, person.email)
+        for letter in letters:
+            at = datetime.fromisoformat(letter["Created"])
+            out.events.append(
+                Event(at, "mailpit", f"письмо {whom}: «{letter['Subject']}»", "email")
+            )
+        ok = len(letters) == 1 and letters[0]["Subject"] == subject
+        ok = ok and line in await letter_text(ctx.mail, letters[0]["ID"])
+        subjects = ", ".join(f"«{letter['Subject']}»" for letter in letters) or "—"
+        out.check(
+            f"ровно одно письмо {whom}",
+            ok,
+            f"{person.email}: писем {len(letters)} ({subjects})"
+            + ("" if ok else f", ждали одно «{subject}» со строкой «{line}»"),
+        )
+
+    prefix = f"bulk_job.completed:job:{job_id}:"
+    events = await ctx.conn.fetchval(
+        "SELECT count(*) FROM outbox_events"
+        " WHERE event_type = 'bulk_job.completed' AND payload->>'job_id' = $1",
+        str(job_id),
+    )
+    commands = await ctx.conn.fetchval(
+        "SELECT count(*) FROM outbox_events WHERE event_type IN ('email.send', 'telegram.send')"
+        " AND starts_with(payload->>'dedup_key', $1)",
+        prefix,
+    )
+    sent = {
+        r["dedup_key"].removeprefix(prefix)
+        for r in await ctx.conn.fetch(
+            "SELECT dedup_key FROM sent_notifications WHERE starts_with(dedup_key, $1)", prefix
+        )
+    }
+    people = (out.author, out.recipient)
+    emails = {f"{p.id}:email" for p in people}
+    out.check(
+        "одно событие bulk_job.completed, по ключу дедупа на письмо",
+        events == 1 and {key for key in sent if key.endswith(":email")} == emails,
+        f"событий {events}, команд notifier {commands}, sent_notifications {len(sent)}",
+    )
+    if ctx.telegram_chats is None:
+        return
+    telegrams = {f"{p.id}:telegram" for p in people}
+    links = await ctx.conn.fetchval(
+        "SELECT count(*) FROM telegram_links WHERE user_id = ANY($1)", [p.id for p in people]
+    )
+    failed = await ctx.conn.fetchval(
+        "SELECT count(*) FROM failed_tasks WHERE task_name = 'notifications.send_telegram'"
+        " AND failed_at >= $1",
+        out.created,
+    )
+    sent_telegram = {key for key in sent if key.endswith(":telegram")}
+    out.check(
+        "Telegram: по сообщению автору и получателю",
+        sent_telegram == telegrams and links == 2 and failed == 0,
+        f"sent_notifications telegram {len(sent_telegram)}, привязок {links},"
+        f" failed_tasks send_telegram {failed}",
     )
 
 
@@ -817,20 +1026,35 @@ def parse_line(line: str) -> tuple[str, datetime, str] | None:
     return service.strip().rsplit("-", 1)[0], at, text.strip()
 
 
+def logs_since(out: Outcome) -> str:
+    assert out.created is not None
+    return (out.created - timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def kill_logs(out: Outcome) -> str:
+    """B: лог убитого worker-bulk, пока контейнер ещё есть. Если конфигурация compose поменялась
+    после его создания (новая переменная окружения), up -d создаст контейнер заново, и docker
+    compose logs покажет только новый — строки чанков до kill пропали бы (так и было в первом
+    прогоне 27.10.2026: «нет bulk_chunk_done у чанков 0–3»)."""
+    return await compose(
+        "logs", "--no-color", "--timestamps", "--since", logs_since(out), "worker-bulk"
+    )
+
+
 async def collect_logs(out: Outcome, job_id: uuid.UUID, killed: dict[str, int]) -> None:
     """События из логов: выдача сообщений убитых чанков (Task bulk.chunk[id] received), строки
     этой job (bulk_chunk_done, bulk_chunk_already_finished, bulk_job_reaped…), гибель процесса
     пула и откат транзакции убитого процесса в Postgres. Строки о чанках — ещё и в
     out.chunk_logs, для check_chunk_logs."""
-    assert out.created is not None
-    since = (out.created - timedelta(seconds=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     text = await compose(
-        "logs", "--no-color", "--timestamps", "--since", since,
+        "logs", "--no-color", "--timestamps", "--since", logs_since(out),
         "worker-bulk", "worker", "postgres",
     )  # fmt: skip
+    # Лог убитого контейнера (B) плюс текущие; тот же контейнер даёт те же строки — без повторов.
+    lines = list(dict.fromkeys([*out.killed_logs.splitlines(), *text.splitlines()]))
     kill = next((e.at for e in out.events if e.tag == "kill"), None)
     seen: dict[str, int] = {}
-    for line in text.splitlines():
+    for line in lines:
         parsed = parse_line(line)
         if parsed is None:
             continue
@@ -954,6 +1178,7 @@ def summarize(out: Outcome) -> None:
     rows: list[tuple[str, datetime | None, datetime | None]] = [
         ("POST → job done (вся job)", post, done),
         ("kill → job done (восстановление)", kill, done),
+        ("job done → письма автору и получателю", done, last("email")),
     ]
     if out.scenario == "A":
         rows += [
@@ -1015,7 +1240,33 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--timeout", type=int, default=1800, help="ждать финала job, с")
     parser.add_argument("--api", default="http://localhost:8000")
+    parser.add_argument(
+        "--mailpit", default="http://localhost:8025/api/v1", help="HTTP API Mailpit стенда"
+    )
+    parser.add_argument(
+        "--telegram-chats",
+        help="два chat_id через запятую — автору и получателю (бот стенда должен мочь писать"
+        " в оба чата): без них Telegram не проверяется",
+    )
     return parser.parse_args()
+
+
+async def telegram_plan(args: argparse.Namespace) -> tuple[tuple[int, int] | None, str]:
+    """Проверять ли Telegram: (чаты автора и получателя, "") или (None, почему нет)."""
+    if not await stack_has_telegram_token():
+        return None, (
+            "у стенда не задан TELEGRAM_BOT_TOKEN (deploy/compose/.env): send_telegram пропускает"
+            " сообщения (telegram_skipped), проверять нечего"
+        )
+    if not args.telegram_chats:
+        return None, (
+            "токен задан, но нет --telegram-chats: Bot API настоящий, а придуманному chat_id"
+            " он ответит «chat not found» — нужны два чата, куда бот может писать"
+        )
+    chats = [int(chat) for chat in args.telegram_chats.split(",")]
+    if len(chats) != 2 or chats[0] == chats[1]:
+        sys.exit("--telegram-chats: нужны два разных chat_id через запятую")
+    return (chats[0], chats[1]), ""
 
 
 async def main() -> int:
@@ -1031,6 +1282,8 @@ async def main() -> int:
         "beat",
         "redis",
         "postgres",
+        "outbox-relay",  # без него bulk_job.completed не дойдёт до notify — писем не будет
+        "mailpit",
     } - await running_services()
     if missing:
         sys.exit(f"стенд не запущен ({', '.join(sorted(missing))}): сначала make up")
@@ -1044,10 +1297,22 @@ async def main() -> int:
     dsn = get_settings().database_url.replace("postgresql+asyncpg", "postgresql")
     conn = await asyncpg.connect(dsn, server_settings={"application_name": APP_NAME})
     api = httpx.AsyncClient(base_url=args.api, timeout=30)
+    mail = httpx.AsyncClient(base_url=args.mailpit, timeout=30)
+    chats, telegram_skip = await telegram_plan(args)
+    log(f"Telegram: чаты {chats}" if chats else f"Telegram не проверяется: {telegram_skip}")
     run_id = uuid.uuid4().hex[:8]
     org = await create_org(conn, run_id)
     log(f"организация {org.slug}, вход {org.admin_email} / {PASSWORD}")
-    ctx = Ctx(args=args, dsn=dsn, conn=conn, api=api, org=org)
+    ctx = Ctx(
+        args=args,
+        dsn=dsn,
+        conn=conn,
+        api=api,
+        mail=mail,
+        org=org,
+        telegram_chats=chats,
+        telegram_skip=telegram_skip,
+    )
     outcomes: list[Outcome] = []
     started = time.perf_counter()
     try:
@@ -1060,11 +1325,14 @@ async def main() -> int:
         if "worker-bulk" not in await running_services():
             log("worker-bulk не запущен — поднимаю")
             await compose("up", "-d", "--wait", "worker-bulk")
-        await cleanup(conn, org)
+        await cleanup(conn, mail, org)
         await conn.close()
         await api.aclose()
+        await mail.aclose()
         for out in outcomes:
             print_outcome(out)
+        if ctx.telegram_skip:
+            print(f"\nTelegram не проверялся: {ctx.telegram_skip}")
         print(f"\nВсего: {(time.perf_counter() - started) / 60:.1f} мин")
     failed = [c for out in outcomes for c in out.checks if not c.ok]
     missed = [out.scenario for out in outcomes if out.missed]

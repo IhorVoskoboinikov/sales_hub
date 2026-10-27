@@ -78,7 +78,7 @@ bench-updates:  ## замеры способов UPDATE на копии contacts
 	$(BACKEND) uv run python scripts/bench_updates.py $(BENCH)
 
 CHAOS ?=
-chaos:  ## chaos-тест bulk на стенде make up: kill воркера посреди job, ~21 мин (CHAOS="--scenario a")
+chaos:  ## chaos-тест bulk на стенде make up: kill воркера посреди job, ~22 мин (CHAOS="--scenario a")
 	$(BACKEND) uv run python scripts/chaos.py $(CHAOS)
 
 refresh-reports:  ## обновить отчёты (materialized view deal_stats) в compose

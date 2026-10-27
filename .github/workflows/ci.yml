@@ -95,7 +95,8 @@ jobs:
       - name: openapi.json is up to date
         run: |
           uv run python -m app.cli export-openapi
-          if ! git diff --quiet -- openapi.json; then
+          # status, а не diff: diff не видит файла, который удалили из git, а команда создала снова.
+          if [ -n "$(git status --porcelain -- openapi.json)" ]; then
             echo "::error file=backend/openapi.json::схема устарела: make openapi и закоммить backend/openapi.json"
             git diff --stat -- openapi.json
             exit 1
@@ -110,7 +111,9 @@ jobs:
           fi
           mkdir -p tmp
           git show "origin/$GITHUB_BASE_REF:backend/openapi.json" > tmp/openapi.base.json
-          # Пути — от корня репозитория (/repo в контейнере): аннотации указывают на backend/openapi.json.
+          # Пути — от корня репозитория (/repo в контейнере). Аннотация указывает на файл, где найдено
+          # изменение: новое и изменённое — на backend/openapi.json, удалённое — на копию из базовой
+          # ветки (её нет в PR, поэтому такие ошибки видны только в списке аннотаций прогона).
           $OASDIFF changelog backend/tmp/openapi.base.json backend/openapi.json --format markdown >> "$GITHUB_STEP_SUMMARY"
           $OASDIFF breaking backend/tmp/openapi.base.json backend/openapi.json --format githubactions
 

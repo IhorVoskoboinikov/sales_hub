@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Collection
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -57,6 +58,34 @@ class UserRepository:
         if for_update:
             query = query.with_for_update().execution_options(populate_existing=True)
         return await self.session.scalar(query)
+
+    async def get_many(self, user_ids: Collection[uuid.UUID]) -> list[User]:
+        """Получатели уведомлений одним запросом; кого нет — того нет в ответе."""
+        if not user_ids:
+            return []
+        return list(
+            await self.session.scalars(
+                select(User)
+                .where(User.id.in_(list(user_ids)))
+                .execution_options(populate_existing=True)
+            )
+        )
+
+    async def active_team_leads(self, org_id: uuid.UUID, team_id: uuid.UUID) -> list[User]:
+        """Активные руководители отдела — им тоже приходит закрытие сделки (раздел 16)."""
+        return list(
+            await self.session.scalars(
+                select(User)
+                .where(
+                    User.org_id == org_id,
+                    User.team_id == team_id,
+                    User.role == Role.TEAM_LEAD,
+                    User.is_active,
+                )
+                .order_by(User.email)
+                .execution_options(populate_existing=True)
+            )
+        )
 
     async def count_active_admins(self, org_id: uuid.UUID) -> int:
         return (

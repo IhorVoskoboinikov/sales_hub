@@ -29,6 +29,7 @@ from sqlalchemy.exc import DBAPIError, InterfaceError
 from app.core.context import request_id_var
 from app.errors import AppError, ServiceUnavailable
 from app.models.failed_tasks import EXC_MESSAGE_MAX, TRACEBACK_MAX
+from app.notifications.telegram import TelegramApiError
 from app.repositories.failed_tasks import FailedTaskRepository
 from app.workers.runtime import resources, run_async
 
@@ -58,6 +59,10 @@ def is_retryable(exc: BaseException) -> bool:
         return sqlstate.startswith(CONNECTION_SQLSTATE_CLASS) or sqlstate in RETRYABLE_SQLSTATES
     if isinstance(exc, ServiceUnavailable):
         return exc.code in RETRYABLE_UNAVAILABLE_CODES
+    # Bot API: 429 (подождать retry_after) и 5xx — повторяем; прочие 4xx — ошибка в запросе.
+    # Сеть до Telegram — TelegramUnavailable, наследник ConnectionError (проверка ниже).
+    if isinstance(exc, TelegramApiError):
+        return exc.retryable
     # SMTP ответил 4xx — «попробуйте позже»; 5xx (адрес отклонён, нет авторизации) — навсегда.
     # Обрыв и таймаут SMTP — наследники ConnectionError и TimeoutError, их ловит проверка ниже.
     # Отказ на RCPT TO aiosmtplib бросает списком SMTPRecipientsRefused — он не наследник
@@ -95,6 +100,15 @@ def backoff(retries: int) -> float:
     return random.uniform(delay / 2, delay)
 
 
+def retry_countdown(exc: BaseException, retries: int) -> float:
+    """Пауза перед повтором: сервис сам сказал, сколько ждать (429 Telegram, retry_after), —
+    столько плюс секунда, но не больше 60 с; иначе — backoff."""
+    retry_after = getattr(exc, "retry_after", None)
+    if isinstance(retry_after, int | float) and retry_after >= 0:
+        return min(float(retry_after) + 1, BACKOFF_MAX_SECONDS)
+    return backoff(retries)
+
+
 class BaseTask(_Task):
     """Задача, которая повторяет себя при временных сбоях: max_retries раз с паузой backoff.
 
@@ -126,7 +140,7 @@ class BaseTask(_Task):
                 # его провал Celery запишет как ожидаемый, на уровне INFO.
                 logger.error("task_retries_exhausted", error=repr(exc), retries=retries)
                 raise
-            countdown = backoff(retries)
+            countdown = retry_countdown(exc, retries)
             logger.warning(
                 "task_retry", error=repr(exc), retries=retries, countdown=round(countdown, 1)
             )

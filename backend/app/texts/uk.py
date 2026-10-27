@@ -113,6 +113,38 @@ EMAIL_SUBJECTS: dict[str, str] = {
     "invite": "Запрошення до SalesHub",
     "already_member": "Запрошення до SalesHub",
     "reset_password": "Зміна пароля в SalesHub",
+    # Уведомления CRM (раздел 16); тот же шаблон .txt — текст сообщения в Telegram.
+    "record_assigned": "Вам призначено запис у SalesHub",
+    "deal_closed": "Угоду закрито — SalesHub",
+    "bulk_job_completed": "Масову операцію завершено — SalesHub",
+    "bulk_reassigned": "Вам передано клієнтів — SalesHub",
+}
+
+# Слова для уведомлений notifier (раздел 16): подставляются в шаблоны готовыми строками.
+NOTIFY_ENTITIES: dict[str, str] = {"contact": "контакт", "deal": "угоду"}
+NOTIFY_UNKNOWN_USER = "користувач SalesHub"  # автора уже удалили — email не показать
+NOTIFY_DEAL_RESULTS: dict[str, str] = {"won": "виграно", "lost": "програно"}
+NOTIFY_BULK_KINDS: dict[str, str] = {
+    "reassign_owner": "Передача клієнтів",
+    "move_team": "Перенесення записів у новий відділ",
+    "import_contacts": "Імпорт контактів",
+    "close_overdue_deals": "Закриття прострочених угод",
+    "add_tags": "Додавання тегу",
+    "remove_tags": "Зняття тегу",
+}
+NOTIFY_BULK_STATUSES: dict[str, str] = {
+    "done": "виконано",
+    "partial_failed": "виконано частково",
+    "failed": "не виконано",
+    "cancelled": "скасовано",
+}
+# Строки итога job по сущностям (result.rows); failed — контакты, пропущенные add_tags.
+NOTIFY_BULK_ROWS: dict[str, str] = {
+    "companies": "компанії",
+    "contacts": "контакти",
+    "deals": "угоди",
+    "activities": "активності",
+    "failed": "пропущено",
 }
 
 # Telegram-бот (раздел 16). Простой текст без parse_mode: экранировать ничего не нужно.

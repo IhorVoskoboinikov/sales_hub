@@ -11,6 +11,7 @@ from typing import Any
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.errors import Conflict, NotFound, ValidationFailed
+from app.events.types import DealClosed, EventType
 from app.models import Deal, DealStatus, Pipeline, PipelineStage
 from app.repositories.crm import SoftDeleteRepository
 from app.repositories.deals import DealFilters, StageTotal
@@ -185,6 +186,27 @@ class DealService(CrmService[Deal]):
             if not closed and fields.get("owner_id") in (None, deal.owner_id):
                 fields["team_id"] = await self._reopened_team(access, deal)
         return await self._update(access, deal, version, fields)
+
+    def _events(self, access: Access, obj: Deal, before: dict[str, Any] | None) -> None:
+        """Кроме record.assigned (CrmService) — deal.closed: сделка перешла в won / lost через
+        PATCH. Сделка, созданная сразу закрытой, и массовое закрытие просроченных (bulk) события
+        не дают: первая никем не «закрывалась», второе — одна строка на job, а не на сделку."""
+        super()._events(access, obj, before)
+        if before is None or before.get("status", obj.status) == obj.status:
+            return
+        if obj.status not in (DealStatus.WON, DealStatus.LOST):
+            return
+        payload: DealClosed = {
+            "deal_id": obj.id,
+            "title": obj.title,
+            "status": str(obj.status),
+            "amount_original": str(obj.amount_original),
+            "currency_original": obj.currency_original,
+            "owner_id": str(obj.owner_id),
+            "team_id": str(obj.team_id),
+            "actor_id": str(access.user_id),
+        }
+        self.uow.outbox.add(EventType.DEAL_CLOSED, dict(payload), org_id=obj.org_id)
 
     async def _reopened_team(self, access: Access, deal: Deal) -> uuid.UUID:
         """Закрытую сделку move_team не переносит — это история, она остаётся в отделе, где её

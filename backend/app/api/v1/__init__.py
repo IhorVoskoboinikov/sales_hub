@@ -4,8 +4,8 @@
   (какие записи видны). Эндпоинты объявляются в модулях org.py, teams.py, users.py, invites.py.
 - admin_router (/api/v1/admin) — только супер-админ: OPA разрешает ему действия admin:*, Access нет.
 - auth.py — свой роутер /api/v1/auth: вход и личные данные, только current_user, без OPA.
-- me.py — свой роутер /api/v1/me: личные настройки (привязка Telegram), только current_member
-  (current_user + организация), без OPA и без строк в routes.rego.
+- me.py — свой роутер /api/v1/me: личные настройки (привязка Telegram, каналы уведомлений),
+  только current_member (current_user + организация), без OPA и без строк в routes.rego.
 
 Правило: эндпоинты объявляются прямо на роутере с полным префиксом
 (@protected_router.get("/teams")), а роутер подключается только в app (main.py) — без

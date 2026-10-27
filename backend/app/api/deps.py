@@ -31,6 +31,7 @@ from app.services.fx import FxService, NbuClient
 from app.services.imports import ImportService
 from app.services.invites import InviteService
 from app.services.members import MemberService
+from app.services.notification_settings import NotificationSettingsService
 from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
 from app.services.reports import ReportService
@@ -275,6 +276,12 @@ def get_telegram_service(
         link_ttl=timedelta(minutes=settings.telegram_link_ttl_minutes),
         bot_username=settings.telegram_bot_username if settings.telegram_enabled else None,
     )
+
+
+def get_notification_settings_service(
+    uow: UnitOfWork = Depends(get_uow),
+) -> NotificationSettingsService:
+    return NotificationSettingsService(uow)
 
 
 def get_page(

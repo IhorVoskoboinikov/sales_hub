@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.types import Text
 
 from app.core.context import get_request_id
-from app.events.types import EventType
+from app.events.types import EventType, TelegramSend
 from app.models import OutboxEvent
 
 # Где в payload команды email.send лежит одноразовый токен: context.token. Под этим именем его
@@ -75,6 +75,20 @@ class OutboxRepository:
             },
             org_id=org_id,
         )
+
+    def add_telegram(
+        self,
+        user_id: uuid.UUID,
+        text: str,
+        dedup_key: str,
+        *,
+        org_id: uuid.UUID | None = None,
+    ) -> OutboxEvent:
+        """Команда «отправить сообщение в Telegram» (раздел 16): её выполнит
+        notifications.send_telegram. Чат не записывается — его берут из telegram_links при
+        отправке: отвязанный за это время чат сообщения не получит."""
+        payload: TelegramSend = {"user_id": str(user_id), "text": text, "dedup_key": dedup_key}
+        return self.add(EventType.TELEGRAM_SEND, dict(payload), org_id=org_id)
 
     async def scrub_token(self, event_id: int) -> None:
         """Стереть сырой токен из payload после отправки письма: payload #- '{context,token}'.

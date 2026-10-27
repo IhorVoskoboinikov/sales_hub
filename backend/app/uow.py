@@ -14,6 +14,7 @@ from app.repositories.failed_tasks import FailedTaskRepository
 from app.repositories.fx import FxRateRepository
 from app.repositories.imports import ImportErrorRepository, ImportRepository
 from app.repositories.maintenance import CleanupRepository
+from app.repositories.notification_settings import NotificationSettingRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
 from app.repositories.outbox import OutboxRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
@@ -46,6 +47,7 @@ class UnitOfWork:
         self.outbox = OutboxRepository(session)
         self.sent_notifications = SentNotificationRepository(session)
         self.telegram_links = TelegramLinkRepository(session)  # раздел 16
+        self.notification_settings = NotificationSettingRepository(session)  # раздел 16
         self.bulk_jobs = BulkJobRepository(session)
         self.bulk_chunks = BulkChunkRepository(session)
         self.bulk = BulkRepository(session)

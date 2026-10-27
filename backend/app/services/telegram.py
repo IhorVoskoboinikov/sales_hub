@@ -145,7 +145,7 @@ class TelegramService:
         owner = await self._load_user(current.user_id)
         if owner is not None and can_use_bot(owner):
             raise Conflict("telegram.chat_taken")  # коммита нет — токен не погашен
-        await self.uow.telegram_links.delete(current.user_id, chat_id)
+        await self.uow.telegram_links.delete(current.user_id, chat_id, current.linked_at)
         logger.info("telegram_link_revoked", user_id=str(current.user_id), reason="access_denied")
 
     async def linked_user(self, chat_id: int) -> CachedUser | None:
@@ -157,7 +157,7 @@ class TelegramService:
             return None
         user = await self._load_user(link.user_id)
         if user is None or not can_use_bot(user):
-            await self.uow.telegram_links.delete(link.user_id, chat_id)
+            await self.uow.telegram_links.delete(link.user_id, chat_id, link.linked_at)
             await self.uow.commit()
             logger.info("telegram_link_revoked", user_id=str(link.user_id), reason="access_denied")
             raise Forbidden("telegram.access_denied")

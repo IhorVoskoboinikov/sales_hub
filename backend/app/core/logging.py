@@ -9,6 +9,9 @@ import sys
 import structlog
 from structlog.typing import Processor
 
+# Библиотеки, чьи строки INFO содержат URL запроса (раздел 16, токен бота в URL).
+QUIET_LOGGERS = ("httpx", "httpcore")
+
 
 def configure_logging(level: str, *, json: bool) -> None:
     # Общие шаги для наших логов и для логов библиотек (stdlib logging).
@@ -51,3 +54,7 @@ def configure_logging(level: str, *, json: bool) -> None:
         uvicorn_logger.setLevel(logging.NOTSET)  # уровень — общий, из LOG_LEVEL
     # Access-лог пишет AccessLogMiddleware (с шаблоном пути и request_id).
     logging.getLogger("uvicorn.access").disabled = True
+    # На INFO httpx пишет строку на каждый запрос с полным URL, а в URL Bot API — токен бота
+    # (…/bot<token>/sendMessage): он попал бы в Loki. Ошибки наши клиенты логируют сами.
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)

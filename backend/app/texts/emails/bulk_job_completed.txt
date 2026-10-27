@@ -1,0 +1,4 @@
+Масову операцію «{{ operation }}» завершено: {{ status }}.
+Оброблено записів: {{ processed }} з {{ total }}.
+{% if rows %}Змінено: {{ rows }}.
+{% endif %}Помилок у рядках: {{ failed_rows }}, невдалих частин: {{ failed_chunks }}.

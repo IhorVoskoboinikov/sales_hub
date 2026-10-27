@@ -1,10 +1,10 @@
 """Ресурсы процесса: пул Postgres, Redis, HTTP-клиент, файл ролей, хранилище файлов (S3),
-отправка писем.
+отправка писем и сообщений в Telegram.
 
 Собирает их одна функция — для API (lifespan в main.py), для воркеров (workers/runtime.py) и
 для бота (bot/__main__.py), поэтому таймауты у всех одинаковые, а отличаются размер пула и то,
-что SMTP-отправитель есть только у воркеров (for_worker=True): с шага 5.3 API почту не
-отправляет (раздел 15).
+что SMTP-отправитель и клиент Bot API есть только у воркеров (for_worker=True): с шага 5.3 API
+почту не отправляет, а с 5.12 сообщения в Telegram отправляет тоже воркер (раздел 15).
 Соединения открываются лениво — при первом запросе, а не при создании. Клиент S3 тоже: он
 создаётся внутри event loop при первом обращении и закрывается в aclose() (app/storage/s3.py).
 """
@@ -20,6 +20,7 @@ from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.db.session import create_engine, create_session_factory
 from app.emails.sender import EmailSender, SmtpEmailSender
+from app.notifications.telegram import TelegramClient
 from app.services.fx import NbuClient
 from app.storage import FileStorage, S3FileStorage
 
@@ -39,6 +40,9 @@ class Resources:
     storage: FileStorage  # один клиент S3 на процесс: API загружает файлы импорта, воркер читает
     # Только у воркеров: API пишет команду email.send в outbox, письмо отправляет воркер.
     email_sender: EmailSender | None
+    # Тоже только у воркеров и только с токеном бота: без него send_telegram пропускает
+    # сообщения (раздел 16, «Запуск»). Тот же HTTP-клиент процесса — его подменяет respx.
+    telegram: TelegramClient | None = None
 
     @classmethod
     def create(
@@ -52,7 +56,7 @@ class Resources:
     ) -> "Resources":
         """roles — уже прочитанный файл ролей (API читает его при сборке приложения),
         иначе он читается здесь. Нет файла — RuntimeError: процесс не стартует.
-        for_worker — собрать и отправителя писем (у API его нет)."""
+        for_worker — собрать и отправителей писем и сообщений (у API их нет)."""
         # Файл ролей — первым: при ошибке пул и HTTP-клиент ещё не созданы, закрывать нечего.
         if roles is None:
             roles = RoleCatalog.load(settings.policies_dir)
@@ -75,6 +79,7 @@ class Resources:
             roles=roles,
             storage=S3FileStorage.from_settings(settings),
             email_sender=smtp_sender(settings) if for_worker else None,
+            telegram=telegram_client(settings, http) if for_worker else None,
         )
 
     async def aclose(self) -> None:
@@ -93,4 +98,14 @@ def smtp_sender(settings: Settings) -> SmtpEmailSender:
         username=settings.smtp_username,
         password=settings.smtp_password.get_secret_value() if settings.smtp_password else None,
         start_tls=settings.smtp_start_tls,
+    )
+
+
+def telegram_client(settings: Settings, http: httpx.AsyncClient) -> TelegramClient | None:
+    """Клиент Bot API для отправки из воркера; None — токена нет (имя бота для отправки не
+    нужно — только для ссылки привязки)."""
+    if settings.telegram_bot_token is None:
+        return None
+    return TelegramClient(
+        http, settings.telegram_bot_token.get_secret_value(), settings.telegram_api_url
     )

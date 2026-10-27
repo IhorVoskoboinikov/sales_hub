@@ -18,7 +18,7 @@ from app.models.email_token import EmailToken, EmailTokenPurpose
 from app.models.failed_tasks import FailedTask
 from app.models.fx import FxRate
 from app.models.imports import ContactStaging, ImportRowError
-from app.models.notifications import NotificationChannel, SentNotification
+from app.models.notifications import NotificationChannel, NotificationSetting, SentNotification
 from app.models.organization import Organization, Team
 from app.models.outbox import OutboxEvent
 from app.models.refresh_token import RefreshToken
@@ -51,6 +51,7 @@ __all__ = [
     "ImportRowError",
     "Note",
     "NotificationChannel",
+    "NotificationSetting",
     "Organization",
     "OutboxEvent",
     "Pipeline",

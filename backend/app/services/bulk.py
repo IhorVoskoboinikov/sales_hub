@@ -5,8 +5,8 @@
    bulk_jobs (pending) → commit → bulk.plan best-effort через TaskQueue → 202.
 2. plan: границы чанков по реальным строкам выборки, строки bulk_job_chunks, job → running.
 3. run_chunk: одна транзакция на чанк; повтор ничего не делает (строка чанка уже не pending).
-4. finalize_if_complete: условный UPDATE завершает job ровно один раз, победитель пишет итог и
-   одну строку журнала.
+4. finalize_if_complete: условный UPDATE завершает job ровно один раз, победитель пишет итог,
+   одну строку журнала и одно событие bulk_job.completed (уведомления автору и получателю).
 
 Закрытие просроченных сделок и теги сегмента (шаг 5.7) — те же шаги: start_close_overdue_deals
 и start_tags проверяют параметры, дальше общие plan / чанк / finalize; выборка вида — одна
@@ -34,6 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.errors import Conflict, NotFound, ValidationFailed
+from app.events.types import BulkJobCompleted, EventType
 from app.models import (
     BulkEntity,
     BulkJob,
@@ -612,10 +613,11 @@ class BulkService:
         return finished.status
 
     async def _record_final(self, job_id: uuid.UUID, finished: FinishedJob) -> None:
-        """Итог job и одна строка журнала — в транзакции того, кто сделал финальный переход:
-        finalize, отмена pending-job, reaper, который сдался, или финал импорта. Переход —
-        условный UPDATE, поэтому итог пишется ровно один раз. У импорта здесь же удаляются
-        строки staging (_import_final)."""
+        """Итог job, одна строка журнала и одно событие bulk_job.completed — в транзакции того,
+        кто сделал финальный переход: finalize, отмена pending-job, reaper, который сдался, или
+        финал импорта. Переход — условный UPDATE, поэтому всё это пишется ровно один раз. У
+        импорта здесь же удаляются строки staging (_import_final)."""
+        entity_rows: dict[str, int] | None = None  # result.rows для события; у импорта — нет
         if finished.kind == BulkJobKind.IMPORT_CONTACTS:
             rows = await self._import_final(job_id)
         else:
@@ -626,6 +628,7 @@ class BulkService:
                 # Контакты, пропущенные из-за предела в 20 тегов, — в итоге и журнале.
                 rows["failed"] = (await self._reload(job_id)).failed_rows
             await self.uow.bulk_jobs.set_result(job_id, {"rows": rows})
+            entity_rows = rows
         self.uow.audit.record(
             actor_id=finished.owner_id,
             org_id=finished.org_id,
@@ -634,7 +637,31 @@ class BulkService:
             entity_id=job_id,
             changes=self._audit_changes(finished, rows),
         )
+        await self._completed_event(job_id, finished, entity_rows)
         logger.info("bulk_job_finished", job_id=str(job_id), status=finished.status, rows=rows)
+
+    async def _completed_event(
+        self, job_id: uuid.UUID, finished: FinishedJob, rows: dict[str, int] | None
+    ) -> None:
+        """bulk_job.completed (раздел 16): автору — итог, получателю reassign_owner — «вам
+        передано N клієнтів». Одно событие на job вместо события на каждую строку — иначе
+        передача 100 тыс. клиентов дала бы 100 тыс. сообщений. Счётчики — из свежей строки job
+        (их меняли чанки в своих транзакциях)."""
+        job = await self._reload(job_id)
+        to_user_id = finished.params.get("to_user_id")
+        payload: BulkJobCompleted = {
+            "job_id": str(job_id),
+            "kind": finished.kind,
+            "status": finished.status,
+            "total": job.total,
+            "processed": job.processed,
+            "failed_rows": job.failed_rows,
+            "failed_chunks": job.failed_chunks,
+            "rows": rows,
+            "author_id": str(finished.owner_id),
+            "to_user_id": str(to_user_id) if to_user_id else None,
+        }
+        self.uow.outbox.add(EventType.BULK_JOB_COMPLETED, dict(payload), org_id=finished.org_id)
 
     async def _import_final(self, job_id: uuid.UUID) -> dict[str, int]:
         """Финальный переход импорта — любой: его собственный финал, отмена pending, reaper,

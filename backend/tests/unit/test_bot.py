@@ -73,6 +73,8 @@ def test_me_routes_have_no_opa_and_need_member() -> None:
         "POST /api/v1/me/telegram/link",
         "GET /api/v1/me/telegram",
         "DELETE /api/v1/me/telegram",
+        "GET /api/v1/me/notifications",
+        "PUT /api/v1/me/notifications",
     }
     for route in routes:
         assert opa_decision not in calls(route.dependant), route.path

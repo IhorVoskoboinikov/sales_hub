@@ -18,7 +18,7 @@ from structlog.testing import capture_logs
 
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
-from app.models import AuditEntry, BulkJob, BulkJobChunk, ContactStaging, User
+from app.models import AuditEntry, BulkJob, BulkJobChunk, ContactStaging, OutboxEvent, User
 from app.services.bulk import BulkService, ReapPolicy, ReapReport, ReassignOwnerRequest
 from app.uow import UnitOfWork
 from app.workers.queue import broker_queue_length
@@ -133,6 +133,17 @@ async def audit_of(uow: UnitOfWork, job_id: uuid.UUID) -> list[AuditEntry]:
     )
 
 
+async def completed_events(uow: UnitOfWork, job_id: uuid.UUID) -> list[dict[str, Any]]:
+    """bulk_job.completed этой job (раздел 16): пишет тот, кто сделал финальный переход."""
+    rows = await uow.session.scalars(
+        select(OutboxEvent.payload).where(
+            OutboxEvent.event_type == "bulk_job.completed",
+            OutboxEvent.payload["job_id"].astext == str(job_id),
+        )
+    )
+    return [dict(row) for row in rows]
+
+
 def sent_for(queue: FakeTaskQueue, job_id: uuid.UUID) -> list[tuple[str, tuple[Any, ...]]]:
     """Что reaper поставил для этой job (в базе могут быть и чужие job других тестов)."""
     return [(name, args) for name, args in queue.enqueued if args[0] == str(job_id)]
@@ -213,6 +224,9 @@ async def test_pending_job_gives_up_after_max_reaps(
     assert job.finished_at is not None
     [entry] = await audit_of(uow, job_id)
     assert (entry.action, entry.changes["status"]) == ("bulk.reassign_owner", "failed")
+    # Сдавшийся reaper (fail_stuck) — тоже финальный переход: автору приходит итог.
+    [completed] = await completed_events(uow, job_id)
+    assert (completed["status"], completed["author_id"]) == ("failed", str(people.admin_id))
 
 
 # --- (2) потерянный finalize
@@ -358,6 +372,12 @@ async def test_stalled_job_gives_up_after_max_reaps(
     [entry] = await audit_of(uow, job_id)
     assert entry.changes["status"] == "failed"
     assert entry.changes["rows"] == {"contacts": 2}
+    [completed] = await completed_events(uow, job_id)
+    assert (completed["status"], completed["processed"], completed["rows"]) == (
+        "failed",
+        2,
+        {"contacts": 2},
+    )
 
 
 async def test_stalled_cancelling_job_gives_up_as_cancelled(

@@ -35,6 +35,7 @@ from app.models import (
     ContactStaging,
     ImportRowError,
     Organization,
+    OutboxEvent,
     Role,
     Team,
     User,
@@ -105,6 +106,8 @@ async def committed(
     finally:
         async with sessions() as s:
             await s.execute(delete(AuditEntry).where(AuditEntry.org_id == org_id))
+            # bulk_job.completed финала job: иначе его подобрал бы relay чужого теста.
+            await s.execute(delete(OutboxEvent).where(OutboxEvent.org_id == org_id))
             # staging и ошибки строк — каскадом от job
             await s.execute(delete(BulkJob).where(BulkJob.org_id == org_id))
             await s.execute(delete(Contact).where(Contact.org_id == org_id))

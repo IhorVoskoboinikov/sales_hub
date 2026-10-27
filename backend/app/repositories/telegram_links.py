@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Collection
 from datetime import datetime
 
 from sqlalchemy import delete, select
@@ -26,6 +27,16 @@ class TelegramLinkRepository:
             .execution_options(populate_existing=True)
         )
 
+    async def linked(self, user_ids: Collection[uuid.UUID]) -> set[uuid.UUID]:
+        """Кто из этих пользователей привязал Telegram — notifier пишет telegram.send только им."""
+        if not user_ids:
+            return set()
+        return set(
+            await self.session.scalars(
+                select(TelegramLink.user_id).where(TelegramLink.user_id.in_(list(user_ids)))
+            )
+        )
+
     async def upsert(
         self, user_id: uuid.UUID, chat_id: int, username: str | None, now: datetime
     ) -> None:
@@ -49,11 +60,14 @@ class TelegramLinkRepository:
     async def delete_for_user(self, user_id: uuid.UUID) -> None:
         await self.session.execute(delete(TelegramLink).where(TelegramLink.user_id == user_id))
 
-    async def delete(self, user_id: uuid.UUID, chat_id: int) -> None:
-        """Удалить именно эту пару: свежую перепривязку к другому чату или чата к другому
-        пользователю это не задевает."""
+    async def delete(self, user_id: uuid.UUID, chat_id: int, linked_at: datetime) -> None:
+        """Удалить именно ту привязку, которую прочитали: пару (user_id, chat_id) и её
+        linked_at. Свежую перепривязку это не задевает — ни к другому чату, ни к тому же: upsert
+        тот же chat_id оставляет, а linked_at меняет."""
         await self.session.execute(
             delete(TelegramLink).where(
-                TelegramLink.user_id == user_id, TelegramLink.chat_id == chat_id
+                TelegramLink.user_id == user_id,
+                TelegramLink.chat_id == chat_id,
+                TelegramLink.linked_at == linked_at,
             )
         )

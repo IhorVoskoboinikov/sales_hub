@@ -8,6 +8,7 @@ Outbox внутри транзакции теста доставляет фик�
 """
 
 import asyncio
+import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
 from contextlib import asynccontextmanager
@@ -62,6 +63,7 @@ from app.models import (
     Team,
     User,
 )
+from app.notifications.telegram import TelegramClient
 from app.services.bulk import BulkService
 from app.services.notifications import NotificationService
 from app.storage import S3FileStorage, StoredFile
@@ -317,6 +319,9 @@ def celery_worker(
             policies_dir=POLICIES_DIR,
             jwt_private_key_file=jwt_key_file,
             nbu_url=NBU_URL,
+            # notifications.send_telegram шлёт в подменённый Bot API (FakeTelegram теста).
+            telegram_bot_token=SecretStr(TELEGRAM_TOKEN),
+            telegram_api_url=TELEGRAM_API_URL,
             **s3_settings(rustfs),
         )
     )
@@ -430,7 +435,7 @@ def app(
     return app
 
 
-Handler = Callable[[int], Awaitable[None]]
+Handler = Callable[[int], Awaitable[object]]
 
 
 class InlinePublisher:
@@ -466,10 +471,19 @@ DeliverOutbox = Callable[[], Awaitable[int]]
 
 
 @pytest.fixture
-def deliver_outbox(db_session: AsyncSession, settings: Settings) -> DeliverOutbox:
-    """deliver_outbox() — доставить outbox этого теста: письма уходят в Mailpit контейнера."""
-    notifications = NotificationService(UnitOfWork(db_session), smtp_sender(settings))
-    handlers: dict[str, Handler] = {"notifications.send_email": notifications.send_email}
+def deliver_outbox(
+    db_session: AsyncSession, settings: Settings, telegram_client: TelegramClient
+) -> DeliverOutbox:
+    """deliver_outbox() — доставить outbox этого теста: notifier пишет команды, письма уходят в
+    Mailpit контейнера, сообщения Telegram — в подменённый Bot API (telegram_api)."""
+    notifications = NotificationService(
+        UnitOfWork(db_session), smtp_sender(settings), telegram_client
+    )
+    handlers: dict[str, Handler] = {
+        "notifications.send_email": notifications.send_email,
+        "notifications.notify": notifications.notify,
+        "notifications.send_telegram": notifications.send_telegram,
+    }
 
     async def run() -> int:
         return await deliver_inline(db_session, handlers)
@@ -699,18 +713,69 @@ class FakeNbu:
         )
 
 
+TELEGRAM_API_URL = "http://telegram.test"
+TELEGRAM_TOKEN = "123456:TEST-secret-token"
+
+
+@dataclass
+class FakeTelegram:
+    """Подмена Bot API (respx): sent — (chat_id, text, тело запроса) каждого sendMessage;
+    responses — заготовленные ответы по очереди (пусто — 200 ok); paths — пути запросов (в них
+    токен бота)."""
+
+    sent: list[tuple[int, str, dict[str, Any]]] = field(default_factory=list)
+    responses: list[httpx.Response] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
+
+    def respond(self, request: httpx.Request) -> httpx.Response:
+        self.paths.append(request.url.path)
+        if self.responses:
+            return self.responses.pop(0)
+        body = json.loads(request.content)
+        self.sent.append((body["chat_id"], body["text"], body))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": len(self.sent)}})
+
+    def texts(self, chat_id: int) -> list[str]:
+        return [text for chat, text, _ in self.sent if chat == chat_id]
+
+
+@dataclass(frozen=True)
+class ExternalApis:
+    nbu: FakeNbu
+    telegram: FakeTelegram
+
+
 @pytest.fixture(autouse=True)
-async def nbu(redis_url: str) -> AsyncIterator[FakeNbu]:
-    fake = FakeNbu(dict(NBU_RATES))
+async def external_apis(redis_url: str) -> AsyncIterator[ExternalApis]:
+    """НБУ и Bot API подменены во всех integration-тестах: в интернет тесты не ходят."""
+    apis = ExternalApis(FakeNbu(dict(NBU_RATES)), FakeTelegram())
     # Кэш курсов в Redis общий на весь запуск — каждый тест начинает с пустого.
     redis = Redis.from_url(redis_url)
     async for key in redis.scan_iter("fx:*"):
         await redis.delete(key)
     await redis.aclose()
     with respx.mock(assert_all_called=False) as router:
-        router.get(NBU_URL).mock(side_effect=fake.respond)
+        router.get(NBU_URL).mock(side_effect=apis.nbu.respond)
+        router.post(url__startswith=TELEGRAM_API_URL).mock(side_effect=apis.telegram.respond)
         router.route().pass_through()  # OPA, Mailpit — настоящие
-        yield fake
+        yield apis
+
+
+@pytest.fixture
+def nbu(external_apis: ExternalApis) -> FakeNbu:
+    return external_apis.nbu
+
+
+@pytest.fixture
+def telegram_api(external_apis: ExternalApis) -> FakeTelegram:
+    return external_apis.telegram
+
+
+@pytest.fixture
+async def telegram_client() -> AsyncIterator[TelegramClient]:
+    """Клиент Bot API на подменённый адрес — как у воркера с токеном бота."""
+    async with httpx.AsyncClient() as http:
+        yield TelegramClient(http, TELEGRAM_TOKEN, TELEGRAM_API_URL)
 
 
 @pytest.fixture

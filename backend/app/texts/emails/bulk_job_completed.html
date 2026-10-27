@@ -1,0 +1,7 @@
+{% extends "_notification.html" %}
+{% block content %}
+<p>Масову операцію «{{ operation }}» завершено: <b>{{ status }}</b>.</p>
+<p>Оброблено записів: {{ processed }} з {{ total }}.</p>
+{% if rows %}<p>Змінено: {{ rows }}.</p>{% endif %}
+<p>Помилок у рядках: {{ failed_rows }}, невдалих частин: {{ failed_chunks }}.</p>
+{% endblock %}

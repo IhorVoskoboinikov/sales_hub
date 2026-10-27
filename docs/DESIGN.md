@@ -1560,8 +1560,31 @@ CI проверяет каждый PR (качество, тесты, мигра�
 | `monitoring` | `promtool check rules`, `promtool test rules` | — |
 | `frontend` (если есть) | `npm ci`, lint, `vitest`, `vite build` | — |
 | `policy` | `make policy-test`: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies` и `--coverage --threshold 90` (OPA 1.21.3 из Docker), перед ними Regal 0.43.0 (линтер Rego, `.regal/config.yaml`; замечания — аннотациями в PR) | — |
+| `ci-ok` | агрегатор: `if: always()`, `needs` — все jobs выше; падает, если хоть один `failure`, `cancelled` или `skipped`. Единственная обязательная проверка защиты `main`; `tests/unit/test_ci.py` падает, если новый job забыли добавить в `needs` | все |
 
 Параллельность: всё, что не зависит друг от друга, идёт одновременно; кэш uv и Docker-слоёв обязателен, иначе CI будет медленным. `integration` — самый долгий job, поэтому он не ждёт `lint` (быстрая ошибка линтера экономит минуты раннера, но не время до результата; минуты публичного репозитория бесплатны). Кэш uv — `setup-uv` с `enable-cache` (ключ — `uv.lock`), версия uv закреплена (`version: "0.11.6"`) и совпадает с Dockerfile: CI и образ ставят зависимости одним и тем же uv. Образы testcontainers не кэшируются: ~1 ГБ через `docker save/load` грузился бы дольше, чем скачивается, а лимитов Docker Hub у раннеров GitHub нет. Новый пуш в PR отменяет идущий прогон, пуш в `main` — нет (иначе у коммита быстрого второго мержа не осталось бы результата CI). Ветка `main` защищена: мерж только при зелёных обязательных проверках.
+
+### Защита ветки `main` (шаг 6.6)
+
+Включается руками в настройках GitHub, один раз; в репозитории — `.github/rulesets/main.json` (его можно импортировать) и job `ci-ok`.
+
+**Ruleset, а не классическая защита ветки.** Оба механизма умеют не пускать мерж без CI. Ruleset новее: его можно выключить, не удаляя, правила видны всем, у кого есть доступ на чтение (поэтому их проверяет `curl` без токена), обходы — явным списком. Включать оба не нужно — они складываются, и разбираться в них сложнее.
+
+**Одна обязательная проверка — `ci-ok`.** Требовать каждый job по отдельности неудобно: новый job (а их добавят этапы 7–9) — снова правка настроек; job-матрица даёт проверки `integration (1)`, `integration (2)`, и обязательная `integration` ждала бы вечно; workflow, пропущенный фильтром `paths`, оставляет обязательную проверку в «Expected» навсегда. Поэтому `on: pull_request` без `paths`, а обязательна только `ci-ok`. Имя проверки — id job-а (`ci-ok`), а не подпись `CI / ci-ok (pull_request)` со страницы PR; источник — GitHub Actions (`integration_id` 15368), чтобы её не подделал статус из другого места.
+
+| Правило | Значение | Почему |
+| --- | --- | --- |
+| Цель | ветка по умолчанию (`~DEFAULT_BRANCH`) | переживёт переименование `main` |
+| Restrict deletions, Block force pushes | вкл. | историю `main` не переписать и ветку не удалить |
+| Require a pull request | вкл., **0 одобрений** | в `main` — только через PR; одобрить свой PR GitHub не даёт, с 1 одобрением мерж был бы невозможен |
+| Require status checks | `ci-ok` из GitHub Actions | PR нельзя смержить без зелёного CI |
+| Require branches to be up to date | вкл. | смержен ровно тот результат, что проверен; если `main` ушёл вперёд — «Update branch» и CI ещё раз |
+| Linear history | выкл. | этапы мержатся merge-коммитами («Merge pull request #5») |
+| Обходы (bypass list) | пусто | иначе «нельзя без зелёного CI» не правда; в аварии — ruleset в Disabled и обратно |
+
+**Как включить.** Сначала `ci-ok` должен хоть раз отработать — запушить ветку с этим job-ом и открыть PR: иначе поиск проверок в настройках его не предложит, а PR без такого job-а повис бы в «Expected». Дальше Settings → Rules → Rulesets → New ruleset → **Import a ruleset** → файл `.github/rulesets/main.json` → Create. Или то же руками: New branch ruleset, имя `main protection`, Enforcement `Active`, Target — Include default branch, отметить правила из таблицы, в Require status checks → Add checks → `ci-ok`, источник GitHub Actions. Через API — `POST /repos/IhorVoskoboinikov/sales_hub/rulesets` с этим же JSON (токен с правом Administration: write); повторный POST создаёт второй ruleset, правка — `PUT …/rulesets/{id}`.
+
+**Как проверить.** `curl -s https://api.github.com/repos/IhorVoskoboinikov/sales_hub/rules/branches/main | jq '.[].type'` → `deletion`, `non_fast_forward`, `pull_request`, `required_status_checks`. И на деле: PR с заведомо падающим тестом — кнопка мержа заблокирована; `git push origin main` — отказ.
 
 ### CD — `.github/workflows/cd.yml` (на push в main и теги `v*`)
 
@@ -1828,7 +1851,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 - [x] 6.3 Job `openapi`: `python -m app.cli export-openapi` → `backend/openapi.json` в git (`make openapi`); CI проверяет, что файл свежий, и сравнивает его с файлом из `main` через `oasdiff` — ломающие изменения подсвечиваются аннотациями и списком в Summary, job из-за них не падает.
 - [x] 6.4 Job `build`: `docker/build-push-action` с кэшем слоёв `type=gha`, без публикации, и проверка, что образ без dev-зависимостей импортирует приложение и воркеры.
 - [x] 6.5 Скорость: integration в 4 процесса (`pytest-xdist -n 4`, у каждого свои контейнеры), integration без `needs: lint`, одна версия uv в CI и Dockerfile, кэш uv; отмена устаревших прогонов только у PR.
-- [ ] 6.6 Обязательная проверка: job-агрегатор `ci-ok` (зелёный, только если зелёные все jobs) и ruleset на `main` — PR, `ci-ok` из GitHub Actions, ветка свежая, без force push и удаления; включается руками в GitHub по инструкции из раздела 12.
+- [ ] 6.6 Обязательная проверка: job-агрегатор `ci-ok` (зелёный, только если зелёные все jobs; `test_ci.py` следит, что в его `needs` все jobs) и ruleset на `main` — PR, `ci-ok` из GitHub Actions, ветка свежая, без force push и удаления; ruleset — `.github/rulesets/main.json`, включается руками в GitHub по инструкции из раздела 12, «Защита ветки `main`». **Код готов; осталось включить ruleset** — галочка после этого.
 
 **Готово, когда:** PR нельзя смержить без зелёного CI, полный прогон занимает меньше 10 минут.
 

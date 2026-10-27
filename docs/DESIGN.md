@@ -1325,6 +1325,8 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 3. `alembic downgrade base` → `upgrade head` — миграции обратимы.
 4. Проверка «одна голова» (`alembic heads` = 1), чтобы параллельные ветки не сломали историю.
 
+Все четыре — `backend/scripts/check_migrations.sh` (голова проверяется первой: без базы и с понятным сообщением). Его запускают job `migrations` на пустом Postgres-сервисе Actions (`postgres:18.6`, как в compose) и `make migrations-check` — на одноразовом контейнере (порт 55432, удаляется после проверки): скрипт делает `downgrade base`, поэтому на базе стенда его не запускают. Нужен только `DATABASE_URL` — остальные настройки при импорте моделей не читаются. `ensure-partitions` в проверку не входит: партиции на два месяца вперёд создаёт сама миграция. Отдельного pytest-теста миграций нет (до шага 6.2 был `test_migrations.py`): те же проверки шли бы дважды, а `downgrade base` посреди прогона стирал бы общую базу тестов.
+
 ## 10. Тесты
 
 Три уровня: unit — сервисы и authz без БД (fake UoW), integration — реальные Postgres и Redis в контейнерах, e2e — несколько сценариев против поднятого стенда. Самый ценный набор — матрица прав «роль × эндпоинт × чужой/свой объект», генерируемая из кода.
@@ -1334,7 +1336,7 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 | Уровень | Что тестируем | Инструменты | Скорость |
 | --- | --- | --- | --- |
 | unit | `Access.matches` / `ensure_allowed`, `sql_filter` (компиляция SQL), сервисы с `FakeUnitOfWork`, правила управления пользователями (нельзя менять себе роль, отдел обязателен), нарезка чанков, маппинг ошибок | pytest, pytest-asyncio, polyfactory | секунды |
-| integration | репозитории на настоящем Postgres, API через `httpx.AsyncClient(transport=ASGITransport(app))`, миграции, Celery-задачи с реальным воркером на Redis из testcontainers, бот через `feed_update` | testcontainers (postgres, redis), factory-boy | десятки секунд |
+| integration | репозитории на настоящем Postgres, API через `httpx.AsyncClient(transport=ASGITransport(app))`, Celery-задачи с реальным воркером на Redis из testcontainers, бот через `feed_update` | testcontainers (postgres, redis), factory-boy | десятки секунд |
 | e2e (smoke) | логин → создать контакт → передать клиентов (bulk) → дождаться job | pytest против `tilt`/kind-стенда | минуты, в CD |
 | нагрузка (опц.) | список контактов и bulk на 5 млн | locust / k6 | вручную |
 | policy (Rego) | роль × эндпоинт (allow / 403), опечатки в действиях и уровнях `data.yaml` | opa test --coverage, Regal (линтер) | миллисекунды |
@@ -1550,8 +1552,8 @@ CI проверяет каждый PR (качество, тесты, мигра�
 | --- | --- | --- |
 | `lint` | `ruff check`, `ruff format --check`, `mypy app` | — |
 | `unit` | `pytest tests/unit` (без покрытия — оно считается в `integration`) | — |
-| `integration` | `make coverage`: все тесты (unit + integration) с покрытием и порогами раздела 10; Postgres, Redis, OPA и др. поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре; там же проверки миграций (одна голова, `alembic check`, downgrade → upgrade) | lint |
-| `migrations` | upgrade → `alembic check` → downgrade base → upgrade; одна голова | lint |
+| `integration` | `make coverage`: все тесты (unit + integration) с покрытием и порогами раздела 10; Postgres, Redis, OPA и др. поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре | lint |
+| `migrations` | `scripts/check_migrations.sh` на Postgres-сервисе: одна голова → upgrade → `alembic check` → downgrade base → upgrade (раздел 9) | lint |
 | `openapi` | экспорт `openapi.json`, diff с main (ломающие изменения подсвечиваются) | lint |
 | `build` | `docker buildx` с кэшем GHA, без push | unit |
 | `helm` | `helm lint`, `helm template` + `kubeconform` | — |
@@ -1822,7 +1824,7 @@ deploy/
 CI растёт с этапа 1; здесь он доводится до полного набора из раздела 12.
 
 - [x] 6.1 Уровни тестов: маркеры `unit` / `integration` (ставятся по каталогу) и `policy` (код, который обязан совпадать с `policies/`), `strict = true` в pytest, `make test-policy`; покрытие — ядро `sysmon`, только строки (без `branch` и `concurrency = greenlet`: с ними sysmon на 3.13 откатывается на ctrace, а ctrace без greenlet теряет строки после `await`), пороги 80% для `services/` и `authz/` и 90% всего — на общем покрытии unit + integration в job `integration` (unit сам по себе покрывает `services/` на 37%); Regal в `make policy-test` и job `policy`.
-- [ ] 6.2 Job `migrations`: `scripts/check_migrations.sh` (одна голова → upgrade → `alembic check` → downgrade base → upgrade) на пустом Postgres-сервисе Actions и `make migrations-check` с одноразовым контейнером; `test_migrations.py` удаляется — его проверки переехали в job, а downgrade посреди общего прогона мешает xdist.
+- [x] 6.2 Job `migrations`: `scripts/check_migrations.sh` (одна голова → upgrade → `alembic check` → downgrade base → upgrade) на пустом Postgres-сервисе Actions и `make migrations-check` с одноразовым контейнером; `test_migrations.py` удаляется — его проверки переехали в job, а downgrade посреди общего прогона мешает xdist.
 - [ ] 6.3 Job `openapi`: `python -m app.cli export-openapi` → `backend/openapi.json` в git (`make openapi`); CI проверяет, что файл свежий, и сравнивает его с файлом из `main` через `oasdiff` — ломающие изменения подсвечиваются аннотациями и списком в Summary, job из-за них не падает.
 - [ ] 6.4 Job `build`: `docker/build-push-action` с кэшем слоёв `type=gha`, без публикации, и проверка, что образ без dev-зависимостей импортирует приложение и воркеры.
 - [ ] 6.5 Скорость: integration в 4 процесса (`pytest-xdist -n 4`, у каждого свои контейнеры), integration без `needs: lint`, одна версия uv в CI и Dockerfile, кэш uv; отмена устаревших прогонов только у PR.

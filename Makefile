@@ -8,7 +8,7 @@ REGAL_ARGS ?=
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate revision run test test-unit test-integration test-policy coverage lint fmt policy-lint policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
+.PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate migrations-check revision run test test-unit test-integration test-policy coverage lint fmt policy-lint policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -83,6 +83,16 @@ bench-updates:  ## замеры способов UPDATE на копии contacts
 CHAOS ?=
 chaos:  ## chaos-тест bulk на стенде make up: kill воркера посреди job, ~22 мин (CHAOS="--scenario a")
 	$(BACKEND) uv run python scripts/chaos.py $(CHAOS)
+
+PG_CHECK = saleshub-migrations-check
+migrations-check:  ## проверки миграций, как в CI: одноразовый Postgres, одна голова, upgrade, check, downgrade, upgrade
+	@docker rm -f $(PG_CHECK) > /dev/null 2>&1 || true
+	@docker run -d --rm --name $(PG_CHECK) -e POSTGRES_USER=saleshub -e POSTGRES_PASSWORD=saleshub \
+		-e POSTGRES_DB=saleshub -p 127.0.0.1:55432:5432 postgres:18.6 > /dev/null
+	@trap 'docker rm -f $(PG_CHECK) > /dev/null' EXIT; \
+	until docker exec $(PG_CHECK) pg_isready -q -U saleshub -d saleshub -h 127.0.0.1; do sleep 1; done; \
+	cd backend && DATABASE_URL=postgresql+asyncpg://saleshub:saleshub@127.0.0.1:55432/saleshub \
+		bash scripts/check_migrations.sh
 
 refresh-reports:  ## обновить отчёты (materialized view deal_stats) в compose
 	$(COMPOSE) exec api python -m app.cli refresh-reports

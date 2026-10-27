@@ -53,6 +53,32 @@ jobs:
       - run: make coverage
         working-directory: .
 
+  # Миграции (раздел 9) на пустой базе: одна голова, upgrade → check → downgrade base → upgrade.
+  migrations:
+    needs: lint
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6  # как в compose и testcontainers
+        env:
+          POSTGRES_USER: saleshub
+          POSTGRES_PASSWORD: saleshub
+          POSTGRES_DB: saleshub
+        ports: ["5432:5432"]
+        # -h 127.0.0.1: пока образ инициализирует базу, он слушает только сокет — ждём настоящий сервер
+        options: >-
+          --health-cmd "pg_isready -U saleshub -d saleshub -h 127.0.0.1"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@localhost:5432/saleshub
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # у setup-uv нет тега v10, только точные версии
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: bash scripts/check_migrations.sh
+
   # Политики OPA (раздел 5): Regal, формат, строгая проверка, opa test и покрытие не ниже 90%.
   # Та же версия OPA, что в compose и testcontainers; ставить opa и regal не нужно — make запускает их в Docker.
   policy:

@@ -114,6 +114,31 @@ jobs:
           $OASDIFF changelog backend/tmp/openapi.base.json backend/openapi.json --format markdown >> "$GITHUB_STEP_SUMMARY"
           $OASDIFF breaking backend/tmp/openapi.base.json backend/openapi.json --format githubactions
 
+  # Образ API и воркеров (раздел 11): собирается, но не публикуется — публикация в cd.yml (этап 9).
+  # Слои кэшируются в кэше GitHub Actions: без изменений uv.lock зависимости не ставятся заново.
+  build:
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: backend
+          target: runtime
+          push: false
+          load: true  # образ нужен следующему шагу
+          tags: saleshub-api:ci
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max  # max: и слои стадии builder (uv sync)
+      # Образ ставит зависимости без dev-группы (uv sync --no-dev): всё, что запускает compose,
+      # должно импортироваться и без неё. Сеть не нужна — проверяется только сам образ.
+      - name: Smoke check
+        run: >-
+          docker run --rm --network none saleshub-api:ci sh -c
+          'python -c "import app.main, app.cli, app.workers.celery_app, app.events.relay, app.bot"
+          && alembic --help > /dev/null && celery --version'
+
   # Политики OPA (раздел 5): Regal, формат, строгая проверка, opa test и покрытие не ниже 90%.
   # Та же версия OPA, что в compose и testcontainers; ставить opa и regal не нужно — make запускает их в Docker.
   policy:

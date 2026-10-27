@@ -5,15 +5,21 @@
 
 Обе формы — это три ветки own / team / org; тест test_access_forms проверяет, что они
 отвечают одинаково на всех сочетаниях. Третья форма — es_filter() — появится с поиском (этап 9).
+
+Массовая операция (раздел 6) хранит Access автора в bulk_jobs.params (to_params), а воркер
+восстанавливает его в каждом чанке (from_params): чанк обновляет только строки в уровне автора.
+
+Вне HTTP (бот, задачи beat — раздел 16) Access строится без OPA: for_user() берёт уровень роли
+из data.yaml, а own() сужает его до своих записей.
 """
 
 import uuid
-from dataclasses import dataclass
-from typing import Any, Protocol
+from dataclasses import dataclass, replace
+from typing import Any, Protocol, cast
 
 from sqlalchemy import ColumnElement, and_, false
 
-from app.authz.roles import RoleCatalog, Scope
+from app.authz.roles import SCOPES, RoleCatalog, Scope
 from app.errors import Forbidden
 
 
@@ -28,6 +34,19 @@ class Scoped(Protocol):
     def owner_id(self) -> uuid.UUID | None: ...
 
 
+class Member(Protocol):
+    """Пользователь организации, от имени которого читаются данные: CachedUser или User."""
+
+    @property
+    def id(self) -> uuid.UUID: ...
+    @property
+    def org_id(self) -> uuid.UUID | None: ...
+    @property
+    def team_id(self) -> uuid.UUID | None: ...
+    @property
+    def role(self) -> str | None: ...
+
+
 @dataclass(frozen=True)
 class Access:
     action: str  # что делаем: deal:write
@@ -37,6 +56,21 @@ class Access:
     team_id: uuid.UUID | None  # у org_admin и viewer отдела нет — уровень team им и не выдаётся
     role: str | None = None  # чтобы получить уровень другого действия: for_action()
 
+    @classmethod
+    def for_user(cls, user: Member, action: str, roles: RoleCatalog) -> "Access | None":
+        """Access без OPA — для бота и задач beat, которые не ходят через HTTP-маршруты:
+        уровень действия у роли из data.yaml. None — у роли нет действия или у пользователя
+        нет организации (супер-админ)."""
+        scope = roles.scope_or_none(user.role, action)
+        if scope is None or user.org_id is None:
+            return None
+        return cls(action, scope, user.id, user.org_id, user.team_id, user.role)
+
+    def own(self) -> "Access":
+        """Тот же человек и действие, уровень own — только записи, где я ответственный. Бот
+        показывает только свои данные, даже руководителю и админу (раздел 16)."""
+        return replace(self, scope="own")
+
     def for_action(self, action: str, roles: RoleCatalog) -> "Access | None":
         """Тот же человек, другое действие: сделку создают с deal:write, а привязанный к ней
         контакт проверяют на contact:read. None — у роли такого действия нет."""
@@ -44,6 +78,33 @@ class Access:
         if scope is None:
             return None
         return Access(action, scope, self.user_id, self.org_id, self.team_id, self.role)
+
+    def to_params(self) -> dict[str, Any]:
+        """Access автора для bulk_jobs.params: только JSON-типы (uuid → строка)."""
+        return {
+            "action": self.action,
+            "scope": self.scope,
+            "user_id": str(self.user_id),
+            "org_id": str(self.org_id),
+            "team_id": str(self.team_id) if self.team_id is not None else None,
+            "role": self.role,
+        }
+
+    @classmethod
+    def from_params(cls, params: dict[str, Any]) -> "Access":
+        """Обратно из to_params(): воркер восстанавливает Access автора в каждом чанке."""
+        scope = params["scope"]
+        if scope not in SCOPES:
+            raise ValueError(f"неизвестный уровень: {scope}")
+        team_id = params.get("team_id")
+        return cls(
+            action=params["action"],
+            scope=cast(Scope, scope),
+            user_id=uuid.UUID(params["user_id"]),
+            org_id=uuid.UUID(params["org_id"]),
+            team_id=uuid.UUID(team_id) if team_id is not None else None,
+            role=params.get("role"),
+        )
 
     def matches(self, obj: Scoped) -> bool:
         if obj.org_id != self.org_id:

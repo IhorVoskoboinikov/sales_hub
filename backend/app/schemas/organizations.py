@@ -86,6 +86,14 @@ class MemberOut(BaseModel):
     created_at: datetime
 
 
+class MemberUpdateOut(MemberOut):
+    bulk_job_id: uuid.UUID | None = Field(
+        None,
+        description="Job move_team: человека перевели в другой отдел, и его записи догоняют "
+        "новый отдел в фоне (GET /bulk-jobs/{job_id}); null — переносить нечего",
+    )
+
+
 class MemberUpdate(BaseModel):
     """Поля, которых нет в запросе, не меняются. team_id: null — снять отдел.
     При смене роли на org_admin или viewer отдел снимается сам."""

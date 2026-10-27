@@ -32,7 +32,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
-from app.models.crm import CrmRecord, scope_indexes
+from app.models.crm import CrmRecord, scope_indexes, trash_index
 
 # Открытая и живая сделка — предикат частичных индексов канбана и просроченных. В запросах
 # пишется тем же литералом (OPEN_ALIVE), а не параметром: иначе в общем плане asyncpg
@@ -113,6 +113,8 @@ class Deal(CrmRecord, Base):
         Index("ix_deals_stage_id", "stage_id"),
         Index("ix_deals_contact_id", "contact_id"),
         Index("ix_deals_company_id", "company_id"),
+        # Корзина: trash.purge (с этапа 5, миграция — CONCURRENTLY).
+        trash_index("deals"),
     )
 
     contact_id: Mapped[int | None] = mapped_column(ForeignKey("contacts.id", ondelete="SET NULL"))

@@ -3,6 +3,7 @@
 generate-jwt-key   создать приватный RS256-ключ для JWT (make keys)
 create-superadmin  создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD
 ensure-partitions  месячные партиции activities и audit_log на 2 месяца вперёд
+ensure-bucket      бакет S3_BUCKET в хранилище файлов (RustFS сам бакетов не создаёт)
 refresh-reports    обновить отчёты (REFRESH MATERIALIZED VIEW CONCURRENTLY deal_stats)
 """
 
@@ -12,13 +13,15 @@ import sys
 from pathlib import Path
 
 from pydantic import EmailStr, TypeAdapter, ValidationError
-from sqlalchemy import text
 
 from app.core.config import Settings, get_settings
 from app.core.jwt import generate_private_key, private_key_to_pem
+from app.db.partitions import ensure_partitions
 from app.db.session import create_engine, create_session_factory
 from app.errors import AppError
+from app.services.reports import refresh_reports
 from app.services.users import create_superadmin
+from app.storage import S3FileStorage
 from app.uow import UnitOfWork
 
 
@@ -64,45 +67,45 @@ async def create_superadmin_command(settings: Settings) -> int:
     return 0
 
 
-# Партиционированные таблицы и на сколько месяцев вперёд готовить партиции (раздел 9).
-PARTITIONED = ("activities", "audit_log")
-MONTHS_AHEAD = 2
-
-
 async def ensure_partitions_command(settings: Settings) -> int:
     """Идемпотентно: существующие партиции пропускаются. Запускается после миграций (сервис
-    migrate), с этапа 5 — ещё и задачей beat раз в месяц."""
+    migrate); та же функция — у задачи beat maintenance.create_partitions (каждый день)."""
     engine = create_engine(settings.database_url)
     try:
-        async with engine.begin() as connection:
-            for table in PARTITIONED:
-                created = await connection.scalar(
-                    text(
-                        # Месяцы — по UTC, как границы партиций (а не по часовому поясу сессии).
-                        "SELECT ensure_monthly_partitions(CAST(:table AS regclass),"
-                        " CAST(now() AT TIME ZONE 'UTC' AS date),"
-                        " CAST((now() + make_interval(months => :ahead)) AT TIME ZONE 'UTC'"
-                        " AS date))"
-                    ),
-                    {"table": table, "ahead": MONTHS_AHEAD},
-                )
-                print(f"{table}: создано партиций — {created}")
+        async with create_session_factory(engine)() as session:
+            created = await ensure_partitions(session)
     finally:
         await engine.dispose()
+    for table, count in created.items():
+        print(f"{table}: создано партиций — {count}")
+    return 0
+
+
+async def ensure_bucket_command(settings: Settings) -> int:
+    """Идемпотентно: бакет уже есть — ничего. Запускается после миграций (сервис migrate) и ждёт
+    хранилище до 30 секунд: в compose RustFS может ещё стартовать."""
+    storage = S3FileStorage.from_settings(settings)
+    try:
+        await storage.ensure_bucket()
+    except AppError as exc:  # хранилище так и не ответило
+        print(f"{exc.title}: {settings.s3_endpoint_url}", file=sys.stderr)
+        return 1
+    finally:
+        await storage.aclose()
+    print(f"бакет {settings.s3_bucket} готов")
     return 0
 
 
 async def refresh_reports_command(settings: Settings) -> int:
-    """Отчёты читают materialized view — он обновляется этой командой (с этапа 5 — задачей
-    beat reports.refresh каждые 5 минут)."""
+    """Отчёты читают materialized view — его обновляет задача beat reports.refresh каждые 5
+    минут, а эта команда — тот же метод сразу. Обновление уже идёт — не ждём второго."""
     engine = create_engine(settings.database_url)
     try:
         async with create_session_factory(engine)() as session:
-            await UnitOfWork(session).reports.refresh()
-            await session.commit()
+            refreshed = await refresh_reports(UnitOfWork(session))
     finally:
         await engine.dispose()
-    print("отчёты обновлены")
+    print("отчёты обновлены" if refreshed else "отчёты уже обновляются — пропуск")
     return 0
 
 
@@ -116,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         "create-superadmin", help="создать супер-админа из SUPERADMIN_EMAIL и SUPERADMIN_PASSWORD"
     )
     commands.add_parser("ensure-partitions", help="месячные партиции на 2 месяца вперёд")
+    commands.add_parser("ensure-bucket", help="создать бакет S3_BUCKET, если его нет")
     commands.add_parser("refresh-reports", help="обновить materialized view отчётов")
 
     args = parser.parse_args(argv)
@@ -125,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "ensure-partitions":
         return asyncio.run(ensure_partitions_command(settings))
+    if args.command == "ensure-bucket":
+        return asyncio.run(ensure_bucket_command(settings))
     if args.command == "refresh-reports":
         return asyncio.run(refresh_reports_command(settings))
     return asyncio.run(create_superadmin_command(settings))

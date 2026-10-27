@@ -5,12 +5,12 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean explain experiments
+.PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
 
-up: keys  ## поднять стенд: API, Postgres, Redis и все UI (ждёт, пока всё станет healthy)
+up: keys  ## поднять стенд: API, воркеры, Postgres, Redis и все UI (ждёт, пока всё станет healthy)
 	$(COMPOSE) up -d --build --wait
 	@$(MAKE) --no-print-directory urls
 
@@ -29,11 +29,24 @@ ps:  ## статус контейнеров
 logs:  ## логи API в реальном времени
 	$(COMPOSE) logs -f api
 
+logs-workers:  ## логи воркеров, beat и outbox relay в реальном времени
+	$(COMPOSE) logs -f worker worker-bulk beat outbox-relay
+
+restart-workers:  ## перезапустить воркеры, beat и relay (beat перечитывает расписание только при старте)
+	$(COMPOSE) restart worker worker-bulk beat outbox-relay
+
+bot:  ## запустить Telegram-бота (профиль telegram; нужны TELEGRAM_BOT_TOKEN и _USERNAME в deploy/compose/.env)
+	$(COMPOSE) --profile telegram up -d --build telegram-bot
+
+bot-logs:  ## логи Telegram-бота в реальном времени
+	$(COMPOSE) --profile telegram logs -f telegram-bot
+
 urls:  ## адреса веб-интерфейсов
 	@echo "Swagger      http://localhost:8000/docs   супер-админ admin@example.com / admin-password"
 	@echo "pgAdmin      http://localhost:5050"
 	@echo "RedisInsight http://localhost:5540"
 	@echo "Mailpit      http://localhost:8025"
+	@echo "Flower       http://localhost:5555   задачи и воркеры Celery"
 	@echo "OPA          http://localhost:8181/v1/data/saleshub/roles"
 	@echo "RustFS (S3)  http://localhost:9001/rustfs/console/   логин saleshub / saleshub-secret"
 
@@ -50,11 +63,23 @@ seed-big:  ## большие данные для замеров: 5 млн кон
 seed-big-clean:  ## удалить данные seed-big (быстрее — make clean && make up)
 	$(COMPOSE) exec -T postgres psql -U saleshub -d saleshub < backend/scripts/seed_big_clean.sql
 
+ROWS ?= 500000
+import-csv:  ## CSV для импорта контактов в backend/tmp/: 500 тыс. строк, 5% дублей, 1% битых (ROWS=1000)
+	$(BACKEND) uv run python scripts/gen_import_csv.py --rows $(ROWS)
+
 explain:  ## планы всех списков и отчётов на seed-данных: нет ли Seq Scan по большим таблицам
 	$(BACKEND) uv run python scripts/explain_lists.py
 
 experiments:  ## замеры индексов «без / с» на seed-данных (результаты — docs/experiments.md)
 	$(COMPOSE) exec -T postgres psql -U saleshub -d saleshub < backend/scripts/experiments.sql
+
+BENCH ?=
+bench-updates:  ## замеры способов UPDATE на копии contacts, ~2 ч (BENCH="--methods U2,U3 --volumes 1m")
+	$(BACKEND) uv run python scripts/bench_updates.py $(BENCH)
+
+CHAOS ?=
+chaos:  ## chaos-тест bulk на стенде make up: kill воркера посреди job, ~22 мин (CHAOS="--scenario a")
+	$(BACKEND) uv run python scripts/chaos.py $(CHAOS)
 
 refresh-reports:  ## обновить отчёты (materialized view deal_stats) в compose
 	$(COMPOSE) exec api python -m app.cli refresh-reports

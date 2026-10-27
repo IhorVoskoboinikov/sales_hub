@@ -1,16 +1,21 @@
-"""Конвертер валют по курсам НБУ (раздел 3, «Деньги») — шаг 4.4.
+"""Конвертер валют по курсам НБУ (раздел 3, «Деньги») — шаг 4.4; загрузка курсов заранее
+(FxService.load_rates, задача beat fx.fetch_nbu_rates) — шаг 5.8.
 
 НБУ подменён фикстурой nbu (respx): USD = 41.488 грн, EUR = 46.5 грн.
 """
 
-from datetime import date
+from datetime import UTC, date, datetime, tzinfo
 from decimal import Decimal
+from typing import Self
 
 import pytest
 from httpx import AsyncClient
 from redis.asyncio import Redis
+from sqlalchemy import func, select
 
 from app.errors import ServiceUnavailable, ValidationFailed
+from app.models import FxRate
+from app.services import fx as fx_module
 from app.services.fx import FxService, NbuClient
 from app.uow import UnitOfWork
 from tests.integration.conftest import (
@@ -160,3 +165,89 @@ async def test_unknown_currency_in_deal_is_422(
     )
 
     assert (resp.status_code, resp.json()["code"]) == (422, "fx.unknown_currency")
+
+
+# --- шаг 5.8: FxService.load_rates — курсы на сегодня и завтра заранее
+
+
+async def stored_dates(uow: UnitOfWork) -> dict[date, int]:
+    rows = await uow.session.execute(
+        select(FxRate.rate_date, func.count()).group_by(FxRate.rate_date)
+    )
+    return {day: int(n) for day, n in rows}
+
+
+async def test_load_rates_stores_today_and_tomorrow(
+    fx: FxService, nbu: FakeNbu, uow: UnitOfWork
+) -> None:
+    before = await stored_dates(uow)
+
+    loaded = await fx.load_rates(FRIDAY)
+    again = await fx.load_rates(FRIDAY)  # повтор задачи — upsert, без дублей и ошибок
+
+    assert loaded == again == {FRIDAY: 3, SATURDAY: 3}
+    assert nbu.dates == ["20261016", "20261017"] * 2
+    after = await stored_dates(uow)
+    assert after[FRIDAY] - before.get(FRIDAY, 0) == 3
+    assert after[SATURDAY] - before.get(SATURDAY, 0) == 3
+    # Курс уже в базе: get_rate не идёт в НБУ.
+    assert (await fx.get_rate("EUR", SATURDAY)).rate_uah == Decimal("46.5")
+    assert len(nbu.dates) == 4
+
+
+async def test_empty_tomorrow_is_not_an_error(fx: FxService, nbu: FakeNbu, uow: UnitOfWork) -> None:
+    nbu.empty = {"20261017"}  # курс на завтра НБУ ещё не опубликовал
+
+    loaded = await fx.load_rates(FRIDAY)
+
+    assert loaded == {FRIDAY: 3, SATURDAY: 0}
+    assert await uow.fx_rates.get("USD", SATURDAY) is None
+    assert (await uow.fx_rates.get("USD", FRIDAY)) is not None
+
+
+async def test_nbu_down_or_empty_today_is_retryable_unavailable(
+    fx: FxService, nbu: FakeNbu, uow: UnitOfWork
+) -> None:
+    nbu.down = True
+    with pytest.raises(ServiceUnavailable) as down:
+        await fx.load_rates(FRIDAY)
+    nbu.down = False
+    nbu.empty = {"20261016"}
+    with pytest.raises(ServiceUnavailable) as empty:
+        await fx.load_rates(FRIDAY)
+
+    # fx.unavailable BaseTask повторяет (раздел 15, «Что повторять»).
+    assert (down.value.code, empty.value.code) == ("fx.unavailable", "fx.unavailable")
+    assert await uow.fx_rates.get("USD", FRIDAY) is None
+    assert await uow.fx_rates.get("USD", SATURDAY) is None
+
+
+async def test_today_is_saved_when_tomorrow_fails(
+    fx: FxService, nbu: FakeNbu, uow: UnitOfWork
+) -> None:
+    nbu.failing = {"20261017"}
+
+    with pytest.raises(ServiceUnavailable):
+        await fx.load_rates(FRIDAY)
+
+    assert await uow.fx_rates.get("USD", FRIDAY) is not None  # своя транзакция — уже сохранён
+    assert await uow.fx_rates.get("USD", SATURDAY) is None
+
+
+class LateEvening(datetime):
+    """22:30 UTC пятницы = 01:30 субботы в Киеве (UTC+3, летнее время до 25 октября)."""
+
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> Self:
+        return cls.fromtimestamp(datetime(2026, 10, 16, 22, 30, tzinfo=UTC).timestamp(), tz)
+
+
+async def test_today_is_kyiv_date(
+    fx: FxService, nbu: FakeNbu, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(fx_module, "datetime", LateEvening)
+
+    loaded = await fx.load_rates()
+
+    assert list(loaded) == [SATURDAY, date(2026, 10, 18)]
+    assert nbu.dates == ["20261017", "20261018"]

@@ -1,0 +1,111 @@
+"""Ресурсы процесса: пул Postgres, Redis, HTTP-клиент, файл ролей, хранилище файлов (S3),
+отправка писем и сообщений в Telegram.
+
+Собирает их одна функция — для API (lifespan в main.py), для воркеров (workers/runtime.py) и
+для бота (bot/__main__.py), поэтому таймауты у всех одинаковые, а отличаются размер пула и то,
+что SMTP-отправитель и клиент Bot API есть только у воркеров (for_worker=True): с шага 5.3 API
+почту не отправляет, а с 5.12 сообщения в Telegram отправляет тоже воркер (раздел 15).
+Соединения открываются лениво — при первом запросе, а не при создании. Клиент S3 тоже: он
+создаётся внутри event loop при первом обращении и закрывается в aclose() (app/storage/s3.py).
+"""
+
+from dataclasses import dataclass
+
+import httpx
+from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+
+from app.authz.opa import OpaClient
+from app.authz.roles import RoleCatalog
+from app.core.config import Settings
+from app.db.session import create_engine, create_session_factory
+from app.emails.sender import EmailSender, SmtpEmailSender
+from app.notifications.telegram import TelegramClient
+from app.services.fx import NbuClient
+from app.storage import FileStorage, S3FileStorage
+
+REDIS_TIMEOUT_SECONDS = 2
+
+
+@dataclass(frozen=True)
+class Resources:
+    settings: Settings
+    engine: AsyncEngine
+    session_factory: async_sessionmaker[AsyncSession]
+    redis: Redis
+    http: httpx.AsyncClient
+    opa: OpaClient
+    nbu: NbuClient
+    roles: RoleCatalog
+    storage: FileStorage  # один клиент S3 на процесс: API загружает файлы импорта, воркер читает
+    # Только у воркеров: API пишет команду email.send в outbox, письмо отправляет воркер.
+    email_sender: EmailSender | None
+    # Тоже только у воркеров и только с токеном бота: без него send_telegram пропускает
+    # сообщения (раздел 16, «Запуск»). Тот же HTTP-клиент процесса — его подменяет respx.
+    telegram: TelegramClient | None = None
+
+    @classmethod
+    def create(
+        cls,
+        settings: Settings,
+        *,
+        roles: RoleCatalog | None = None,
+        pool_size: int = 5,
+        max_overflow: int = 10,
+        for_worker: bool = False,
+    ) -> "Resources":
+        """roles — уже прочитанный файл ролей (API читает его при сборке приложения),
+        иначе он читается здесь. Нет файла — RuntimeError: процесс не стартует.
+        for_worker — собрать и отправителей писем и сообщений (у API их нет)."""
+        # Файл ролей — первым: при ошибке пул и HTTP-клиент ещё не созданы, закрывать нечего.
+        if roles is None:
+            roles = RoleCatalog.load(settings.policies_dir)
+        engine = create_engine(
+            settings.database_url, pool_size=pool_size, max_overflow=max_overflow
+        )
+        http = httpx.AsyncClient()  # один пул соединений на процесс
+        return cls(
+            settings=settings,
+            engine=engine,
+            session_factory=create_session_factory(engine),
+            redis=Redis.from_url(
+                settings.redis_url,
+                socket_connect_timeout=REDIS_TIMEOUT_SECONDS,
+                socket_timeout=REDIS_TIMEOUT_SECONDS,
+            ),
+            http=http,
+            opa=OpaClient(http, settings.opa_url, settings.opa_timeout_seconds),
+            nbu=NbuClient(http, settings.nbu_url),  # тот же пул: OPA и НБУ — разные хосты
+            roles=roles,
+            storage=S3FileStorage.from_settings(settings),
+            email_sender=smtp_sender(settings) if for_worker else None,
+            telegram=telegram_client(settings, http) if for_worker else None,
+        )
+
+    async def aclose(self) -> None:
+        await self.storage.aclose()
+        await self.http.aclose()
+        await self.redis.aclose()
+        await self.engine.dispose()
+
+
+def smtp_sender(settings: Settings) -> SmtpEmailSender:
+    """Отправитель по SMTP из настроек. Соединение открывается на каждое письмо, не здесь."""
+    return SmtpEmailSender(
+        host=settings.smtp_host,
+        port=settings.smtp_port,
+        sender=settings.email_from,
+        username=settings.smtp_username,
+        password=settings.smtp_password.get_secret_value() if settings.smtp_password else None,
+        start_tls=settings.smtp_start_tls,
+    )
+
+
+def telegram_client(settings: Settings, http: httpx.AsyncClient) -> TelegramClient | None:
+    """Клиент Bot API для отправки из воркера; None — токена нет (имя бота для отправки не
+    нужно — только для ссылки привязки)."""
+    if settings.telegram_bot_token is None:
+        return None
+    return TelegramClient(
+        http, settings.telegram_bot_token.get_secret_value(), settings.telegram_api_url
+    )

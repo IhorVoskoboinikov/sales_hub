@@ -34,6 +34,9 @@ class CurrentUser:
     email: str
     is_superadmin: bool
     session_id: uuid.UUID  # sid из access-токена: по нему logout знает, какую сессию закрыть
+    # ver из access-токена (совпал с users.token_version): ссылка привязки Telegram его
+    # запоминает, и logout-all, смена или сброс пароля её гасят (раздел 16)
+    token_version: int
     org_id: uuid.UUID | None = None
     team_id: uuid.UUID | None = None
     role: str | None = None
@@ -150,6 +153,8 @@ class AuthService:
         row = await self._lock_user(user.id)
         await self.uow.refresh_tokens.revoke_all_for_user(user.id, datetime.now(UTC))
         row.token_version += 1
+        # Telegram — как ещё одна сессия: чат мог привязать тот, у кого был украденный токен.
+        await self.uow.telegram_links.delete_for_user(user.id)
         await self.uow.commit()
         await self.cache.invalidate(user.id)
 
@@ -191,6 +196,7 @@ class AuthService:
         check_password_rules(new_password, user.email)
         user.password_hash = await hash_password(new_password)
         user.token_version += 1
+        await self.uow.telegram_links.delete_for_user(user.id)  # как в logout_all
 
         now = datetime.now(UTC)
         session = await self.uow.refresh_tokens.get_active_in_family(
@@ -231,6 +237,7 @@ class AuthService:
             email=user.email,
             is_superadmin=user.is_superadmin,
             session_id=claims.session_id,
+            token_version=claims.token_version,
             org_id=user.org_id,
             team_id=user.team_id,
             role=user.role,

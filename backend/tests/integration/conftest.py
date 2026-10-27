@@ -2,23 +2,32 @@
 
 Изоляция (раздел 10): каждый тест работает во внешней транзакции, которая откатывается после
 него. Коммиты сервисов внутри теста становятся SAVEPOINT-ами — таблицы чистить не нужно.
+Задачи Celery выполняет настоящий воркер в потоке (фикстура celery_worker, маркер worker).
+Хранилище файлов в тестах API — фейк в памяти (file_storage), RustFS — у тестов хранилища и воркера.
+Outbox внутри транзакции теста доставляет фикстура deliver_outbox, письма читает inbox.
 """
 
+import asyncio
+import json
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 
 import httpx
 import pytest
 import respx
 from alembic import command
 from alembic.config import Config
+from celery.contrib.testing.worker import start_worker
+from celery.worker import WorkController
 from fastapi import FastAPI
 from httpx import AsyncClient
+from pydantic import SecretStr
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -27,21 +36,41 @@ from testcontainers.community.redis import RedisContainer
 from testcontainers.core.container import DockerContainer
 from testcontainers.core.wait_strategies import HttpWaitStrategy
 
-from app.api.deps import get_session
+from app.api.deps import (
+    SessionScope,
+    get_session,
+    get_session_scope,
+    get_storage,
+    get_task_queue,
+    get_task_sender,
+)
+from app.authz.roles import RoleCatalog
 from app.core.config import Settings
+from app.core.resources import smtp_sender
 from app.core.security import hash_password
+from app.errors import NotFound, ServiceUnavailable
+from app.events.relay import publish_batch
 from app.models import (
     Activity,
+    BulkJob,
     Company,
     Contact,
     Deal,
+    FailedTask,
     Organization,
     Pipeline,
     PipelineStage,
     Team,
     User,
 )
+from app.notifications.telegram import TelegramClient
+from app.services.bulk import BulkService
+from app.services.notifications import NotificationService
+from app.storage import S3FileStorage, StoredFile
 from app.uow import UnitOfWork
+from app.workers import runtime
+from app.workers.celery_app import celery_app
+from app.workers.queue import CeleryTaskSender
 from tests.conftest import POLICIES_DIR
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
@@ -51,6 +80,9 @@ POSTGRES_IMAGE = "postgres:18.6"
 REDIS_IMAGE = "redis:8.10"
 MAILPIT_IMAGE = "axllent/mailpit:v1.31.6"
 OPA_IMAGE = "openpolicyagent/opa:1.21.3"
+RUSTFS_IMAGE = "rustfs/rustfs:1.0.3"
+RUSTFS_ACCESS_KEY = "saleshub"
+RUSTFS_SECRET_KEY = "saleshub-secret"
 
 
 def alembic_config(database_url: str) -> Config:
@@ -72,6 +104,23 @@ def postgres_url() -> Iterator[str]:
 def redis_url() -> Iterator[str]:
     with RedisContainer(REDIS_IMAGE) as redis:
         yield f"redis://{redis.get_container_host_ip()}:{redis.get_exposed_port(6379)}/0"
+
+
+@pytest.fixture(scope="session")
+def celery_broker_url(redis_url: str) -> str:
+    # Как в compose: кэш и rate limit — db 0, очереди Celery — db 1 того же Redis.
+    return redis_url.removesuffix("/0") + "/1"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def celery_broker(celery_broker_url: str) -> None:
+    """Брокер celery_app — Redis контейнера, для всех integration-тестов, а не только с воркером.
+
+    celery_app читает адрес из get_settings() при импорте (localhost:6379), а не из фикстуры
+    settings: без этого .delay() из эндпоинта ушёл бы в чужой Redis на машине разработчика.
+    Autouse — чтобы адрес сменился до первой публикации: пул брокера запоминает адрес.
+    """
+    celery_app.conf.update(broker_url=celery_broker_url)
 
 
 @dataclass(frozen=True)
@@ -111,21 +160,182 @@ def opa_url() -> Iterator[str]:
         yield f"http://{container.get_container_host_ip()}:{container.get_exposed_port(8181)}"
 
 
+@dataclass(frozen=True)
+class RustFs:
+    endpoint_url: str
+
+
+@pytest.fixture(scope="session")
+def rustfs() -> Iterator[RustFs]:
+    """Настоящий RustFS (S3 API) — как сервис rustfs в compose. Для тестов хранилища и воркера:
+    API-тесты работают с фейком в памяти (FakeFileStorage)."""
+    container = (
+        DockerContainer(RUSTFS_IMAGE)
+        .with_env("RUSTFS_ACCESS_KEY", RUSTFS_ACCESS_KEY)
+        .with_env("RUSTFS_SECRET_KEY", RUSTFS_SECRET_KEY)
+        .with_exposed_ports(9000)
+        .waiting_for(HttpWaitStrategy(9000, "/health"))
+    )
+    with container:
+        host = container.get_container_host_ip()
+        yield RustFs(f"http://{host}:{container.get_exposed_port(9000)}")
+
+
+TEST_BUCKET = "saleshub-test"
+
+
+def s3_settings(rustfs: RustFs) -> dict[str, Any]:
+    """Настройки S3 для RustFS контейнера — у воркера и у приложения конец-в-конец теста."""
+    return {
+        "s3_endpoint_url": rustfs.endpoint_url,
+        "s3_access_key": RUSTFS_ACCESS_KEY,
+        "s3_secret_key": SecretStr(RUSTFS_SECRET_KEY),  # model_copy не проверяет типы
+        "s3_bucket": TEST_BUCKET,
+    }
+
+
+def s3_storage(rustfs: RustFs, bucket: str = TEST_BUCKET) -> S3FileStorage:
+    return S3FileStorage(
+        endpoint_url=rustfs.endpoint_url,
+        access_key=RUSTFS_ACCESS_KEY,
+        secret_key=RUSTFS_SECRET_KEY,
+        bucket=bucket,
+        region="us-east-1",
+    )
+
+
+@pytest.fixture
+async def storage(rustfs: RustFs) -> AsyncIterator[S3FileStorage]:
+    """S3FileStorage на бакете RustFS контейнера; бакет — ensure_bucket, как в migrate. Клиент —
+    свой на тест: он привязан к event loop, а loop у каждого теста свой."""
+    s3 = s3_storage(rustfs)
+    await s3.ensure_bucket()
+    try:
+        yield s3
+    finally:
+        await s3.aclose()
+
+
+class FakeFileStorage:
+    """Подмена FileStorage в тестах API: файлы — в памяти (ключ → байты и тип). down —
+    хранилище недоступно (503). modified — время загрузки файла: тесты очистки сдвигают его
+    назад."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, tuple[bytes, str]] = {}
+        self.modified: dict[str, datetime] = {}
+        self.deleted: list[str] = []
+        self.down = False
+
+    async def put(self, key: str, fileobj: BinaryIO, size: int, content_type: str) -> None:
+        if self.down:
+            raise ServiceUnavailable(service="storage")
+        data = fileobj.read()
+        assert len(data) == size, "size не совпал с файлом"
+        self.files[key] = (data, content_type)
+        self.modified[key] = datetime.now(UTC)
+
+    async def list_files(self, prefix: str) -> AsyncIterator[list[StoredFile]]:
+        if self.down:
+            raise ServiceUnavailable(service="storage")
+        keys = sorted(key for key in self.files if key.startswith(prefix))
+        for start in range(0, len(keys), 2):  # страницы по 2 — чтобы их было несколько
+            yield [StoredFile(key, self.modified[key]) for key in keys[start : start + 2]]
+
+    async def download_to(self, key: str, path: Path) -> None:
+        if key not in self.files:
+            raise NotFound(entity="file", key=key)
+        await asyncio.to_thread(path.write_bytes, self.files[key][0])
+
+    async def delete(self, key: str) -> None:
+        if self.down:
+            raise ServiceUnavailable(service="storage")
+        self.files.pop(key, None)
+        self.modified.pop(key, None)
+        self.deleted.append(key)
+
+    async def ensure_bucket(self) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        return None
+
+
+@pytest.fixture
+def file_storage() -> FakeFileStorage:
+    return FakeFileStorage()
+
+
 @pytest.fixture
 def settings(
-    settings: Settings, postgres_url: str, redis_url: str, mailpit: Mailpit, opa_url: str
+    settings: Settings,
+    postgres_url: str,
+    redis_url: str,
+    celery_broker_url: str,
+    mailpit: Mailpit,
+    opa_url: str,
 ) -> Settings:
     # Те же настройки, что у unit-тестов, но с адресами настоящих контейнеров.
     return settings.model_copy(
         update={
             "database_url": postgres_url,
             "redis_url": redis_url,
+            "celery_broker_url": celery_broker_url,
             "smtp_host": mailpit.smtp_host,
             "smtp_port": mailpit.smtp_port,
             "opa_url": opa_url,
+            "opa_timeout_seconds": 5.0,  # пауза GC в полном прогоне не должна давать 503
             "nbu_url": NBU_URL,
         }
     )
+
+
+@pytest.fixture(scope="session")
+def celery_worker(
+    jwt_key_file: Path,
+    postgres_url: str,
+    redis_url: str,
+    celery_broker_url: str,
+    celery_broker: None,
+    mailpit: Mailpit,
+    rustfs: RustFs,
+) -> Iterator[WorkController]:
+    """Настоящий воркер нашего celery_app в потоке этого процесса (раздел 10), один на запуск.
+    Хранилище воркера — RustFS контейнера, бакет TEST_BUCKET (его создаёт фикстура storage).
+
+    pool=solo: задачи выполняются в потоке воркера со своим event loop (runtime.py).
+    perform_ping_check=False: ping-задаче нужен result backend, а его нет. Тест ждёт результат
+    опросом — Redis, базы или очереди в памяти, — а не через AsyncResult.get().
+    """
+    runtime.configure(
+        Settings(
+            _env_file=None,
+            app_env="test",
+            database_url=postgres_url,
+            redis_url=redis_url,
+            celery_broker_url=celery_broker_url,
+            smtp_host=mailpit.smtp_host,  # notifications.send_email шлёт в Mailpit контейнера
+            smtp_port=mailpit.smtp_port,
+            policies_dir=POLICIES_DIR,
+            jwt_private_key_file=jwt_key_file,
+            nbu_url=NBU_URL,
+            # notifications.send_telegram шлёт в подменённый Bot API (FakeTelegram теста).
+            telegram_bot_token=SecretStr(TELEGRAM_TOKEN),
+            telegram_api_url=TELEGRAM_API_URL,
+            **s3_settings(rustfs),
+        )
+    )
+    try:
+        with start_worker(
+            celery_app,
+            pool="solo",
+            perform_ping_check=False,
+            queues=["default", "bulk", "imports", "notifications"],
+        ) as worker:
+            yield worker
+    finally:
+        # Поток воркера остановлен — закрываем его пул Postgres, Redis и loop отсюда.
+        runtime.shutdown()
 
 
 @pytest.fixture
@@ -151,8 +361,55 @@ def uow(db_session: AsyncSession) -> UnitOfWork:
     return UnitOfWork(db_session)
 
 
+class FakeTaskQueue:
+    """Подмена TaskQueue в тестах API (раздел 10): задачи не уходят в Redis, а запоминаются —
+    иначе их выполнил бы сессионный воркер других тестов, а данные транзакции теста он не видит."""
+
+    def __init__(self) -> None:
+        self.enqueued: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def enqueue(self, name: str, *args: Any) -> None:
+        self.enqueued.append((name, args))
+
+
 @pytest.fixture
-def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
+def task_queue() -> FakeTaskQueue:
+    return FakeTaskQueue()
+
+
+class FakeTaskSender:
+    """Подмена TaskSender (перезапуск упавших задач): какие задачи есть и какие из них можно
+    перезапускать — настоящий реестр celery_app, а публикация только запоминается (иначе
+    задачу выполнил бы сессионный воркер). broker_down — брокер недоступен (503)."""
+
+    def __init__(self) -> None:
+        self.registry = CeleryTaskSender(celery_app)
+        self.sent: list[tuple[str, list[Any], dict[str, Any]]] = []
+        self.broker_down = False
+
+    def replayable(self, name: str) -> bool | None:
+        return self.registry.replayable(name)
+
+    async def send(self, name: str, args: list[Any], kwargs: dict[str, Any]) -> str:
+        if self.broker_down:
+            raise ServiceUnavailable()
+        self.sent.append((name, args, kwargs))
+        return f"replay-{uuid.uuid4().hex}"
+
+
+@pytest.fixture
+def task_sender() -> FakeTaskSender:
+    return FakeTaskSender()
+
+
+@pytest.fixture
+def app(
+    app: FastAPI,
+    db_session: AsyncSession,
+    task_queue: FakeTaskQueue,
+    task_sender: FakeTaskSender,
+    file_storage: FakeFileStorage,
+) -> FastAPI:
     # Запросы API идут в ту же транзакцию теста: после теста всё откатится.
     async def test_session() -> AsyncIterator[AsyncSession]:
         try:
@@ -163,8 +420,89 @@ def app(app: FastAPI, db_session: AsyncSession) -> FastAPI:
             await db_session.rollback()
             raise
 
+    @asynccontextmanager
+    async def test_scope() -> AsyncIterator[AsyncSession]:
+        yield db_session  # короткие сессии SSE — та же транзакция теста, не закрываем её
+
+    def session_scope() -> SessionScope:
+        return test_scope
+
     app.dependency_overrides[get_session] = test_session
+    app.dependency_overrides[get_session_scope] = session_scope
+    app.dependency_overrides[get_task_queue] = lambda: task_queue
+    app.dependency_overrides[get_task_sender] = lambda: task_sender
+    app.dependency_overrides[get_storage] = lambda: file_storage
     return app
+
+
+Handler = Callable[[int], Awaitable[object]]
+
+
+class InlinePublisher:
+    """Издатель для outbox внутри транзакции теста: ничего не ставит в Celery, а запоминает
+    (имя задачи, id события) — deliver_inline выполнит обработчики сам."""
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, int]] = []
+
+    async def publish(self, task_name: str, event_id: int) -> None:
+        self.published.append((task_name, event_id))
+
+
+async def deliver_inline(session: AsyncSession, handlers: Mapping[str, Handler]) -> int:
+    """Доставить outbox в сессии теста (раздел 10): строки транзакции теста не закоммичены, и
+    настоящий relay их не видит. Та же publish_batch, что у relay, но обработчик задачи
+    вызывается сразу и в той же сессии — после коммита батча, как воркер после relay. Круги —
+    пока неопубликованные строки не кончатся (notify порождает новые команды, шаг 5.12).
+    Возвращает число доставленных событий. Фикстура deliver_outbox — то же с обработчиками
+    настоящих задач."""
+    delivered = 0
+    while True:
+        publisher = InlinePublisher()
+        await publish_batch(session, publisher, batch_size=100)
+        if not publisher.published:
+            return delivered
+        for task_name, event_id in publisher.published:
+            await handlers[task_name](event_id)
+        delivered += len(publisher.published)
+
+
+DeliverOutbox = Callable[[], Awaitable[int]]
+
+
+@pytest.fixture
+def deliver_outbox(
+    db_session: AsyncSession, settings: Settings, telegram_client: TelegramClient
+) -> DeliverOutbox:
+    """deliver_outbox() — доставить outbox этого теста: notifier пишет команды, письма уходят в
+    Mailpit контейнера, сообщения Telegram — в подменённый Bot API (telegram_api)."""
+    notifications = NotificationService(
+        UnitOfWork(db_session), smtp_sender(settings), telegram_client
+    )
+    handlers: dict[str, Handler] = {
+        "notifications.send_email": notifications.send_email,
+        "notifications.notify": notifications.notify,
+        "notifications.send_telegram": notifications.send_telegram,
+    }
+
+    async def run() -> int:
+        return await deliver_inline(db_session, handlers)
+
+    return run
+
+
+Inbox = Callable[[str], Awaitable[list[dict[str, Any]]]]
+
+
+@pytest.fixture
+def inbox(deliver_outbox: DeliverOutbox, mailpit: Mailpit) -> Inbox:
+    """inbox(email) = доставить outbox теста + письма адреса из Mailpit (от новых к старым)."""
+
+    async def read(to: str) -> list[dict[str, Any]]:
+        await deliver_outbox()
+        return await read_emails(mailpit, to)
+
+    return read
 
 
 PASSWORD = "correct horse battery"  # пароль всех пользователей из make_user
@@ -266,6 +604,16 @@ async def member(
     )
 
 
+def roles_without(action: str) -> RoleCatalog:
+    """Файл ролей, где ни у одной роли нет action: команда бота отвечает «недоступно»."""
+    catalog = RoleCatalog.load(POLICIES_DIR)
+    permissions = {
+        role: {a: scope for a, scope in catalog.permissions(role).items() if a != action}
+        for role in catalog.titles
+    }
+    return RoleCatalog(permissions, catalog.titles)
+
+
 async def tokens_for(client: AsyncClient, user: User) -> dict[str, str]:
     return bearer(await login(client, user.email))
 
@@ -354,33 +702,90 @@ NBU_RATES = {"USD": Decimal("41.488"), "EUR": Decimal("46.5"), "PLN": Decimal("1
 @dataclass
 class FakeNbu:
     """Подмена API НБУ (respx): тесты не ходят в интернет. rates — курсы на любую дату;
-    down — НБУ не отвечает; dates — за какие даты спрашивали."""
+    down — НБУ не отвечает (failing — только на эти даты, YYYYMMDD); empty — даты, на которые
+    курса ещё нет (пустой список, как НБУ отвечает на будущую дату); dates — за какие даты
+    спрашивали."""
 
     rates: dict[str, Decimal]
     down: bool = False
+    failing: set[str] = field(default_factory=set)
+    empty: set[str] = field(default_factory=set)
     dates: list[str] = field(default_factory=list)
 
     def respond(self, request: httpx.Request) -> httpx.Response:
         self.dates.append(request.url.params["date"])
-        if self.down:
+        if self.down or request.url.params["date"] in self.failing:
             return httpx.Response(503)
+        if request.url.params["date"] in self.empty:
+            return httpx.Response(200, json=[])
         return httpx.Response(
             200, json=[{"cc": cc, "rate": float(rate)} for cc, rate in self.rates.items()]
         )
 
 
+TELEGRAM_API_URL = "http://telegram.test"
+TELEGRAM_TOKEN = "123456:TEST-secret-token"
+
+
+@dataclass
+class FakeTelegram:
+    """Подмена Bot API (respx): sent — (chat_id, text, тело запроса) каждого sendMessage;
+    responses — заготовленные ответы по очереди (пусто — 200 ok); paths — пути запросов (в них
+    токен бота)."""
+
+    sent: list[tuple[int, str, dict[str, Any]]] = field(default_factory=list)
+    responses: list[httpx.Response] = field(default_factory=list)
+    paths: list[str] = field(default_factory=list)
+
+    def respond(self, request: httpx.Request) -> httpx.Response:
+        self.paths.append(request.url.path)
+        if self.responses:
+            return self.responses.pop(0)
+        body = json.loads(request.content)
+        self.sent.append((body["chat_id"], body["text"], body))
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": len(self.sent)}})
+
+    def texts(self, chat_id: int) -> list[str]:
+        return [text for chat, text, _ in self.sent if chat == chat_id]
+
+
+@dataclass(frozen=True)
+class ExternalApis:
+    nbu: FakeNbu
+    telegram: FakeTelegram
+
+
 @pytest.fixture(autouse=True)
-async def nbu(redis_url: str) -> AsyncIterator[FakeNbu]:
-    fake = FakeNbu(dict(NBU_RATES))
+async def external_apis(redis_url: str) -> AsyncIterator[ExternalApis]:
+    """НБУ и Bot API подменены во всех integration-тестах: в интернет тесты не ходят."""
+    apis = ExternalApis(FakeNbu(dict(NBU_RATES)), FakeTelegram())
     # Кэш курсов в Redis общий на весь запуск — каждый тест начинает с пустого.
     redis = Redis.from_url(redis_url)
     async for key in redis.scan_iter("fx:*"):
         await redis.delete(key)
     await redis.aclose()
     with respx.mock(assert_all_called=False) as router:
-        router.get(NBU_URL).mock(side_effect=fake.respond)
+        router.get(NBU_URL).mock(side_effect=apis.nbu.respond)
+        router.post(url__startswith=TELEGRAM_API_URL).mock(side_effect=apis.telegram.respond)
         router.route().pass_through()  # OPA, Mailpit — настоящие
-        yield fake
+        yield apis
+
+
+@pytest.fixture
+def nbu(external_apis: ExternalApis) -> FakeNbu:
+    return external_apis.nbu
+
+
+@pytest.fixture
+def telegram_api(external_apis: ExternalApis) -> FakeTelegram:
+    return external_apis.telegram
+
+
+@pytest.fixture
+async def telegram_client() -> AsyncIterator[TelegramClient]:
+    """Клиент Bot API на подменённый адрес — как у воркера с токеном бота."""
+    async with httpx.AsyncClient() as http:
+        yield TelegramClient(http, TELEGRAM_TOKEN, TELEGRAM_API_URL)
 
 
 @pytest.fixture
@@ -397,3 +802,96 @@ def make_activity(uow: UnitOfWork) -> MakeRecord:
         return activity
 
     return make
+
+
+MakeJob = Callable[..., Awaitable[BulkJob]]
+
+
+@pytest.fixture
+def make_job(uow: UnitOfWork) -> MakeJob:
+    """Bulk job, которую запустил author (owner_id — автор, team_id — его отдел). По умолчанию
+    уже завершённая (done): SSE отдаёт снимок и сразу закрывается."""
+
+    async def make(author: User, **fields: Any) -> BulkJob:
+        assert author.org_id is not None
+        fields.setdefault("kind", "reassign_owner")
+        fields.setdefault("status", "done")
+        fields.setdefault("params", {"include": ["contacts"]})
+        job = BulkJob(org_id=author.org_id, team_id=author.team_id, owner_id=author.id, **fields)
+        uow.bulk_jobs.add(job)
+        await uow.commit()
+        return job
+
+    return make
+
+
+RunJob = Callable[[uuid.UUID | str], Awaitable[None]]
+
+
+@pytest.fixture
+def run_job(uow: UnitOfWork) -> RunJob:
+    """plan и все чанки job по очереди в сессии теста — как воркер, но без Celery. Чанки по 2
+    строки: даже у пары записей их несколько. job_id — и строкой из ответа API."""
+    service = BulkService(uow, RoleCatalog.load(POLICIES_DIR), FakeTaskQueue(), chunk_size=2)
+
+    async def run(job_id: uuid.UUID | str) -> None:
+        job_id = uuid.UUID(str(job_id))
+        for no in await service.plan(job_id):
+            await service.run_chunk(job_id, no)
+
+    return run
+
+
+MakeFailedTask = Callable[..., Awaitable[FailedTask]]
+
+
+@pytest.fixture
+def make_failed_task(uow: UnitOfWork) -> MakeFailedTask:
+    """Строка failed_tasks, как её пишет task_failure. По умолчанию — workers.heartbeat: его
+    можно перезапускать."""
+
+    async def make(**fields: Any) -> FailedTask:
+        fields.setdefault("task_id", str(uuid.uuid4()))
+        fields.setdefault("task_name", "workers.heartbeat")
+        fields.setdefault("queue", "default")
+        fields.setdefault("args", [])
+        fields.setdefault("kwargs", {})
+        fields.setdefault("exc_type", "builtins.ConnectionRefusedError")
+        fields.setdefault("exc_message", "redis:6379")
+        fields.setdefault("traceback", "Traceback (most recent call last): ...")
+        fields.setdefault("retries", 5)
+        task = FailedTask(**fields)
+        uow.session.add(task)
+        await uow.commit()
+        return task
+
+    return make
+
+
+# (имя поля, содержимое, имя файла: None — обычное поле формы)
+FormPart = tuple[str, bytes, str | None]
+BOUNDARY = "saleshub-test-boundary"
+
+
+def multipart_body(parts: list[FormPart]) -> tuple[bytes, dict[str, str]]:
+    """Тело multipart/form-data «руками» и его Content-Type: тесты импорта отправляют и то, что
+    httpx собрать не даст (два файла, файл без имени поля, битую форму)."""
+    chunks: list[bytes] = []
+    for name, content, filename in parts:
+        disposition = f'form-data; name="{name}"'
+        if filename is not None:
+            disposition += f'; filename="{filename}"'
+        head = f"--{BOUNDARY}\r\nContent-Disposition: {disposition}\r\n"
+        if filename is not None:
+            head += "Content-Type: text/csv\r\n"
+        chunks.append(head.encode() + b"\r\n" + content + b"\r\n")
+    chunks.append(f"--{BOUNDARY}--\r\n".encode())
+    return b"".join(chunks), {"Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
+
+
+def import_form(csv: bytes, owner_id: uuid.UUID | str | None = None) -> list[FormPart]:
+    """Форма POST /contacts/import: файл contacts.csv и необязательный owner_id."""
+    parts: list[FormPart] = [("file", csv, "contacts.csv")]
+    if owner_id is not None:
+        parts.append(("owner_id", str(owner_id).encode(), None))
+    return parts

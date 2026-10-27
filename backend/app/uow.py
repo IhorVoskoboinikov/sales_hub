@@ -2,17 +2,26 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Company, Contact, Deal
+from app.models import Activity, Company, Contact, Deal
 from app.repositories.activities import ActivityRepository, AuditQueries, NoteRepository
 from app.repositories.audit import AuditRepository
+from app.repositories.bulk import BulkChunkRepository, BulkJobRepository, BulkRepository
 from app.repositories.contacts import CompanyRepository, ContactRepository
 from app.repositories.crm import LiveRecords
 from app.repositories.deals import DealRepository, PipelineRepository
 from app.repositories.email_tokens import EmailTokenRepository
+from app.repositories.failed_tasks import FailedTaskRepository
 from app.repositories.fx import FxRateRepository
+from app.repositories.imports import ImportErrorRepository, ImportRepository
+from app.repositories.maintenance import CleanupRepository
+from app.repositories.notification_settings import NotificationSettingRepository
 from app.repositories.organizations import OrganizationRepository, TeamRepository
+from app.repositories.outbox import OutboxRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.reports import ReportRepository
+from app.repositories.sent_notifications import SentNotificationRepository
+from app.repositories.telegram_links import TelegramLinkRepository
+from app.repositories.trash import TrashRepository
 from app.repositories.users import UserRepository
 
 
@@ -34,7 +43,19 @@ class UnitOfWork:
         self.notes = NoteRepository(session)
         self.audit_log = AuditQueries(session)
         self.reports = ReportRepository(session)
-        self.live_records = LiveRecords(session, (Company, Contact, Deal))
+        self.live_records = LiveRecords(session, (Company, Contact, Deal, Activity))
+        self.outbox = OutboxRepository(session)
+        self.sent_notifications = SentNotificationRepository(session)
+        self.telegram_links = TelegramLinkRepository(session)  # раздел 16
+        self.notification_settings = NotificationSettingRepository(session)  # раздел 16
+        self.bulk_jobs = BulkJobRepository(session)
+        self.bulk_chunks = BulkChunkRepository(session)
+        self.bulk = BulkRepository(session)
+        self.failed_tasks = FailedTaskRepository(session)
+        self.import_errors = ImportErrorRepository(session)
+        self.imports = ImportRepository(session)  # staging и шаги задачи импорта
+        self.trash = TrashRepository(session)  # trash.purge
+        self.cleanup = CleanupRepository(session)  # maintenance.cleanup
 
     async def flush(self) -> None:
         """Отправить изменения в базу без коммита: проверить ограничения, получить значения

@@ -6,7 +6,7 @@
 3. все проверки и чтения (ответственный, ссылки, дубль email) — до присваивания полей:
    иначе autoflush отправил бы UPDATE раньше времени;
 4. новая версия в моём уровне (ensure_allowed, иначе 403 out_of_scope);
-5. журнал и commit.
+5. журнал, доменные события (хук _events: outbox в той же транзакции) и commit.
 """
 
 import uuid
@@ -16,6 +16,7 @@ from typing import Any
 from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.errors import Conflict
+from app.events.types import EventType, RecordAssigned
 from app.models import Company, Contact, Deal
 from app.repositories.audit import diff
 from app.repositories.contacts import ContactFilters
@@ -44,6 +45,8 @@ class CrmService[R: Record]:
     """Общее для компаний и контактов: создать, изменить, удалить в корзину, восстановить."""
 
     entity: str  # company / contact — для журнала и имён действий (contact:read)
+    # record.assigned новому ответственному (раздел 16). У компаний — нет: это общий справочник.
+    assigned_event = True
 
     def __init__(self, uow: UnitOfWork, roles: RoleCatalog) -> None:
         self.uow = uow
@@ -79,6 +82,7 @@ class CrmService[R: Record]:
         self.repo.add(obj)
         await self.uow.flush()  # id из базы — для журнала
         self._audit(access, "created", obj, {k: v for k, v in fields.items() if v is not None})
+        self._events(access, obj, None)
         await self.uow.commit()
         return obj
 
@@ -99,8 +103,39 @@ class CrmService[R: Record]:
             obj.owner_id, obj.team_id = owner.owner_id, owner.team_id
         if changed := diff(before, {f: getattr(obj, f) for f in before}):
             self._audit(access, "updated", obj, changed)
+            self._events(access, obj, before)
             await self.uow.commit()  # UPDATE … AND version = :v — гонка даст 409
         return obj
+
+    def _events(self, access: Access, obj: R, before: dict[str, Any] | None) -> None:
+        """Доменные события изменения — в outbox той же транзакции, перед коммитом (раздел 16):
+        откатилось изменение — откатилось и событие. before — значения полей до изменения
+        (None — запись создана). Только присваивания: id у записи уже есть (flush в _create).
+
+        record.assigned — новому ответственному, если его назначил не он сам: создание с чужим
+        ответственным или смена ответственного. Массовые операции событий по строкам не пишут —
+        у передачи клиентов одно сообщение через bulk_job.completed."""
+        if not self.assigned_event or obj.owner_id == access.user_id:
+            return
+        if before is not None and before["owner_id"] == obj.owner_id:
+            return
+        payload: RecordAssigned = {
+            "entity_type": self.entity,
+            "entity_id": obj.id,
+            "title": self._title(obj),
+            "owner_id": str(obj.owner_id),
+            "actor_id": str(access.user_id),
+        }
+        self.uow.outbox.add(EventType.RECORD_ASSIGNED, dict(payload), org_id=obj.org_id)
+
+    @staticmethod
+    def _title(obj: R) -> str:
+        """Как запись называется в уведомлении: имя контакта, название сделки."""
+        if isinstance(obj, Contact):
+            return f"{obj.first_name} {obj.last_name}".strip()
+        if isinstance(obj, Deal):
+            return obj.title
+        return obj.name
 
     async def delete(self, access: Access, entity_id: int) -> None:
         obj = await self._for_change(access, entity_id)
@@ -109,7 +144,9 @@ class CrmService[R: Record]:
         await self.uow.commit()
 
     async def restore(self, access: Access, entity_id: int) -> R:
-        obj = await self.repo.get_deleted_or_404(entity_id, access)
+        # FOR UPDATE до коммита: trash.purge (SKIP LOCKED) такую строку пропустит, а restore,
+        # который ждал чанк purge, после его коммита строки уже не найдёт — 404.
+        obj = await self.repo.get_deleted_or_404(entity_id, access, for_update=True)
         await self._before_restore(access, obj)
         owner = await owner_for_restore(self.uow, obj)
         access.ensure_allowed(owner)  # ответственный мог перейти в чужой для меня отдел
@@ -126,6 +163,7 @@ class CrmService[R: Record]:
 
 class CompanyService(CrmService[Company]):
     entity = "company"
+    assigned_event = False  # компании — общий справочник: о смене ответственного не пишем
 
     @property
     def repo(self) -> SoftDeleteRepository[Company]:

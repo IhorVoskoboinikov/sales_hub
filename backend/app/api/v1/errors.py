@@ -13,5 +13,7 @@ PROTECTED: Responses = {
 }
 NOT_FOUND: Responses = {404: {"model": ErrorOut, "description": "Нет такой записи в организации"}}
 CONFLICT: Responses = {409: {"model": ErrorOut}}
+LENGTH_REQUIRED: Responses = {411: {"model": ErrorOut, "description": "Нет Content-Length"}}
+PAYLOAD_TOO_LARGE: Responses = {413: {"model": ErrorOut, "description": "Файл больше лимита"}}
 RATE_LIMITED: Responses = {429: {"model": ErrorOut, "description": "Слишком часто"}}
 VALIDATION: Responses = {422: {"model": ErrorOut}}

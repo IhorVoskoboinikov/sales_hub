@@ -6,12 +6,28 @@
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
+import structlog
+
 from app.authz.access import Access
 from app.errors import NotFound, ValidationFailed
 from app.models import Pipeline
 from app.repositories.reports import ManagerRow, StageRow
 from app.services.fx import Display, FxService
 from app.uow import UnitOfWork
+
+logger = structlog.get_logger("reports")
+
+
+async def refresh_reports(uow: UnitOfWork) -> bool:
+    """Обновить отчёты — один путь для задачи beat reports.refresh (каждые 5 минут) и make
+    refresh-reports. False — обновление уже идёт в другой сессии, этот запуск пропущен."""
+    refreshed = await uow.reports.refresh()
+    await uow.commit()  # и отпустить блокировку
+    if refreshed:
+        logger.info("reports_refreshed")
+    else:
+        logger.info("reports_refresh_skipped", reason="already_running")
+    return refreshed
 
 
 @dataclass(frozen=True)

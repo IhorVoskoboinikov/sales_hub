@@ -58,6 +58,16 @@ class ValidationFailed(AppError):
     code = "validation"
 
 
+class LengthRequired(AppError):
+    status = 411
+    code = "length_required"  # тело без Content-Length (Transfer-Encoding: chunked)
+
+
+class PayloadTooLarge(AppError):
+    status = 413
+    code = "payload_too_large"  # файл импорта больше лимита
+
+
 class RateLimited(AppError):
     status = 429
     code = "rate_limited"

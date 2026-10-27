@@ -3,7 +3,8 @@
 супер-админ → организация → приглашение её админа → письмо → invite/accept → логин → /me →
 истёк access → refresh →
 повтор старого refresh (кража) → отзыв сессии → забыл пароль → письмо → сброс → старые
-токены мертвы, вход с новым паролем. Письма читаются через API Mailpit, сроки — freezegun.
+токены мертвы, вход с новым паролем. Письма доставляет из outbox и читает из Mailpit inbox(),
+сроки — freezegun.
 """
 
 import uuid
@@ -17,13 +18,12 @@ from httpx import AsyncClient
 from app.services.users import create_superadmin
 from app.uow import UnitOfWork
 from tests.integration.conftest import (
-    Mailpit,
+    Inbox,
     MakeOrg,
     MakeUser,
     bearer,
     login,
     member,
-    read_emails,
     token_from_email,
     tokens_for,
 )
@@ -38,7 +38,7 @@ def later(**delta: float) -> AbstractContextManager[Any]:
     return freeze_time(datetime.now(UTC) + timedelta(**delta), real_asyncio=True)
 
 
-async def test_whole_auth_scenario(client: AsyncClient, uow: UnitOfWork, mailpit: Mailpit) -> None:
+async def test_whole_auth_scenario(client: AsyncClient, uow: UnitOfWork, inbox: Inbox) -> None:
     # 1. Супер-админ из команды create-superadmin → Authorize.
     admin_email = f"root-{uuid.uuid4().hex[:8]}@example.com"
     await create_superadmin(uow, admin_email, ADMIN_PASSWORD)
@@ -58,7 +58,7 @@ async def test_whole_auth_scenario(client: AsyncClient, uow: UnitOfWork, mailpit
         headers=bearer(admin),
     )
     assert invited.status_code == 202
-    [invite_letter] = await read_emails(mailpit, email)
+    [invite_letter] = await inbox(email)
 
     # 3. invite/accept → вход новым пользователем → /me.
     accepted = await client.post(
@@ -99,9 +99,7 @@ async def test_whole_auth_scenario(client: AsyncClient, uow: UnitOfWork, mailpit
     current = await login(client, email, USER_PASSWORD)
     forgot = await client.post("/api/v1/auth/password/forgot", json={"email": email})
     assert forgot.status_code == 202
-    reset_letter = next(
-        e for e in await read_emails(mailpit, email) if e["Subject"] == "Зміна пароля в SalesHub"
-    )
+    reset_letter = next(e for e in await inbox(email) if e["Subject"] == "Зміна пароля в SalesHub")
     reset = await client.post(
         "/api/v1/auth/password/reset",
         json={"token": token_from_email(reset_letter), "new_password": NEW_PASSWORD},
@@ -134,13 +132,13 @@ async def test_session_cannot_outlive_30_days(client: AsyncClient, uow: UnitOfWo
 
 
 async def test_invite_expires_after_7_days(
-    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, inbox: Inbox
 ) -> None:
     org = await make_org()
     admin = await tokens_for(client, await member(make_user, org, "org_admin"))
     email = f"late-{uuid.uuid4().hex[:8]}@example.com"
     await client.post("/api/v1/invites", json={"email": email, "role": "viewer"}, headers=admin)
-    token = token_from_email((await read_emails(mailpit, email))[0])
+    token = token_from_email((await inbox(email))[0])
 
     with later(days=7, seconds=1):
         resp = await client.post(

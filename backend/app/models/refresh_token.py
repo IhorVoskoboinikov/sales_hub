@@ -26,8 +26,9 @@ class RefreshToken(Base):
     # Не продлевается при ротации: сессия живёт не дольше REFRESH_TTL_DAYS с момента входа.
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Индекс — для FK: удаление истёкших токенов (maintenance.cleanup) ищет ссылки на строку.
     replaced_by: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("refresh_tokens.id", ondelete="SET NULL")
+        ForeignKey("refresh_tokens.id", ondelete="SET NULL"), index=True
     )
     user_agent: Mapped[str | None] = mapped_column(String(255))
     ip: Mapped[str | None] = mapped_column(String(45))  # длина IPv6 в текстовом виде

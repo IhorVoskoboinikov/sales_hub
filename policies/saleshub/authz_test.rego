@@ -139,9 +139,29 @@ test_everyone_in_org_reads_reports_in_own_level if {
 	not authz.allow with input as req(super_admin, "GET", "/api/v1/reports/pipeline")
 }
 
+# Упавшие задачи Celery — системное, только супер-админ: админ организации их не видит.
+test_only_super_admin_sees_failed_tasks if {
+	routes := [
+		["GET", "/api/v1/admin/failed-tasks"],
+		["GET", "/api/v1/admin/failed-tasks/{failed_task_id}"],
+		["POST", "/api/v1/admin/failed-tasks/{failed_task_id}/replay"],
+	]
+	every r in routes {
+		d := authz.decision with input as req(super_admin, r[0], r[1])
+		d.allow
+		d.action == "admin:system"
+	}
+	every user in [org_admin, team_lead, sales_rep, viewer] {
+		every r in routes {
+			not authz.allow with input as req(user, r[0], r[1])
+		}
+	}
+}
+
 # У супер-админа нет организации, поэтому в обычные эндпоинты он не ходит.
 test_super_admin_only_admin_routes if {
 	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/orgs")
+	authz.allow with input as req(super_admin, "GET", "/api/v1/admin/failed-tasks")
 	not authz.allow with input as req(super_admin, "GET", "/api/v1/org")
 	not authz.allow with input as req(super_admin, "POST", "/api/v1/invites")
 }
@@ -183,12 +203,118 @@ rank := {"own": 1, "team": 2, "org": 3}
 # Массовые операции и выгрузка не шире, чем права на одну запись:
 # иначе через bulk можно было бы обойти ограничения роли.
 test_bulk_and_export_not_wider_than_single_record if {
-	pairs := {"bulk:run": "contact:write", "export:run": "contact:read"}
+	# Множество пар, а не объект: у bulk:run несколько «базовых» действий — передача клиентов
+	# меняет компании, контакты, сделки и активности одним уровнем bulk:run.
+	pairs := {
+		["bulk:run", "company:write"], ["bulk:run", "contact:write"],
+		["bulk:run", "deal:write"], ["bulk:run", "activity:write"],
+		["export:run", "contact:read"], ["bulk_job:cancel", "bulk_job:read"],
+	}
 	bad := {[name, a] |
 		some name, r in data.saleshub.roles
-		some a, base in pairs
+		some [a, base] in pairs
 		r.permissions[a]
 		not rank[r.permissions[a]] <= rank[r.permissions[base]]
 	}
 	count(bad) == 0
+}
+
+test_bulk_run_by_org_admin_and_team_lead if {
+	every user in [org_admin, team_lead] {
+		d := authz.decision with input as req(user, "POST", "/api/v1/bulk/reassign-owner")
+		d.allow
+		d.action == "bulk:run"
+	}
+	not authz.allow with input as req(super_admin, "POST", "/api/v1/bulk/reassign-owner")
+}
+
+# Менеджер не запускает массовые операции и не выгружает клиентов.
+test_sales_rep_has_no_bulk_and_export if {
+	not data.saleshub.roles.sales_rep.permissions["bulk:run"]
+	not data.saleshub.roles.sales_rep.permissions["export:run"]
+	not data.saleshub.roles.sales_rep.permissions["bulk_job:read"]
+	not authz.allow with input as req(sales_rep, "POST", "/api/v1/bulk/reassign-owner")
+	not authz.allow with input as req(sales_rep, "GET", "/api/v1/bulk-jobs/{job_id}")
+}
+
+# Наблюдатель выгружает (export:run — org), но массовых изменений не запускает.
+test_viewer_exports_but_cannot_run_bulk if {
+	data.saleshub.roles.viewer.permissions["export:run"] == "org"
+	not data.saleshub.roles.viewer.permissions["bulk:run"]
+	not authz.allow with input as req(viewer, "POST", "/api/v1/bulk/reassign-owner")
+}
+
+# Импорт CSV — массовая операция (bulk:run): админ и руководитель запускают, менеджер и
+# наблюдатель — нет (импорт создаёт и меняет контакты, как bulk:run к contact:write).
+test_contacts_import_is_bulk_run if {
+	every user in [org_admin, team_lead] {
+		d := authz.decision with input as req(user, "POST", "/api/v1/contacts/import")
+		d.allow
+		d.action == "bulk:run"
+	}
+	every user in [sales_rep, viewer, super_admin] {
+		not authz.allow with input as req(user, "POST", "/api/v1/contacts/import")
+	}
+}
+
+# Ошибки строк импорта видит тот, кто видит job (bulk_job:read); у менеджера job нет.
+test_import_errors_follow_job_read if {
+	every user in [org_admin, team_lead, viewer] {
+		d := authz.decision with input as req(user, "GET", "/api/v1/bulk-jobs/{job_id}/errors")
+		d.allow
+		d.action == "bulk_job:read"
+	}
+	not authz.allow with input as req(sales_rep, "GET", "/api/v1/bulk-jobs/{job_id}/errors")
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/bulk-jobs/{job_id}/errors")
+}
+
+# Наблюдатель видит только свои job (выгрузки в S3 — этап 10).
+test_viewer_reads_own_jobs if {
+	data.saleshub.roles.viewer.permissions["bulk_job:read"] == "own"
+	every route in ["/api/v1/bulk-jobs/{job_id}", "/api/v1/bulk-jobs/{job_id}/events"] {
+		d := authz.decision with input as req(viewer, "GET", route)
+		d.allow
+		d.action == "bulk_job:read"
+	}
+}
+
+# Отменить job может тот, кто её видит: админ, руководитель и наблюдатель (свои выгрузки);
+# менеджер — нет, у него нет ни bulk_job:read, ни bulk_job:cancel.
+test_bulk_job_cancel if {
+	every user in [org_admin, team_lead, viewer] {
+		d := authz.decision with input as req(user, "POST", "/api/v1/bulk-jobs/{job_id}/cancel")
+		d.allow
+		d.action == "bulk_job:cancel"
+	}
+	data.saleshub.roles.viewer.permissions["bulk_job:cancel"] == "own"
+	not data.saleshub.roles.sales_rep.permissions["bulk_job:cancel"]
+	not authz.allow with input as req(sales_rep, "POST", "/api/v1/bulk-jobs/{job_id}/cancel")
+	not authz.allow with input as req(super_admin, "POST", "/api/v1/bulk-jobs/{job_id}/cancel")
+}
+
+# Закрытие просроченных сделок и теги сегмента — массовые операции (bulk:run): админ и
+# руководитель запускают, менеджер и наблюдатель — нет.
+test_close_overdue_and_tags_are_bulk_run if {
+	routes := ["/api/v1/bulk/close-overdue-deals", "/api/v1/bulk/add-tags", "/api/v1/bulk/remove-tags"]
+	every route in routes {
+		every user in [org_admin, team_lead] {
+			d := authz.decision with input as req(user, "POST", route)
+			d.allow
+			d.action == "bulk:run"
+		}
+		every user in [sales_rep, viewer, super_admin] {
+			not authz.allow with input as req(user, "POST", route)
+		}
+	}
+}
+
+# Выгрузка — export:run: наблюдатель выгружает, менеджер — нет (раздел 5).
+test_contacts_export if {
+	every user in [org_admin, team_lead, viewer] {
+		d := authz.decision with input as req(user, "GET", "/api/v1/contacts/export")
+		d.allow
+		d.action == "export:run"
+	}
+	not authz.allow with input as req(sales_rep, "GET", "/api/v1/contacts/export")
+	not authz.allow with input as req(super_admin, "GET", "/api/v1/contacts/export")
 }

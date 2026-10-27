@@ -17,17 +17,9 @@ class Email:
 
 
 class EmailSender(Protocol):
-    """Отправить письмо прямо сейчас."""
+    """Отправить письмо прямо сейчас. Есть только у воркеров (Resources, for_worker=True)."""
 
     async def send(self, email: Email) -> None: ...
-
-
-class Mailer(Protocol):
-    """Куда сервис отдаёт письмо. Когда и как оно уйдёт — решает реализация (сейчас —
-    BackgroundTasks, на этапе 5 — outbox и очередь). Вызывать после коммита: письмо о том,
-    чего нет в базе, отправлять нельзя."""
-
-    def send_later(self, email: Email) -> None: ...
 
 
 class SmtpEmailSender:

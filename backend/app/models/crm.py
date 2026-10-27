@@ -36,6 +36,16 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
 ALIVE = text("deleted_at IS NULL")
+# Корзина: предикат частичных индексов «наоборот» — список корзины и trash.purge (раздел 3).
+TRASH = "deleted_at IS NOT NULL"
+
+
+def trash_index(table: str) -> Index:
+    """(org_id, deleted_at, id) WHERE deleted_at IS NOT NULL: удалённые строки организации по
+    времени удаления. Маленький — в корзине доли процента строк."""
+    return Index(f"ix_{table}_trash", "org_id", "deleted_at", "id", postgresql_where=text(TRASH))
+
+
 # Текст поиска контакта: имя, фамилия и email одной строкой в нижнем регистре.
 # first_name и last_name NOT NULL, email может быть NULL — поэтому coalesce только у него.
 # Записано так, как Postgres хранит выражение индекса (со скобками и ::text), — тогда
@@ -93,7 +103,8 @@ class Company(CrmRecord, Base):
     __table_args__ = (
         # Список компаний сортируется по имени: keyset (name, id).
         Index("ix_companies_org_id_name", "org_id", "name", "id", postgresql_where=ALIVE),
-        # Удаление отдела и перевод человека проверяют, что записей нет (*.has_records).
+        # Удаление отдела и смена роли человека проверяют, что записей нет (*.has_records);
+        # перевод человека ищет записи, которые догонит job move_team.
         Index("ix_companies_team_id", "team_id", postgresql_where=ALIVE),
         Index("ix_companies_owner_id", "owner_id", postgresql_where=ALIVE),
         # Поиск ?q= по подстроке: ILIKE '%acme%' через триграммы (pg_trgm).
@@ -104,6 +115,8 @@ class Company(CrmRecord, Base):
             postgresql_ops={"name": "gin_trgm_ops"},
             postgresql_where=ALIVE,
         ),
+        # Корзина: trash.purge (с этапа 5, миграция — CONCURRENTLY).
+        trash_index("companies"),
     )
 
     name: Mapped[str] = mapped_column(String(200))
@@ -142,14 +155,8 @@ class Contact(CrmRecord, Base):
         ),
         # Сегмент по тегу: tags @> ARRAY['vip'].
         Index("ix_contacts_tags", "tags", postgresql_using="gin", postgresql_where=ALIVE),
-        # Корзина: удалённые, новые сначала.
-        Index(
-            "ix_contacts_trash",
-            "org_id",
-            "deleted_at",
-            "id",
-            postgresql_where=text("deleted_at IS NOT NULL"),
-        ),
+        # Корзина: удалённые, новые сначала; и trash.purge.
+        trash_index("contacts"),
     )
 
     company_id: Mapped[int | None] = mapped_column(ForeignKey("companies.id", ondelete="SET NULL"))

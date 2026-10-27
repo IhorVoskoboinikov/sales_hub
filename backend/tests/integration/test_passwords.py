@@ -8,13 +8,12 @@ from httpx import AsyncClient, Response
 from app.uow import UnitOfWork
 from tests.integration.conftest import (
     PASSWORD,
-    Mailpit,
+    Inbox,
     MakeOrg,
     MakeUser,
     bearer,
     login,
     member,
-    read_emails,
     token_from_email,
     tokens_for,
 )
@@ -44,7 +43,7 @@ async def refresh_status(client: AsyncClient, tokens: dict[str, Any]) -> int:
 
 
 async def test_forgot_and_reset_kills_old_tokens(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, inbox: Inbox
 ) -> None:
     # email — в переменной: ответ 401 откатывает сессию теста, и объект user «протухает».
     email = unique_email()
@@ -52,7 +51,7 @@ async def test_forgot_and_reset_kills_old_tokens(
     old = await login(client, email)
 
     assert (await forgot(client, email)).status_code == 202
-    [letter] = await read_emails(mailpit, email)
+    [letter] = await inbox(email)
     assert letter["Subject"] == "Зміна пароля в SalesHub"
     resp = await reset(client, token_from_email(letter))
 
@@ -64,21 +63,21 @@ async def test_forgot_and_reset_kills_old_tokens(
     await login(client, email, NEW_PASSWORD)
 
 
-async def test_forgot_does_not_reveal_unknown_email(client: AsyncClient, mailpit: Mailpit) -> None:
+async def test_forgot_does_not_reveal_unknown_email(client: AsyncClient, inbox: Inbox) -> None:
     email = unique_email()
 
     resp = await forgot(client, email)
 
     assert resp.status_code == 202
-    assert await read_emails(mailpit, email) == []
+    assert await inbox(email) == []
 
 
 async def test_reset_token_works_once(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, inbox: Inbox
 ) -> None:
     user = await make_user(unique_email())
     await forgot(client, user.email)
-    token = token_from_email((await read_emails(mailpit, user.email))[0])
+    token = token_from_email((await inbox(user.email))[0])
 
     assert (await reset(client, token)).status_code == 204
     again = await reset(client, token, "another password 2")
@@ -88,13 +87,13 @@ async def test_reset_token_works_once(
 
 
 async def test_invite_token_cannot_reset_password(
-    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, make_org: MakeOrg, inbox: Inbox
 ) -> None:
     org = await make_org()
     admin = await tokens_for(client, await member(make_user, org, "org_admin"))
     invited = unique_email()
     await client.post("/api/v1/invites", json={"email": invited, "role": "viewer"}, headers=admin)
-    invite_token = token_from_email((await read_emails(mailpit, invited))[0])
+    invite_token = token_from_email((await inbox(invited))[0])
 
     resp = await reset(client, invite_token)
 
@@ -172,17 +171,17 @@ async def test_change_password_is_rate_limited(client: AsyncClient, make_user: M
 
 
 async def test_forgot_for_blocked_user_sends_nothing(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, inbox: Inbox
 ) -> None:
     email = unique_email()
     await make_user(email, is_active=False)
 
     assert (await forgot(client, email)).status_code == 202
-    assert await read_emails(mailpit, email) == []
+    assert await inbox(email) == []
 
 
 async def test_reset_is_refused_if_user_was_blocked_after_forgot(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit, uow: UnitOfWork
+    client: AsyncClient, make_user: MakeUser, inbox: Inbox, uow: UnitOfWork
 ) -> None:
     email = unique_email()
     user = await make_user(email)
@@ -190,19 +189,19 @@ async def test_reset_is_refused_if_user_was_blocked_after_forgot(
     user.is_active = False
     await uow.commit()
 
-    resp = await reset(client, token_from_email((await read_emails(mailpit, email))[0]))
+    resp = await reset(client, token_from_email((await inbox(email))[0]))
 
     assert resp.status_code == 403
     assert resp.json()["code"] == "auth.user_inactive"
 
 
 async def test_weak_reset_password_does_not_burn_token(
-    client: AsyncClient, make_user: MakeUser, mailpit: Mailpit
+    client: AsyncClient, make_user: MakeUser, inbox: Inbox
 ) -> None:
     email = unique_email()
     await make_user(email)
     await forgot(client, email)
-    token = token_from_email((await read_emails(mailpit, email))[0])
+    token = token_from_email((await inbox(email))[0])
 
     weak = await reset(client, token, email)  # пароль = email
 

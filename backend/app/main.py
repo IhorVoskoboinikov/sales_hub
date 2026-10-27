@@ -3,9 +3,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-import httpx
 from fastapi import FastAPI
-from redis.asyncio import Redis
 
 from app.api import health, well_known
 from app.api.v1 import (  # noqa: F401 — модули с эндпоинтами регистрируют маршруты
@@ -13,10 +11,14 @@ from app.api.v1 import (  # noqa: F401 — модули с эндпоинтам�
     admin_router,
     audit,
     auth,
+    bulk,
+    bulk_jobs,
     companies,
     contacts,
     deals,
+    failed_tasks,
     invites,
+    me,
     organizations,
     pipelines,
     protected_router,
@@ -24,49 +26,47 @@ from app.api.v1 import (  # noqa: F401 — модули с эндпоинтам�
     teams,
     users,
 )
-from app.authz.opa import OpaClient
 from app.authz.openapi import fetch_route_actions, install_openapi
 from app.authz.roles import RoleCatalog
 from app.core.config import Settings, get_settings
 from app.core.jwt import KeySet
 from app.core.logging import configure_logging
-from app.db.session import create_engine, create_session_factory
-from app.emails.sender import SmtpEmailSender
+from app.core.resources import Resources
 from app.errors.handlers import register_error_handlers
 from app.middleware.access_log import AccessLogMiddleware
 from app.middleware.request_id import RequestIdMiddleware
 from app.middleware.unhandled_errors import UnhandledErrorMiddleware
-from app.services.fx import NbuClient
+from app.services.exports import ExportSlots
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level, json=settings.log_json)
 
+    # Тот же data.yaml, что читает OPA. Нет файла — приложение не создаётся.
+    roles = RoleCatalog.load(settings.policies_dir)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Создаётся один раз при старте и закрывается при остановке процесса.
         # Соединения открываются лениво — при первом запросе, а не здесь.
         app.state.keys = KeySet.from_settings(settings)  # нет ключа — сервер не стартует
-        engine = create_engine(settings.database_url)
-        app.state.engine = engine
-        app.state.session_factory = create_session_factory(engine)
-        app.state.redis = Redis.from_url(
-            settings.redis_url, socket_connect_timeout=2, socket_timeout=2
-        )
-        http = httpx.AsyncClient()  # один пул соединений к OPA на процесс
-        app.state.opa = OpaClient(http, settings.opa_url)
-        app.state.nbu = NbuClient(http, settings.nbu_url)  # тот же пул: OPA и НБУ — разные хосты
-        if settings.show_docs:
-            app.state.route_actions = await fetch_route_actions(
-                app.state.opa, settings.opa_startup_attempts
-            )
+        resources = Resources.create(settings, roles=roles)
+        # Те же атрибуты app.state, что читает api/deps.py.
+        app.state.engine = resources.engine
+        app.state.session_factory = resources.session_factory
+        app.state.redis = resources.redis
+        app.state.opa = resources.opa
+        app.state.nbu = resources.nbu
+        app.state.storage = resources.storage
         try:
+            if settings.show_docs:
+                app.state.route_actions = await fetch_route_actions(
+                    resources.opa, settings.opa_startup_attempts
+                )
             yield
         finally:
-            await http.aclose()
-            await app.state.redis.aclose()
-            await engine.dispose()
+            await resources.aclose()
 
     app = FastAPI(
         title="SalesHub API",
@@ -77,16 +77,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url="/openapi.json" if settings.show_docs else None,
     )
     app.state.settings = settings
-    # Тот же data.yaml, что читает OPA. Нет файла — приложение не создаётся.
-    app.state.roles = RoleCatalog.load(settings.policies_dir)
-    app.state.email_sender = SmtpEmailSender(
-        host=settings.smtp_host,
-        port=settings.smtp_port,
-        sender=settings.email_from,
-        username=settings.smtp_username,
-        password=settings.smtp_password.get_secret_value() if settings.smtp_password else None,
-        start_tls=settings.smtp_start_tls,
-    )
+    app.state.roles = roles
+    app.state.export_slots = ExportSlots()  # идущие выгрузки CSV процесса (раздел 6)
 
     register_error_handlers(app)
     install_openapi(app, app.state.roles)
@@ -100,6 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(well_known.router)
     app.include_router(auth.router)
+    app.include_router(me.router)
     # Модули с эндпоинтами импортированы выше и объявили маршруты на этих роутерах. FastAPI 0.151
     # подключает роутер обёрткой (_IncludedRouter) и берёт его маршруты при каждом поиске.
     app.include_router(protected_router)

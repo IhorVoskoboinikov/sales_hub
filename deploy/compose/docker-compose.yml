@@ -8,7 +8,34 @@ x-app-env: &app-env
   APP_ENV: dev
   DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@postgres:5432/saleshub
   REDIS_URL: redis://redis:6379/0
+  CELERY_BROKER_URL: redis://redis:6379/1  # очереди Celery — отдельно от кэша (раздел 15)
+  BULK_CHUNK_SIZE: 10000  # строк в чанке массовой операции (раздел 6)
+  # bulk.reap_stuck (раздел 15): пороги в секундах и сколько раз переотправлять до bulk.stuck
+  BULK_REAP_PENDING_SECONDS: 120
+  BULK_REAP_STALL_SECONDS: 300
+  IMPORT_REAP_STALL_SECONDS: 900
+  BULK_MAX_REAPS: 3
+  TRASH_RETENTION_DAYS: 30  # trash.purge: корзина старше — насовсем (раздел 3)
+  # Файлы — S3 API сервиса rustfs (ключи — из его environment ниже), бакет создаёт migrate.
+  S3_ENDPOINT_URL: http://rustfs:9000
+  S3_ACCESS_KEY: saleshub
+  S3_SECRET_KEY: saleshub-secret
+  S3_BUCKET: saleshub
+  S3_REGION: us-east-1
+  # Импорт контактов из CSV (раздел 6): 100 МиБ и 1 млн строк на файл.
+  IMPORT_MAX_BYTES: 104857600
+  IMPORT_MAX_ROWS: 1000000
+  # Выгрузка в CSV: до 1 млн строк, 10 выгрузок в час на пользователя, 3 одновременно на процесс.
+  EXPORT_MAX_ROWS: 1000000
+  EXPORT_RATE_PER_HOUR: 10
+  EXPORT_MAX_CONCURRENT: 3
   SMTP_HOST: mailpit  # письма видно на localhost:8025
+  # Telegram-бот пользователей (раздел 16): токен и имя бота — в deploy/compose/.env. Без них
+  # make bot завершается с telegram_bot_token_missing, а POST /me/telegram/link — 503.
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+  TELEGRAM_API_URL: https://api.telegram.org
+  TELEGRAM_LINK_TTL_MINUTES: 10
   OPA_URL: http://opa:8181
   POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA
   LOG_LEVEL: INFO
@@ -49,15 +76,17 @@ services:
       timeout: 3s
       retries: 10
 
-  # Одноразовый: применяет миграции, готовит месячные партиции и завершается.
+  # Одноразовый: применяет миграции, готовит месячные партиции, создаёт бакет в RustFS
+  # (сам RustFS бакетов не создаёт; ensure-bucket ждёт его до 30 с) и завершается.
   # api стартует только после него.
   migrate:
     build: ../../backend
     image: saleshub-api:dev
-    command: ["sh", "-c", "alembic upgrade head && python -m app.cli ensure-partitions"]
+    command: ["sh", "-c", "alembic upgrade head && python -m app.cli ensure-partitions && python -m app.cli ensure-bucket"]
     environment: *app-env
     depends_on:
       postgres: {condition: service_healthy}
+      rustfs: {condition: service_started}
     restart: "no"
 
   # Одноразовый: создаёт супер-админа (идемпотентно — повторный запуск ничего не меняет).
@@ -97,6 +126,109 @@ services:
       timeout: 5s
       retries: 6
       start_period: 10s
+
+  # --- Воркеры Celery (раздел 15). Код смонтирован, как у api. У Celery нет --reload, поэтому
+  # воркеры перезапускает watchfiles: при сохранении .py он шлёт SIGINT, Celery дорабатывает
+  # текущую задачу (warm shutdown) и стартует заново. SIGTERM от docker stop watchfiles
+  # превращает в тот же SIGINT; stop_grace_period больше лимита чанка (90 с).
+  # healthcheck — ping именно этого воркера: ping без адресата был бы зелёным, пока жив хоть один.
+
+  worker:  # короткие задачи и письма; экземпляр один — лимит писем 50 в минуту общий
+    image: saleshub-api:dev
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "110",
+              "celery -A app.workers.celery_app:celery_app worker -Q default,notifications -c 4 -n worker@%h",
+              "/app/app"]
+    volumes: &worker-volumes
+      - ../../backend/app:/app/app:ro
+      - ../../policies:/policies:ro  # файл ролей data.yaml: сервисы проверяют уровень доступа
+    environment: *app-env
+    depends_on: &worker-depends-on
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping -d worker@$$HOSTNAME"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+      start_interval: 5s
+
+  worker-bulk:  # чанки bulk и импорт: тяжёлая работа, её убивает chaos-тест, не трогая письма
+    image: saleshub-api:dev
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "110",
+              "celery -A app.workers.celery_app:celery_app worker -Q bulk,imports -c 4 -n bulk@%h",
+              "/app/app"]
+    volumes: *worker-volumes
+    environment: *app-env
+    depends_on: *worker-depends-on
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping -d bulk@$$HOSTNAME"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 60s
+      start_interval: 5s
+
+  # Расписание (app/workers/schedule.py), ровно один: две копии продублируют задачи.
+  # Без watchfiles: правку расписания применяет make restart-workers. Состояние — в /tmp.
+  beat:
+    image: saleshub-api:dev
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "beat",
+              "-s", "/tmp/celerybeat-schedule"]
+    volumes: *worker-volumes
+    environment: *app-env
+    depends_on: *worker-depends-on
+
+  # Публикует outbox_events в Celery (раздел 15): LISTEN outbox_new + опрос раз в 2 с. Тоже через
+  # watchfiles: правка .py — SIGINT, relay дорабатывает текущий батч и стартует заново.
+  # Файл ролей и OPA ему не нужны. Без healthcheck: make up --wait ждёт только запуска.
+  outbox-relay:
+    image: saleshub-api:dev
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "25",
+              "python -m app.events.relay", "/app/app"]
+    volumes:
+      - ../../backend/app:/app/app:ro
+    environment: *app-env
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    # Батч — доли секунды; дольше ждёт только подключение к недоступной базе.
+    stop_grace_period: 30s
+
+  # Telegram-бот (раздел 16): long polling, ровно одна копия — две конфликтуют в getUpdates.
+  # Профиль telegram: make up его не запускает (токена может не быть), make bot — запускает.
+  # watchfiles, как у relay: правка .py — SIGINT, бот дожидается начатых апдейтов (до 20 с) и
+  # стартует заново. Вышедший сам процесс (нет токена) watchfiles не перезапускает: контейнер
+  # остаётся Up, причина — в make bot-logs.
+  # Файл ролей — для команд /today и /deals (шаг 5.13); OPA боту не нужен.
+  telegram-bot:
+    image: saleshub-api:dev
+    profiles: [telegram]
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "25",
+              "python -m app.bot", "/app/app"]
+    volumes: *worker-volumes
+    environment: *app-env
+    depends_on: *worker-depends-on
+    stop_grace_period: 30s
+
+  # Мониторинг задач по событиям воркеров. Без входа — порт только на localhost.
+  flower:
+    image: mher/flower:2.2.0
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+      FLOWER_PORT: "5555"
+    ports: ["127.0.0.1:5555:5555"]
+    depends_on:
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5555/healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   # Решения о доступе (раздел 5): «может ли роль вызвать эндпоинт». --watch — правка .rego и
   # data.yaml применяется сразу. Тесты политик (*_test.rego) серверу не нужны.

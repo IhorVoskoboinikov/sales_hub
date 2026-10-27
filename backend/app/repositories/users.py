@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Collection
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,9 +24,10 @@ class UserRepository:
         )
 
     async def get_for_share(self, user_id: uuid.UUID) -> User | None:
-        """FOR SHARE — человек становится ответственным за запись. Конфликтует с FOR UPDATE
-        в смене роли и отдела: перевод подождёт, пока запись создастся, и увидит её
-        (409 member.has_records), а не оставит запись в старом отделе."""
+        """FOR SHARE — человек становится ответственным за запись (или чанк bulk читает его
+        текущий отдел). Конфликтует с FOR UPDATE в смене роли и отдела: перевод подождёт, пока
+        запись создастся, и увидит её (job move_team догонит её до нового отдела; при смене
+        роли — 409 member.has_records), а не оставит запись в старом отделе незамеченной."""
         return await self.session.scalar(
             select(User)
             .where(User.id == user_id)
@@ -56,6 +58,34 @@ class UserRepository:
         if for_update:
             query = query.with_for_update().execution_options(populate_existing=True)
         return await self.session.scalar(query)
+
+    async def get_many(self, user_ids: Collection[uuid.UUID]) -> list[User]:
+        """Получатели уведомлений одним запросом; кого нет — того нет в ответе."""
+        if not user_ids:
+            return []
+        return list(
+            await self.session.scalars(
+                select(User)
+                .where(User.id.in_(list(user_ids)))
+                .execution_options(populate_existing=True)
+            )
+        )
+
+    async def active_team_leads(self, org_id: uuid.UUID, team_id: uuid.UUID) -> list[User]:
+        """Активные руководители отдела — им тоже приходит закрытие сделки (раздел 16)."""
+        return list(
+            await self.session.scalars(
+                select(User)
+                .where(
+                    User.org_id == org_id,
+                    User.team_id == team_id,
+                    User.role == Role.TEAM_LEAD,
+                    User.is_active,
+                )
+                .order_by(User.email)
+                .execution_options(populate_existing=True)
+            )
+        )
 
     async def count_active_admins(self, org_id: uuid.UUID) -> int:
         return (

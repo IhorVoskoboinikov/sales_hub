@@ -55,4 +55,18 @@ actions := {
 	# --- этап 4: отчёты
 	"GET /api/v1/reports/pipeline": "report:read",
 	"GET /api/v1/reports/managers": "report:read",
+	# --- этап 5: массовые операции и выгрузка (каждый шаг добавляет свои строки)
+	"POST /api/v1/bulk/reassign-owner": "bulk:run",
+	"GET /api/v1/bulk-jobs/{job_id}": "bulk_job:read",
+	"GET /api/v1/bulk-jobs/{job_id}/events": "bulk_job:read",
+	"POST /api/v1/bulk-jobs/{job_id}/cancel": "bulk_job:cancel",
+	"POST /api/v1/contacts/import": "bulk:run",
+	"GET /api/v1/bulk-jobs/{job_id}/errors": "bulk_job:read",
+	"POST /api/v1/bulk/close-overdue-deals": "bulk:run",
+	"POST /api/v1/bulk/add-tags": "bulk:run",
+	"POST /api/v1/bulk/remove-tags": "bulk:run",
+	"GET /api/v1/contacts/export": "export:run",
+	"GET /api/v1/admin/failed-tasks": "admin:system",
+	"GET /api/v1/admin/failed-tasks/{failed_task_id}": "admin:system",
+	"POST /api/v1/admin/failed-tasks/{failed_task_id}/replay": "admin:system",
 }

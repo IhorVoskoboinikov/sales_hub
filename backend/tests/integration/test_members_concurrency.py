@@ -1,7 +1,8 @@
 """Гонки в управлении людьми (настоящие транзакции, мимо общей транзакции теста).
 
 Два админа одновременно снимают или отключают друг друга: без блокировки организации оба
-увидели бы «админов двое» — и не осталось бы ни одного.
+увидели бы «админов двое» — и не осталось бы ни одного. Перевод менеджера в другой отдел, пока
+ему создают клиента: клиент не остаётся в старом отделе — его догоняет job move_team.
 """
 
 import asyncio
@@ -15,15 +16,19 @@ from sqlalchemy import delete as delete_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.authz.access import Access
+from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.db.session import create_engine, create_session_factory
 from app.errors import Conflict
-from app.models import Contact, Organization, Role, Team, User
+from app.models import AuditEntry, BulkJob, Contact, Organization, Role, Team, User
 from app.repositories.user_cache import UserCache
+from app.services.bulk import BulkService
 from app.services.crm import resolve_owner
 from app.services.members import MemberChanges, MemberService
 from app.services.organizations import TeamService
 from app.uow import UnitOfWork
+from tests.conftest import POLICIES_DIR
+from tests.integration.conftest import FakeTaskQueue
 
 
 @pytest.fixture
@@ -65,8 +70,8 @@ async def test_two_admins_cannot_remove_each_other(
     redis = Redis.from_url(settings.redis_url)
     try:
         async with sessions() as first, sessions() as second:
-            svc_a = MemberService(UnitOfWork(first), UserCache(redis))
-            svc_b = MemberService(UnitOfWork(second), UserCache(redis))
+            svc_a = MemberService(UnitOfWork(first), UserCache(redis), FakeTaskQueue())
+            svc_b = MemberService(UnitOfWork(second), UserCache(redis), FakeTaskQueue())
             # A снимает B и держит блокировку организации, пока не закоммитит…
             await first.get(Organization, org_id, with_for_update=True)
             b_demotes_a = asyncio.create_task(svc_b.change(admin_access(b), a.id, change))
@@ -131,15 +136,15 @@ async def test_team_delete_waits_for_member_moving_in(
             await s.commit()
 
 
-async def test_member_move_waits_for_record_being_created(
+async def test_record_created_during_member_move_follows_to_new_team(
     settings: Settings, sessions: async_sessionmaker[AsyncSession]
 ) -> None:
     """Менеджеру создают клиента, а админ одновременно переводит его в другой отдел.
 
-    Создание держит FOR SHARE на ответственном, перевод ждёт его и потом видит новую запись —
-    409 member.has_records, а не клиент, оставшийся в старом отделе. И без deadlock: проверка
-    FK контакта на организацию (FOR KEY SHARE) не конфликтует с FOR NO KEY UPDATE организации,
-    которую держит перевод."""
+    Создание держит FOR SHARE на ответственном, перевод ждёт его и потом видит новую запись в
+    старом отделе — создаёт job move_team, и после неё клиент в новом отделе, а не остался в
+    старом. И без deadlock: проверка FK контакта на организацию (FOR KEY SHARE) не конфликтует
+    с FOR NO KEY UPDATE организации, которую держит перевод."""
     org_id, rep_id = uuid.uuid4(), uuid.uuid4()
     teams = [uuid.uuid4(), uuid.uuid4()]
     async with sessions() as s:
@@ -159,32 +164,59 @@ async def test_member_move_waits_for_record_being_created(
         )
         await s.commit()
     rep_access = Access("contact:write", "own", rep_id, org_id, teams[0], "sales_rep")
+    admin = admin_access_for(org_id)
+    queue = FakeTaskQueue()
     redis = Redis.from_url(settings.redis_url)
     try:
+        async with sessions() as s:  # автор job — настоящий пользователь (FK bulk_jobs)
+            s.add(
+                User(
+                    id=admin.user_id,
+                    email=f"admin-{org_id.hex[:8]}@example.com",
+                    password_hash="x",
+                    org_id=org_id,
+                    role=Role.ORG_ADMIN,
+                )
+            )
+            await s.commit()
         async with sessions() as creating, sessions() as moving:
             uow = UnitOfWork(creating)
             owner = await resolve_owner(uow, rep_access, None)  # FOR SHARE на менеджере
             move = asyncio.create_task(
-                MemberService(UnitOfWork(moving), UserCache(redis)).change(
-                    admin_access_for(org_id),
-                    rep_id,
-                    MemberChanges(team_given=True, team_id=teams[1]),
+                MemberService(UnitOfWork(moving), UserCache(redis), queue).change(
+                    admin, rep_id, MemberChanges(team_given=True, team_id=teams[1])
                 )
             )
             await asyncio.sleep(0.5)
             assert not move.done()  # перевод ждёт, пока запись создастся
 
-            uow.contacts.add(
-                Contact(org_id=org_id, team_id=owner.team_id, owner_id=rep_id, first_name="Іван")
+            contact = Contact(
+                org_id=org_id, team_id=owner.team_id, owner_id=rep_id, first_name="Іван"
             )
+            uow.contacts.add(contact)
             await uow.commit()
+            contact_id = contact.id
 
-            with pytest.raises(Conflict) as exc:
-                await move
-            assert exc.value.code == "member.has_records"
+            changed = await move
+        assert changed.bulk_job_id is not None  # перевод увидел запись в старом отделе
+        assert queue.enqueued == [("bulk.plan", (str(changed.bulk_job_id),))]
+
+        async with sessions() as working:  # как воркер: plan и чанки в своих транзакциях
+            bulk = BulkService(
+                UnitOfWork(working), RoleCatalog.load(POLICIES_DIR), queue, chunk_size=10
+            )
+            for no in await bulk.plan(changed.bulk_job_id):
+                await bulk.run_chunk(changed.bulk_job_id, no)
+        async with sessions() as s:
+            moved = await s.get(Contact, contact_id)
+            job = await s.get(BulkJob, changed.bulk_job_id)
+        assert moved is not None and moved.team_id == teams[1]
+        assert job is not None and (job.status, job.processed) == ("done", 1)
     finally:
         await redis.aclose()
         async with sessions() as s:
+            await s.execute(delete_(BulkJob).where(BulkJob.org_id == org_id))
+            await s.execute(delete_(AuditEntry).where(AuditEntry.org_id == org_id))
             await s.execute(delete_(Contact).where(Contact.org_id == org_id))
             await s.execute(delete_(User).where(User.org_id == org_id))
             await s.execute(delete_(Team).where(Team.org_id == org_id))

@@ -20,6 +20,7 @@ USER = CurrentUser(
     email="ivan@example.com",
     is_superadmin=False,
     session_id=uuid.uuid4(),
+    token_version=0,
     org_id=ORG,
     team_id=TEAM,
     role="sales_rep",

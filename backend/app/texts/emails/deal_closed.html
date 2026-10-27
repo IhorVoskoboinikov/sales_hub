@@ -1,0 +1,6 @@
+{% extends "_notification.html" %}
+{% block content %}
+<p>Угоду «<b>{{ title }}</b>» закрито: <b>{{ result }}</b>.</p>
+<p>Сума: {{ amount }}.</p>
+<p>Відповідальний: {{ owner }}. Закрив: {{ actor }}.</p>
+{% endblock %}

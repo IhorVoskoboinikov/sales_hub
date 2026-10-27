@@ -3,7 +3,9 @@
 - owner_id: по умолчанию — тот, кто создаёт; руководитель и админ могут указать другого.
   Ответственным может быть только активный team_lead или sales_rep той же организации.
 - team_id: всегда отдел ответственного — его ставит сервис, из тела запроса он не берётся.
-  Пересчитывается только при создании, смене ответственного и восстановлении из корзины.
+  Пересчитывается только при создании, смене ответственного, восстановлении из корзины и (с
+  этапа 5) когда закрытая сделка или выполненная задача снова открыта: move_team такие записи
+  не переносит, и снова открытая запись догоняет текущий отдел ответственного.
 - Ссылка на другую запись (company_id, contact_id…) должна быть видна на чтение, иначе 422.
 """
 
@@ -38,14 +40,17 @@ def can_own(user: User | None, org_id: uuid.UUID) -> bool:
     )
 
 
-async def resolve_owner(uow: UnitOfWork, access: Access, owner_id: uuid.UUID | None) -> Owner:
+async def resolve_owner(
+    uow: UnitOfWork, access: Access, owner_id: uuid.UUID | None, *, field: str = "owner_id"
+) -> Owner:
     """Ответственный и его отдел. Можно ли мне назначить этого человека, проверяет потом
-    access.ensure_allowed(): sales_rep может назначить только себя, team_lead — свой отдел."""
+    access.ensure_allowed(): sales_rep может назначить только себя, team_lead — свой отдел.
+    field — поле запроса для ошибки 422 (у передачи клиентов — to_user_id)."""
     user = await uow.users.get_for_share(owner_id or access.user_id)
     if not can_own(user, access.org_id):
         # org_admin и viewer сами записей не ведут — нужно указать, кому запись.
         code = "owner.invalid" if owner_id is not None else "owner.required"
-        raise ValidationFailed(code, field="owner_id")
+        raise ValidationFailed(code, field=field)
     assert user is not None and user.team_id is not None
     return Owner(org_id=access.org_id, team_id=user.team_id, owner_id=user.id)
 

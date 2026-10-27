@@ -4,7 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +17,44 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://saleshub:saleshub@localhost:5432/saleshub"
     redis_url: str = "redis://localhost:6379/0"
+
+    # --- Воркеры (раздел 15): брокер — db 1 того же Redis, чтобы FLUSHDB кэша не стёр задачи.
+    celery_broker_url: str = "redis://localhost:6379/1"
+    # Секунды. Больше самой долгой задачи (запуск импорта — 12 минут), иначе Redis выдаст
+    # её повторно, пока она ещё выполняется.
+    celery_visibility_timeout: int = 1200
+    # Outbox relay (раздел 15): строк за одну транзакцию и сколько ждать NOTIFY до опроса.
+    outbox_batch_size: int = 100
+    outbox_poll_seconds: float = 2.0
+    # Массовые операции (раздел 6): строк в чанке. Границы чанков считаются по реальным
+    # строкам выборки, а не равными диапазонами id. 0 — ошибка конфигурации уже при старте.
+    bulk_chunk_size: int = Field(10_000, ge=1)
+    # bulk.reap_stuck (раздел 15), секунды: pending дольше — снова bulk.plan; running без
+    # прогресса дольше — снова pending-чанки; у импорта порог больше лимита запуска (12 минут).
+    # После bulk_max_reaps повторных отправок job проваливается с bulk.stuck.
+    bulk_reap_pending_seconds: int = Field(120, ge=1)
+    bulk_reap_stall_seconds: int = Field(300, ge=1)
+    import_reap_stall_seconds: int = Field(900, ge=1)
+    bulk_max_reaps: int = Field(3, ge=1)
+    # trash.purge (раздел 3): через сколько дней корзина удаляется насовсем.
+    trash_retention_days: int = Field(30, ge=1)
+
+    # --- Файлы (разделы 11 и 12): S3 API; локально — RustFS из compose (ключи — оттуда же).
+    s3_endpoint_url: str = "http://localhost:9000"
+    s3_access_key: str = "saleshub"
+    s3_secret_key: SecretStr = SecretStr("saleshub-secret")
+    s3_bucket: str = "saleshub"
+    s3_region: str = "us-east-1"
+    # Импорт контактов из CSV (раздел 6): размер файла в байтах (больше — 413) и строк (больше —
+    # job failed с import.too_many_rows).
+    import_max_bytes: int = Field(100 * 1024 * 1024, ge=1)
+    import_max_rows: int = Field(1_000_000, ge=1)
+    # Выгрузка контактов в CSV (раздел 6): строк в одном файле (больше — 422 export.too_large,
+    # «сузьте фильтр»), выгрузок в час на пользователя (больше — 429) и одновременных выгрузок
+    # на процесс API (больше — 429 export.busy): каждая держит соединение из пула 5 + 10.
+    export_max_rows: int = Field(1_000_000, ge=1)
+    export_rate_per_hour: int = Field(10, ge=1)
+    export_max_concurrent: int = Field(3, ge=1)
 
     # --- Вход по почте (раздел 4)
     # Путь относительно backend/ (в контейнере — /app). В dev файл создаёт make keys.
@@ -41,8 +79,22 @@ class Settings(BaseSettings):
     smtp_start_tls: bool = False
     email_from: str = "SalesHub <noreply@saleshub.local>"
 
+    # --- Telegram-бот пользователей (раздел 16). Без токена или имени бот не запускается
+    # (telegram_bot_token_missing), а POST /me/telegram/link отвечает 503 telegram.disabled.
+    telegram_bot_token: SecretStr | None = None
+    # Имя бота без @ — для ссылки https://t.me/<имя>?start=<токен> без запроса getMe.
+    telegram_bot_username: str | None = None
+    # Bot API: для бота и, с шага 5.12, для отправки из воркера; другой адрес — свой Bot API
+    # сервер или заглушка.
+    telegram_api_url: str = "https://api.telegram.org"
+    # Сколько живёт токен привязки из ссылки (email_tokens, цель telegram_link).
+    telegram_link_ttl_minutes: int = Field(10, ge=1)
+
     # --- Права (раздел 5): OPA и файл ролей policies/saleshub/data.yaml, который читают оба.
     opa_url: str = "http://localhost:8181"
+    # Ответ сайдкара — ~1 мс. В тестах больше: паузы сборщика мусора полного прогона pytest
+    # (тысячи тестов в памяти) иначе роняли бы запрос к OPA по таймауту в 503.
+    opa_timeout_seconds: float = 0.5
     policies_dir: Path = Path("../policies")  # относительно backend/; в контейнере — /policies
     # Сколько раз при старте спросить у OPA маршруты для Swagger (раз в секунду).
     opa_startup_attempts: int = 5
@@ -63,6 +115,11 @@ class Settings(BaseSettings):
         if self.docs_enabled is not None:
             return self.docs_enabled
         return self.app_env != "prod"
+
+    @property
+    def telegram_enabled(self) -> bool:
+        """Бот настроен: есть и токен, и имя для ссылки."""
+        return self.telegram_bot_token is not None and bool(self.telegram_bot_username)
 
     @property
     def log_json(self) -> bool:

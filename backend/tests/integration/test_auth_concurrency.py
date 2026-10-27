@@ -76,7 +76,11 @@ async def test_refresh_waits_for_logout_all(
             assert not refresh.done()
 
             current = CurrentUser(
-                id=user.id, email=email, is_superadmin=True, session_id=uuid.uuid4()
+                id=user.id,
+                email=email,
+                is_superadmin=True,
+                session_id=uuid.uuid4(),
+                token_version=user.token_version,
             )
             await logout.logout_all(current)  # отзыв всех токенов и коммит — refresh проснётся
 

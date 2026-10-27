@@ -1,4 +1,8 @@
-"""Письма собираются из Jinja2-шаблонов app/texts/emails/<имя>.txt и <имя>.html."""
+"""Письма собираются из Jinja2-шаблонов app/texts/emails/<имя>.txt и <имя>.html.
+
+Текст сообщения в Telegram — тот же шаблон .txt (render_text): уведомление одинаково в обоих
+каналах, а HTML Telegram без parse_mode не показывает.
+"""
 
 from pathlib import Path
 from typing import Any
@@ -25,3 +29,8 @@ def render_email(template: str, to: str, **context: Any) -> Email:
         text=_env.get_template(f"{template}.txt").render(**context),
         html=_env.get_template(f"{template}.html").render(**context),
     )
+
+
+def render_text(template: str, **context: Any) -> str:
+    """Только текстовая часть шаблона — для Telegram. Пустые строки по краям убраны."""
+    return _env.get_template(f"{template}.txt").render(**context).strip()

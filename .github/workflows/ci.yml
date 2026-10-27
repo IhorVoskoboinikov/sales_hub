@@ -6,11 +6,13 @@ on:
   push:
     branches: [main]
 
-# Новый пуш в PR отменяет ещё идущий прогон. В main — нет: иначе коммит быстрого второго мержа
-# остался бы без результата CI.
+# Новый пуш в PR отменяет ещё идущий прогон этого PR. В main у каждого коммита своя группа (sha):
+# его прогон не отменяется и не ждёт соседей. Общая группа на main не годится даже без отмены:
+# GitHub держит в группе один ждущий прогон и заменяет его новым — коммит в середине серии
+# быстрых мержей остался бы без результата CI.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
 
 defaults:
   run:

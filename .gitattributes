@@ -1,0 +1,2 @@
+# Схема API генерируется (make openapi): GitHub сворачивает её diff в PR.
+backend/openapi.json linguist-generated=true

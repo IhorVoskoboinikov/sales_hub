@@ -5,10 +5,12 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 # Regal — линтер Rego, тоже из Docker; конфиг .regal/config.yaml находится, потому что смонтирован весь репозиторий.
 REGAL = docker run --rm -v $(CURDIR):/work:ro -w /work ghcr.io/open-policy-agent/regal:0.43.0
 REGAL_ARGS ?=
+# oasdiff — сравнение схем OpenAPI (раздел 12), версия — как в job openapi.
+OASDIFF = docker run --rm -v $(CURDIR):/repo:ro -w /repo tufin/oasdiff:v1.34.1
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate migrations-check revision run test test-unit test-integration test-policy coverage lint fmt policy-lint policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
+.PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate migrations-check revision openapi openapi-diff run test test-unit test-integration test-policy coverage lint fmt policy-lint policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -99,6 +101,16 @@ refresh-reports:  ## обновить отчёты (materialized view deal_stats
 
 revision:  ## новая миграция по моделям: make revision m="add users"
 	$(BACKEND) uv run alembic revision --autogenerate -m "$(m)"
+
+openapi:  ## записать схему API в backend/openapi.json (файл в git; CI проверяет, что он свежий)
+	$(BACKEND) uv run python -m app.cli export-openapi
+
+OPENAPI_BASE ?= origin/main
+openapi-diff: openapi  ## изменения API относительно main (OPENAPI_BASE=<ветка>) и ломающие среди них, как в CI
+	@mkdir -p backend/tmp
+	git show $(OPENAPI_BASE):backend/openapi.json > backend/tmp/openapi.base.json
+	$(OASDIFF) changelog backend/tmp/openapi.base.json backend/openapi.json
+	$(OASDIFF) breaking backend/tmp/openapi.base.json backend/openapi.json
 
 run: keys  ## API без Docker с автоперезапуском (сначала make infra; с make up конфликт по порту 8000)
 	$(BACKEND) uv run uvicorn app.main:create_app --factory --reload --no-access-log

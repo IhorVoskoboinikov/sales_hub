@@ -1242,7 +1242,7 @@ raise Conflict("member.last_admin")        # → 409, code=member.last_admin, ti
 - Теги по ресурсам, версия API в префиксе `/api/v1`.
 - У каждой операции: требуемое право в описании (раздел 5) и `responses={401: …, 403: …, 404: …}` с моделью `ErrorOut`.
 - Примеры тел (`model_config = {"json_schema_extra": {"examples": [...]}}`) для bulk-эндпоинтов.
-- Swagger отключается в prod-профиле флагом `DOCS_ENABLED`; схема экспортируется в CI в `openapi.json` и на её основе генерируется TS-клиент для фронта.
+- Swagger отключается в prod-профиле флагом `DOCS_ENABLED`. Схема лежит в git — `backend/openapi.json` (шаг 6.3): `make openapi` (`python -m app.cli export-openapi`) строит её без запуска сервисов — `app.openapi()` без lifespan, ключи по алфавиту, тот же файл при каждом запуске. Пометок «Требуется: …» в файле нет: их Swagger берёт у OPA при старте, а согласованность маршрутов и политик и так проверяет `test_routes_match_policy`. CI проверяет, что файл свежий, и сравнивает его с файлом из `main` (раздел 12); `make openapi-diff` — то же локально. По этому файлу на этапе 11 генерируется TS-клиент.
 
 ### Health-эндпоинты
 
@@ -1554,7 +1554,7 @@ CI проверяет каждый PR (качество, тесты, мигра�
 | `unit` | `pytest tests/unit` (без покрытия — оно считается в `integration`) | — |
 | `integration` | `make coverage`: все тесты (unit + integration) с покрытием и порогами раздела 10; Postgres, Redis, OPA и др. поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре | lint |
 | `migrations` | `scripts/check_migrations.sh` на Postgres-сервисе: одна голова → upgrade → `alembic check` → downgrade base → upgrade (раздел 9) | lint |
-| `openapi` | экспорт `openapi.json`, diff с main (ломающие изменения подсвечиваются) | lint |
+| `openapi` | `export-openapi` → `backend/openapi.json` не изменился (иначе — «схема устарела: make openapi»); в PR — `oasdiff` против файла из базовой ветки (`git show`, без запуска её кода): `changelog` — в Summary, `breaking` — аннотациями; ломающие изменения подсвечиваются, но job не валят (API 0.x, часть ломок намеренные; блокировать — `--fail-on ERR`). В базовой ветке файла ещё нет — notice и без сравнения | lint |
 | `build` | `docker buildx` с кэшем GHA, без push | unit |
 | `helm` | `helm lint`, `helm template` + `kubeconform` | — |
 | `monitoring` | `promtool check rules`, `promtool test rules` | — |
@@ -1825,7 +1825,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 
 - [x] 6.1 Уровни тестов: маркеры `unit` / `integration` (ставятся по каталогу) и `policy` (код, который обязан совпадать с `policies/`), `strict = true` в pytest, `make test-policy`; покрытие — ядро `sysmon`, только строки (без `branch` и `concurrency = greenlet`: с ними sysmon на 3.13 откатывается на ctrace, а ctrace без greenlet теряет строки после `await`), пороги 80% для `services/` и `authz/` и 90% всего — на общем покрытии unit + integration в job `integration` (unit сам по себе покрывает `services/` на 37%); Regal в `make policy-test` и job `policy`.
 - [x] 6.2 Job `migrations`: `scripts/check_migrations.sh` (одна голова → upgrade → `alembic check` → downgrade base → upgrade) на пустом Postgres-сервисе Actions и `make migrations-check` с одноразовым контейнером; `test_migrations.py` удаляется — его проверки переехали в job, а downgrade посреди общего прогона мешает xdist.
-- [ ] 6.3 Job `openapi`: `python -m app.cli export-openapi` → `backend/openapi.json` в git (`make openapi`); CI проверяет, что файл свежий, и сравнивает его с файлом из `main` через `oasdiff` — ломающие изменения подсвечиваются аннотациями и списком в Summary, job из-за них не падает.
+- [x] 6.3 Job `openapi`: `python -m app.cli export-openapi` → `backend/openapi.json` в git (`make openapi`); CI проверяет, что файл свежий, и сравнивает его с файлом из `main` через `oasdiff` — ломающие изменения подсвечиваются аннотациями и списком в Summary, job из-за них не падает.
 - [ ] 6.4 Job `build`: `docker/build-push-action` с кэшем слоёв `type=gha`, без публикации, и проверка, что образ без dev-зависимостей импортирует приложение и воркеры.
 - [ ] 6.5 Скорость: integration в 4 процесса (`pytest-xdist -n 4`, у каждого свои контейнеры), integration без `needs: lint`, одна версия uv в CI и Dockerfile, кэш uv; отмена устаревших прогонов только у PR.
 - [ ] 6.6 Обязательная проверка: job-агрегатор `ci-ok` (зелёный, только если зелёные все jobs) и ruleset на `main` — PR, `ci-ok` из GitHub Actions, ветка свежая, без force push и удаления; включается руками в GitHub по инструкции из раздела 12.

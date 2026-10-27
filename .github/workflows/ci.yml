@@ -79,6 +79,41 @@ jobs:
       - run: uv sync --locked
       - run: bash scripts/check_migrations.sh
 
+  # Схема API (раздел 12): backend/openapi.json свежая, ломающие изменения относительно базовой
+  # ветки подсвечиваются аннотациями и списком в Summary, но job не валят. Сервисы не нужны.
+  openapi:
+    needs: lint
+    runs-on: ubuntu-latest
+    env:
+      OASDIFF: docker run --rm -v ${{ github.workspace }}:/repo:ro -w /repo tufin/oasdiff:v1.34.1  # как в Makefile
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0  # у setup-uv нет тега v10, только точные версии
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: openapi.json is up to date
+        run: |
+          uv run python -m app.cli export-openapi
+          if ! git diff --quiet -- openapi.json; then
+            echo "::error file=backend/openapi.json::схема устарела: make openapi и закоммить backend/openapi.json"
+            git diff --stat -- openapi.json
+            exit 1
+          fi
+      - name: Breaking changes vs base branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth=1 origin "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
+          if ! git cat-file -e "origin/$GITHUB_BASE_REF:backend/openapi.json" 2>/dev/null; then
+            echo "::notice::в $GITHUB_BASE_REF ещё нет backend/openapi.json — сравнивать не с чем"
+            exit 0
+          fi
+          mkdir -p tmp
+          git show "origin/$GITHUB_BASE_REF:backend/openapi.json" > tmp/openapi.base.json
+          # Пути — от корня репозитория (/repo в контейнере): аннотации указывают на backend/openapi.json.
+          $OASDIFF changelog backend/tmp/openapi.base.json backend/openapi.json --format markdown >> "$GITHUB_STEP_SUMMARY"
+          $OASDIFF breaking backend/tmp/openapi.base.json backend/openapi.json --format githubactions
+
   # Политики OPA (раздел 5): Regal, формат, строгая проверка, opa test и покрытие не ниже 90%.
   # Та же версия OPA, что в compose и testcontainers; ставить opa и regal не нужно — make запускает их в Docker.
   policy:

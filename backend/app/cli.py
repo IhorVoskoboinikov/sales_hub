@@ -5,10 +5,12 @@ create-superadmin  создать супер-админа из SUPERADMIN_EMAIL 
 ensure-partitions  месячные партиции activities и audit_log на 2 месяца вперёд
 ensure-bucket      бакет S3_BUCKET в хранилище файлов (RustFS сам бакетов не создаёт)
 refresh-reports    обновить отчёты (REFRESH MATERIALIZED VIEW CONCURRENTLY deal_stats)
+export-openapi     записать схему OpenAPI в openapi.json (make openapi)
 """
 
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -109,6 +111,19 @@ async def refresh_reports_command(settings: Settings) -> int:
     return 0
 
 
+def export_openapi(settings: Settings, path: Path) -> None:
+    """Схема API в файл (раздел 12): он лежит в git, CI сравнивает его с main, этап 11 генерирует
+    по нему TS-клиент. lifespan не запускается — не нужны ни Postgres, ни Redis, ни OPA, ни ключ
+    JWT. Поэтому в файле нет пометок «Требуется: …»: их Swagger берёт у OPA при старте API."""
+    from app.main import create_app  # все роутеры нужны только этой команде
+
+    schema = create_app(settings).openapi()
+    # Ключи по алфавиту и кириллица как есть: файл одинаковый при каждом запуске, diff читаемый.
+    text = json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    path.write_text(text, encoding="utf-8")
+    print(f"схема OpenAPI: {path}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m app.cli")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -121,6 +136,10 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("ensure-partitions", help="месячные партиции на 2 месяца вперёд")
     commands.add_parser("ensure-bucket", help="создать бакет S3_BUCKET, если его нет")
     commands.add_parser("refresh-reports", help="обновить materialized view отчётов")
+    openapi = commands.add_parser("export-openapi", help="записать схему OpenAPI в файл")
+    openapi.add_argument(
+        "--out", type=Path, default=Path("openapi.json"), help="путь (по умолчанию — openapi.json)"
+    )
 
     args = parser.parse_args(argv)
     settings = get_settings()
@@ -133,6 +152,9 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(ensure_bucket_command(settings))
     if args.command == "refresh-reports":
         return asyncio.run(refresh_reports_command(settings))
+    if args.command == "export-openapi":
+        export_openapi(settings, args.out)
+        return 0
     return asyncio.run(create_superadmin_command(settings))
 
 

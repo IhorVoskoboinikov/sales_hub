@@ -1,15 +1,75 @@
 import uuid
 from collections.abc import Collection
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, time
+from typing import Any
 
-from sqlalchemy import delete, select
+from sqlalchemy import (
+    ColumnElement,
+    DateTime,
+    Select,
+    Time,
+    and_,
+    delete,
+    exists,
+    func,
+    literal,
+    literal_column,
+    select,
+    true,
+)
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import TelegramLink
+from app.models import (
+    Activity,
+    ActivityType,
+    NotificationSetting,
+    Organization,
+    Role,
+    SentNotification,
+    TelegramLink,
+    User,
+)
+from app.models.activities import OPEN
+from app.notifications.keys import TELEGRAM, digest_key_sql, reminder_key_sql
 
 # UNIQUE (chat_id): в него упирается гонка двух /start из одного чата (раздел 16).
 CHAT_CONSTRAINT = "uq_telegram_links_chat_id"
+
+# Напоминания — только о звонках и встречах: у задачи нет момента начала (раздел 16).
+REMINDER_TYPES = (ActivityType.CALL.value, ActivityType.MEETING.value)
+# Дайджест — тем, кто ведёт записи; org_admin и viewer ответственными не бывают.
+DIGEST_ROLES = (Role.TEAM_LEAD.value, Role.SALES_REP.value)
+
+
+@dataclass(frozen=True)
+class DueReminder:
+    """Строка выборки напоминаний: кому, в каком поясе показать время и о чём."""
+
+    user_id: uuid.UUID
+    org_id: uuid.UUID
+    zone: str  # coalesce(users.timezone, organizations.timezone)
+    activity_id: int
+    kind: str  # call / meeting
+    subject: str
+    due_at: datetime
+
+
+def _zone() -> ColumnElement[str]:
+    return func.coalesce(User.timezone, Organization.timezone)
+
+
+def _enabled(event_type: str, default: bool) -> tuple[Any, ColumnElement[bool]]:
+    """Условие join строки настроек пары (event_type, telegram) и итог «включено»: строка
+    пользователя, иначе умолчание — параметром из catalog.DEFAULTS, второго источника правды в
+    SQL нет."""
+    on = and_(
+        NotificationSetting.user_id == User.id,
+        NotificationSetting.event_type == event_type,
+        NotificationSetting.channel == TELEGRAM,
+    )
+    return on, func.coalesce(NotificationSetting.enabled, default)
 
 
 class TelegramLinkRepository:
@@ -80,3 +140,95 @@ class TelegramLinkRepository:
                 TelegramLink.linked_at == linked_at,
             )
         )
+
+    # --- задачи beat (раздел 16, «Напоминания и дайджест»): одним запросом от привязанных
+
+    @staticmethod
+    def reminders_query(
+        now: datetime, until: datetime, *, enabled_default: bool, limit: int
+    ) -> Select[Any]:
+        """Напоминания тика: telegram_links ⨝ users ⨝ LATERAL (открытые звонки и встречи этого
+        ответственного со сроком в (now, until], ещё не отправленные, до limit по сроку).
+
+        Ключ дедупа вычитается внутри LATERAL, до limit: отправленные не занимают места, и 21-е
+        напоминание уйдёт следующим тиком. Индекс — ix_activities_owner_id_due_at (owner_id,
+        due_at, id) WHERE done_at IS NULL в каждой партиции; предикат — литералом, как в
+        индексе. Активность — только своей организации: owner_id без FK копирует сервис."""
+        due = (
+            select(Activity.id, Activity.type, Activity.subject, Activity.due_at)
+            .where(
+                Activity.owner_id == User.id,
+                Activity.org_id == User.org_id,
+                literal_column(OPEN),
+                Activity.type.in_(REMINDER_TYPES),
+                Activity.due_at > now,
+                Activity.due_at <= until,
+                ~exists().where(
+                    SentNotification.dedup_key
+                    == reminder_key_sql(Activity.id, Activity.owner_id, Activity.due_at)
+                ),
+            )
+            .order_by(Activity.due_at, Activity.id)
+            .limit(limit)
+            .lateral("due")
+        )
+        on, enabled = _enabled("activity.reminder", enabled_default)
+        return (
+            select(
+                User.id,
+                User.org_id,
+                _zone(),
+                due.c.id,
+                due.c.type,
+                due.c.subject,
+                due.c.due_at,
+            )
+            .select_from(TelegramLink)
+            .join(User, User.id == TelegramLink.user_id)
+            .join(Organization, Organization.id == User.org_id)
+            .outerjoin(NotificationSetting, on)
+            .join(due, true())
+            .where(User.is_active, enabled)
+            .order_by(User.id, due.c.due_at, due.c.id)
+        )
+
+    async def reminders(
+        self, now: datetime, until: datetime, *, enabled_default: bool, limit: int
+    ) -> list[DueReminder]:
+        query = self.reminders_query(now, until, enabled_default=enabled_default, limit=limit)
+        return [DueReminder(*row) for row in await self.session.execute(query)]
+
+    @staticmethod
+    def digest_recipients_query(
+        now: datetime, *, enabled_default: bool, start: time, end: time
+    ) -> Select[User, str]:
+        """Кому сейчас утренний дайджест: активные team_lead и sales_rep с привязанным Telegram,
+        у которых местное время (coalesce(users.timezone, organizations.timezone)) в [start,
+        end), настройка включена, а ключа за местную дату ещё нет. Строка — (пользователь, его
+        пояс): по поясу сервис ставит команде срок — местный конец окна."""
+        local = func.timezone(_zone(), literal(now, DateTime(timezone=True)))
+        on, enabled = _enabled("digest.morning", enabled_default)
+        return (
+            select(User, _zone())
+            .select_from(TelegramLink)
+            .join(User, User.id == TelegramLink.user_id)
+            .join(Organization, Organization.id == User.org_id)
+            .outerjoin(NotificationSetting, on)
+            .where(
+                User.is_active,
+                User.role.in_(DIGEST_ROLES),
+                enabled,
+                local.cast(Time) >= start,
+                local.cast(Time) < end,
+                ~exists().where(SentNotification.dedup_key == digest_key_sql(User.id, local)),
+            )
+            .order_by(User.id)
+        )
+
+    async def digest_recipients(
+        self, now: datetime, *, enabled_default: bool, start: time, end: time
+    ) -> list[tuple[User, str]]:
+        query = self.digest_recipients_query(
+            now, enabled_default=enabled_default, start=start, end=end
+        )
+        return [(user, zone) for user, zone in await self.session.execute(query)]

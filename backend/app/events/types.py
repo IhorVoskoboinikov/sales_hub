@@ -11,7 +11,7 @@ bulk_job.completed — в 5.12. Тест test_every_event_type_has_route не д
 """
 
 from enum import StrEnum
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 
 class EventType(StrEnum):
@@ -33,6 +33,9 @@ class TelegramSend(TypedDict):
     user_id: str
     text: str  # простой текст без parse_mode — экранировать нечего
     dedup_key: str
+    # ISO-время UTC, после которого сообщение устарело и не отправляется (напоминание и
+    # дайджест, шаг 5.14); у сообщений notifier срока нет.
+    not_after: NotRequired[str]
 
 
 class RecordAssigned(TypedDict):

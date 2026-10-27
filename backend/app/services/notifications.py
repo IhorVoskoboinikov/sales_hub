@@ -14,6 +14,7 @@ sent_notifications: ключ занимается в той же транзак�
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -303,7 +304,12 @@ class NotificationService:
         перепривязку, даже к тому же чату, это не задевает — и коммит, без ретрая: канал
         выключен, пользователь включит его через /start.
         429, 5xx и сеть — исключение наружу, BaseTask повторит (429 — через retry_after + 1 с);
-        прочие 4xx — провал в failed_tasks. Бот не настроен (нет токена) — пропуск."""
+        прочие 4xx — провал в failed_tasks. Бот не настроен (нет токена) — пропуск.
+
+        Команда со сроком (not_after: напоминание, дайджест) после него не отправляется и ключ
+        не занимает: её текст устарел («через 14 хв» за минуту до встречи, «утренний» дайджест
+        днём). Ретрай после срока тоже выходит здесь — свежую команду, пока ключ свободен,
+        напишет следующий тик beat."""
         try:
             event = await self.uow.outbox.get(event_id)
             if event is None:
@@ -315,6 +321,11 @@ class NotificationService:
             payload = event.payload
             key = payload["dedup_key"]
             user_id = uuid.UUID(payload["user_id"])
+            not_after = payload.get("not_after")
+            if not_after is not None and datetime.now(UTC) >= datetime.fromisoformat(not_after):
+                logger.info("telegram_expired", event_id=event_id, dedup_key=key)
+                await self.uow.rollback()
+                return
             link = await self.uow.telegram_links.get(user_id)
             if link is None:
                 logger.info("telegram_not_linked", event_id=event_id, user_id=str(user_id))

@@ -414,13 +414,15 @@ def test_reaper_runs_every_minute() -> None:
     assert entry["options"] == {"expires": 60}  # пропущенные запуски не копятся
 
 
-def test_beat_schedule_has_all_maintenance_rows_with_expires_on_default_queue() -> None:
-    """Шаг 5.8: все строки таблицы «Расписание beat» (кроме напоминаний и дайджеста — 5.14).
-    Время — по Киеву; expires — интервал между запусками; очередь — default."""
+def test_beat_schedule_has_all_rows_with_expires_on_default_queue() -> None:
+    """Все строки таблицы «Расписание beat» (обслуживание — шаг 5.8, напоминания и дайджест —
+    5.14). Время — по Киеву; expires — интервал между запусками; очередь — default."""
     hour, day = 3600, 86400
     expected = {
         "workers.heartbeat": (crontab(), 60),
         "bulk.reap_stuck": (crontab(), 60),
+        "notifications.send_reminders": (crontab(), 60),
+        "notifications.morning_digest": (crontab(minute="*/15"), 900),
         "reports.refresh": (crontab(minute="*/5"), 300),
         "fx.fetch_nbu_rates": (crontab(minute=30, hour="18,19"), hour),
         "maintenance.create_partitions": (crontab(minute=0, hour=1), day),

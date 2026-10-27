@@ -5,6 +5,7 @@ import logging
 import traceback
 import uuid
 from collections.abc import Iterator
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,10 +20,17 @@ from app.emails.render import render_email, render_text
 from app.models import NotificationChannel
 from app.notifications import catalog
 from app.notifications.catalog import ALLOWED, DEFAULTS, NotificationEvent
-from app.notifications.keys import event_subject, job_subject, notify_key
+from app.notifications.keys import (
+    digest_key,
+    event_subject,
+    job_subject,
+    notify_key,
+    reminder_key,
+)
 from app.notifications.telegram import TelegramApiError, TelegramClient, TelegramUnavailable
 from app.workers.base import BaseTask, failed_task_values, is_retryable, retry_countdown
 from app.workers.celery_app import TASK_ROUTES, celery_app
+from app.workers.tasks import notifications as notification_tasks
 
 TOKEN = "777000:SECRET-token-value"
 BASE_URL = "http://telegram.unit"
@@ -74,14 +82,54 @@ def test_notifier_dedup_key_format() -> None:
     )
 
 
+def test_reminder_and_digest_key_format() -> None:
+    user_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    # Срок — unix-время в секундах, доли отбрасываются.
+    due_at = datetime(2026, 10, 27, 12, 15, 0, 999_999, tzinfo=UTC)
+
+    assert reminder_key(7, user_id, due_at) == (
+        "activity.reminder:7:00000000-0000-0000-0000-000000000001:1793103300:telegram"
+    )
+    # Перенос встречи и передача звонка другому — другой ключ.
+    assert reminder_key(7, user_id, due_at + timedelta(minutes=30)) != reminder_key(
+        7, user_id, due_at
+    )
+    assert reminder_key(7, uuid.uuid4(), due_at) != reminder_key(7, user_id, due_at)
+    assert digest_key(user_id, date(2026, 10, 27)) == (
+        "digest.morning:00000000-0000-0000-0000-000000000001:2026-10-27:telegram"
+    )
+
+
 def test_notify_and_telegram_tasks_go_to_default_queue() -> None:
     celery_app.loader.import_default_modules()
     router = celery_app.amqp.router
-    for name in ("notifications.notify", "notifications.send_telegram"):
+    for name in (
+        "notifications.notify",
+        "notifications.send_telegram",
+        "notifications.send_reminders",
+        "notifications.morning_digest",
+    ):
         assert name in celery_app.tasks
         assert name not in TASK_ROUTES
         assert router.route({}, name)["queue"].name == "default"
     assert celery_app.tasks["notifications.send_telegram"].rate_limit is None
+
+
+async def test_reminder_tasks_skip_without_bot_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Нет токена бота — тики напоминаний и дайджеста ничего не пишут: send_telegram такие
+    команды всё равно пропустил бы. Сессию задача даже не открывает."""
+
+    def no_session() -> None:
+        raise AssertionError("сессия не нужна")
+
+    res = SimpleNamespace(telegram=None, session_factory=no_session)
+    monkeypatch.setattr(notification_tasks, "resources", lambda: res)
+
+    with structlog.testing.capture_logs() as logs:
+        await notification_tasks._send_reminders()
+        await notification_tasks._morning_digest()
+
+    assert [log["event"] for log in logs] == ["reminders_skipped", "reminders_skipped"]
 
 
 # --- шаблоны: письмо и текст Telegram из одного .txt

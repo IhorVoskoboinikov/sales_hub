@@ -176,6 +176,11 @@ AGENDA_KINDS: dict[str, str] = {
     "email": "лист",
 }
 
+# Задачи beat (шаг 5.14): напоминание за 15 минут и заголовок утреннего дайджеста (дальше —
+# та же повестка, что у /today).
+REMINDER = "Через {minutes} хв (о {time}) — {kind}: {subject}"
+DIGEST_TITLE = "Доброго ранку! План на {date}:"
+
 # /deals: итог по всем открытым сделкам и до 10 новых.
 DEALS: dict[str, str] = {
     "total": "Ваші відкриті угоди: {count} на суму {amount}",

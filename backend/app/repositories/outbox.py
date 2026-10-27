@@ -2,6 +2,7 @@ import json
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import func, literal, select, update
@@ -83,11 +84,15 @@ class OutboxRepository:
         dedup_key: str,
         *,
         org_id: uuid.UUID | None = None,
+        not_after: datetime | None = None,
     ) -> OutboxEvent:
         """Команда «отправить сообщение в Telegram» (раздел 16): её выполнит
         notifications.send_telegram. Чат не записывается — его берут из telegram_links при
-        отправке: отвязанный за это время чат сообщения не получит."""
+        отправке: отвязанный за это время чат сообщения не получит. not_after — после этого
+        момента команда устарела, отправитель её пропустит (текст «через N хв» уже неверен)."""
         payload: TelegramSend = {"user_id": str(user_id), "text": text, "dedup_key": dedup_key}
+        if not_after is not None:
+            payload["not_after"] = not_after.isoformat()
         return self.add(EventType.TELEGRAM_SEND, dict(payload), org_id=org_id)
 
     async def scrub_token(self, event_id: int) -> None:

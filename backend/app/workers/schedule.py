@@ -29,6 +29,19 @@ BEAT_SCHEDULE: dict[str, dict[str, Any]] = {
         "schedule": crontab(),
         "options": {"expires": MINUTE},
     },
+    # Напоминания за 15 минут до звонков и встреч (раздел 16).
+    "notifications.send_reminders": {
+        "task": "notifications.send_reminders",
+        "schedule": crontab(),
+        "options": {"expires": MINUTE},
+    },
+    # Утренний дайджест: тем, у кого по их часовому поясу 09:00–12:00 (раздел 16). Каждые 15
+    # минут, а не в 09:00 по Киеву: у пользователей свои пояса.
+    "notifications.morning_digest": {
+        "task": "notifications.morning_digest",
+        "schedule": crontab(minute="*/15"),
+        "options": {"expires": 15 * MINUTE},
+    },
     # Отчёты: REFRESH deal_stats; идёт прошлое обновление — пропуск (advisory lock).
     "reports.refresh": {
         "task": "reports.refresh",

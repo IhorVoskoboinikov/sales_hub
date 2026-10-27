@@ -24,6 +24,11 @@ seed-организации, включая менеджера с наиболь
 С шага 5.13 — запросы команд бота /today и /deals: те же списки задач и сделок и итог открытых
 сделок, но на уровне own у каждой роли (бот показывает только свои записи).
 
+С шага 5.14 — запросы задач beat (один раз, у org_admin: они общие на всю базу): выборка
+напоминаний (LATERAL по ix_activities_owner_id_due_at каждой партиции) и получатели утреннего
+дайджеста. В seed-данных привязок Telegram нет, поэтому в транзакции замера все пользователи
+организации сначала «привязываются» (SETUP) — иначе LATERAL не выполнился бы ни разу.
+
 Ошибка — Seq Scan по большой таблице (companies, contacts, deals, activities и её партиции)
 больше SEQ_SCAN_PAGES страниц: код выхода 1. Запрос дольше SLOW_MS — предупреждение: индекс
 используется, но данных слишком много (например, частая подстрока в ?q= — см.
@@ -69,8 +74,10 @@ from app.repositories.contacts import (
 from app.repositories.deals import DealFilters, DealRepository
 from app.repositories.pagination import Page, encode_cursor
 from app.repositories.reports import ReportRepository
+from app.repositories.telegram_links import TelegramLinkRepository
 from app.repositories.trash import TrashRepository
 from app.services.agenda import DEALS_LIMIT, OVERDUE_LIMIT, TODAY_LIMIT
+from app.services.reminders import DIGEST_END, DIGEST_START, REMINDER_AHEAD, REMINDER_LIMIT
 from app.services.trash import PURGE_CHUNK
 
 BIG = re.compile(r"^(companies|contacts|deals|activities)(_p\d{4}_\d{2})?$")
@@ -88,16 +95,26 @@ BACKGROUND = frozenset(
         "чанк add-tags",
     }
 )
-# Запросы trash.purge не зависят от роли — проверяются один раз, у org_admin.
-PURGE = frozenset(
+# Запросы trash.purge и задач beat не зависят от роли — проверяются один раз, у org_admin.
+ONCE = frozenset(
     {
         "purge: чанк корзины сделок",
         "purge: чанк корзины контактов",
         "purge: чанк корзины компаний",
         "purge: заметки контакта",
         "purge: активности контакта без сделки",
+        "beat: напоминания",
+        "beat: получатели дайджеста",
     }
 )
+# Подготовка в транзакции замера (откатывается вместе с ним): привязать Telegram всем
+# пользователям организации. chat_id — отрицательные: настоящие id чатов положительные.
+LINK_ORG = (
+    "INSERT INTO telegram_links (user_id, chat_id)"
+    " SELECT id, -row_number() OVER (ORDER BY id) FROM users WHERE org_id = '{org_id}'"
+    " ON CONFLICT DO NOTHING"
+)
+SETUP = {"beat: напоминания": LINK_ORG, "beat: получатели дайджеста": LINK_ORG}
 
 
 @dataclass(frozen=True)
@@ -129,7 +146,9 @@ def render(statement: ClauseElement) -> tuple[str, list[str]]:
     )
     values = []
     for name in compiled.positiontup or []:
-        bind = compiled.binds[name]
+        # IN (...) раскрыт в type_1_1, type_1_2…: значения — под этими именами, а тип — у
+        # исходного параметра type_1 (с шага 5.14: типы активностей и роли в задачах beat).
+        bind = compiled.binds[name if name in compiled.binds else name.rsplit("_", 1)[0]]
         value = compiled.params[name]
         values.append(
             str(
@@ -148,8 +167,13 @@ def walk(node: dict[str, Any]) -> Iterator[dict[str, Any]]:
 
 
 async def explain(
-    conn: asyncpg.Connection, statement: ClauseElement, mode: str, pages: dict[str, int]
+    conn: asyncpg.Connection,
+    statement: ClauseElement,
+    mode: str,
+    pages: dict[str, int],
+    setup: str | None = None,
 ) -> tuple[float, int, str, list[str]]:
+    """setup — SQL до замера в той же транзакции (откатывается вместе с ним)."""
     sql, values = render(statement)
     await conn.execute(f"SET plan_cache_mode = force_{mode}_plan")
     await conn.execute(f"PREPARE q AS {sql}")  # PREPARE не транзакционен — DEALLOCATE в конце
@@ -159,6 +183,8 @@ async def explain(
         transaction = conn.transaction()
         await transaction.start()
         try:
+            if setup:
+                await conn.execute(setup)
             raw = await conn.fetchval(f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE q{args}")
         finally:
             await transaction.rollback()
@@ -272,6 +298,7 @@ async def main() -> int:
         size = settings.bulk_chunk_size
         no_filter = ContactRepository.filter_conditions(ContactFilters())
         purge_before = datetime.now(UTC) - timedelta(days=settings.trash_retention_days)
+        now = datetime.now(UTC)
 
         Builder = Callable[[Access], Any]  # Select с разными колонками
         checks: list[tuple[str, str, Builder]] = [
@@ -467,6 +494,21 @@ async def main() -> int:
                 ),
             ),
             ("бот /deals: итог", "deal:read", lambda a: deals.open_totals_query(a.own())),
+            # --- шаг 5.14: задачи beat — напоминания за 15 минут и получатели дайджеста.
+            (
+                "beat: напоминания",
+                "contact:read",
+                lambda a: TelegramLinkRepository.reminders_query(
+                    now, now + REMINDER_AHEAD, enabled_default=True, limit=REMINDER_LIMIT
+                ),
+            ),
+            (
+                "beat: получатели дайджеста",
+                "contact:read",
+                lambda a: TelegramLinkRepository.digest_recipients_query(
+                    now.replace(hour=7), enabled_default=True, start=DIGEST_START, end=DIGEST_END
+                ),
+            ),
         ]
 
         results: list[Result] = []
@@ -475,7 +517,7 @@ async def main() -> int:
                 acc = access(person, action, roles)
                 if acc is None:
                     continue  # у роли нет действия — в API это 403 от OPA
-                if name in PURGE and person.role != "org_admin":
+                if name in ONCE and person.role != "org_admin":
                     continue
                 queries = [(name, build(acc))]
                 if name == "контакты":
@@ -495,7 +537,10 @@ async def main() -> int:
                         queries.append(("чанк add-tags", chunk))
                 for query_name, query in queries:
                     for mode in ("custom", "generic"):
-                        ms, buffers, scans, problems = await explain(conn, query, mode, pages)
+                        setup = SETUP.get(query_name, "").format(org_id=person.org_id) or None
+                        ms, buffers, scans, problems = await explain(
+                            conn, query, mode, pages, setup
+                        )
                         warnings: list[str] = []
                         if query_name in BACKGROUND:
                             problems, warnings = [], problems

@@ -1,14 +1,26 @@
-"""Уведомления (разделы 15 и 16): notifier, письма и сообщения в Telegram из outbox.
+"""Уведомления (разделы 15 и 16): notifier, письма и сообщения в Telegram из outbox,
+напоминания и утренний дайджест.
 
-Все три задачи ставит relay, в аргументах только id строки outbox_events. Очередь — по имени в
-TASK_ROUTES: письма — notifications (общий rate limit), notify и Telegram — default.
+notify, send_email и send_telegram ставит relay, в аргументах только id строки outbox_events.
+Очередь — по имени в TASK_ROUTES: письма — notifications (общий rate limit), notify и Telegram —
+default. send_reminders и morning_digest ставит beat (шаг 5.14, очередь default): они только
+пишут команды telegram.send в outbox, отправляет их send_telegram.
 """
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+import structlog
+
+from app.services.fx import FxService
 from app.services.notifications import NotificationService
+from app.services.reminders import ReminderService
 from app.uow import UnitOfWork
 from app.workers.base import BaseTask
 from app.workers.celery_app import celery_app
 from app.workers.runtime import resources, run_async
+
+logger = structlog.get_logger("notifications")
 
 
 # rate_limit действует на экземпляр воркера: очередь notifications слушает ровно один воркер,
@@ -52,3 +64,41 @@ async def _send_telegram(event_id: int) -> None:
         await NotificationService(UnitOfWork(session), telegram=res.telegram).send_telegram(
             event_id
         )
+
+
+@celery_app.task(base=BaseTask, name="notifications.send_reminders")
+def send_reminders() -> None:
+    """Каждую минуту: напоминания за 15 минут до звонков и встреч (раздел 16)."""
+    run_async(_send_reminders())
+
+
+async def _send_reminders() -> None:
+    async with _reminders() as service:
+        if service is not None:
+            await service.send_reminders()
+
+
+@celery_app.task(base=BaseTask, name="notifications.morning_digest")
+def morning_digest() -> None:
+    """Каждые 15 минут: утренний дайджест тем, у кого по их поясу 09:00–12:00 (раздел 16)."""
+    run_async(_morning_digest())
+
+
+async def _morning_digest() -> None:
+    async with _reminders() as service:
+        if service is not None:
+            await service.morning_digest()
+
+
+@asynccontextmanager
+async def _reminders() -> AsyncIterator[ReminderService | None]:
+    """ReminderService на своей сессии. Бот не настроен (нет токена) — None: send_telegram такие
+    команды всё равно пропустил бы, а тик каждую минуту копил бы их в outbox зря."""
+    res = resources()
+    if res.telegram is None:
+        logger.info("reminders_skipped", reason="bot_not_configured")
+        yield None
+        return
+    async with res.session_factory() as session:
+        uow = UnitOfWork(session)
+        yield ReminderService(uow, res.roles, FxService(uow, res.redis, res.nbu))

@@ -89,10 +89,15 @@ chaos:  ## chaos-тест bulk на стенде make up: kill воркера п
 PG_CHECK = saleshub-migrations-check
 migrations-check:  ## проверки миграций, как в CI: одноразовый Postgres, одна голова, upgrade, check, downgrade, upgrade
 	@docker rm -f $(PG_CHECK) > /dev/null 2>&1 || true
-	@docker run -d --rm --name $(PG_CHECK) -e POSTGRES_USER=saleshub -e POSTGRES_PASSWORD=saleshub \
+	@docker run -d --name $(PG_CHECK) -e POSTGRES_USER=saleshub -e POSTGRES_PASSWORD=saleshub \
 		-e POSTGRES_DB=saleshub -p 127.0.0.1:55432:5432 postgres:18.6 > /dev/null
+	@# Ждём не дольше 30 с; без --rm: упавший Postgres успеет показать логи, удаляет контейнер trap.
 	@trap 'docker rm -f $(PG_CHECK) > /dev/null' EXIT; \
-	until docker exec $(PG_CHECK) pg_isready -q -U saleshub -d saleshub -h 127.0.0.1; do sleep 1; done; \
+	for i in $$(seq 30); do \
+		docker exec $(PG_CHECK) pg_isready -q -U saleshub -d saleshub -h 127.0.0.1 2> /dev/null && break; \
+		if [ $$i = 30 ]; then echo "Postgres не поднялся за 30 с:"; docker logs --tail 20 $(PG_CHECK); exit 1; fi; \
+		sleep 1; \
+	done; \
 	cd backend && DATABASE_URL=postgresql+asyncpg://saleshub:saleshub@127.0.0.1:55432/saleshub \
 		bash scripts/check_migrations.sh
 

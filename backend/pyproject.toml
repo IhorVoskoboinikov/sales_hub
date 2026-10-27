@@ -39,6 +39,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
     "respx>=0.23.1",
     "ruff==0.17.1",
     # Без экстры redis: она требует redis-py >= 7, а модулю Redis-контейнера хватает основного redis.
@@ -78,9 +79,32 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+# Незарегистрированный маркер, опечатка в настройке, нестрогий xfail — ошибка, а не предупреждение.
+strict = true
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
+    # Уровни (раздел 10): unit и integration ставятся сами по каталогу (tests/conftest.py).
+    "unit: tests/unit — без Docker",
+    "integration: tests/integration — настоящие Postgres, Redis, OPA и др. в testcontainers",
+    "policy: код, который обязан совпадать с policies/ (routes.rego, data.yaml); make test-policy",
     "worker: задачи выполняет настоящий воркер Celery (фикстура celery_worker)",
     "committing: тест коммитит в настоящих транзакциях, мимо общей транзакции теста",
 ]
+
+# Покрытие (раздел 10). Пороги — в make coverage (его вызывает job integration) на общем покрытии
+# unit + integration, а не здесь: fail_under — один общий порог без разбивки по каталогам, и
+# pytest-cov применил бы его к любому прогону с --cov, в том числе к частичному.
+[tool.coverage.run]
+source = ["app"]
+# sys.monitoring: на Python 3.13 почти без накладных (ctrace — +39%) и видит строки после await
+# в SQLAlchemy async (greenlet), которые ctrace без concurrency = greenlet теряет: сервис — 50%
+# вместо 97%. Ни branch, ни concurrency = greenlet не добавлять: с ними sysmon на 3.13 не
+# работает, и coverage молча (одним предупреждением) переключается на ctrace.
+core = "sysmon"
+relative_files = true
+
+[tool.coverage.report]
+skip_empty = true
+precision = 1
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]

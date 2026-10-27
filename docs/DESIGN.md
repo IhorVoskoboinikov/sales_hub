@@ -28,7 +28,7 @@ SalesHub — мульти-тенантная CRM для отделов прод�
 | События (этап 9) | Transactional outbox → Redpanda (Kafka API), aiokafka или FastStream | сравнение с Celery |
 | Логи | structlog (JSON), Loki |  |
 | Метрики / алерты | Prometheus, Grafana, Alertmanager → Telegram |  |
-| Тесты | pytest, pytest-asyncio, httpx, testcontainers, factory-boy, polyfactory |  |
+| Тесты | pytest, pytest-asyncio, pytest-xdist, pytest-cov (coverage, ядро sysmon), httpx, testcontainers, factory-boy, polyfactory |  |
 | Качество | ruff, mypy, pre-commit |  |
 | Пакеты | uv | быстрый lock и сборка образов |
 | Деплой | Docker, docker compose → k3d + Helm + Tilt, Sealed Secrets |  |
@@ -660,7 +660,7 @@ roles:
 
 ### Политики
 
-В проекте — OPA 1.21.3 (compose, testcontainers и CI). `make policy-test` запускает OPA из Docker: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies -v` и покрытие `--coverage --threshold 90`; тот же make-таргет — job `policy` в CI. Тесты на маршруты этапов 4–9 добавляются в `authz_test.rego` вместе с маршрутами. Намеренная опечатка в имени действия, неверный уровень и слишком широкий `export:run` роняют тесты.
+В проекте — OPA 1.21.3 (compose, testcontainers и CI). `make policy-test` запускает из Docker Regal 0.43.0 (линтер Rego, `.regal/config.yaml`), затем OPA: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies -v` и покрытие `--coverage --threshold 90`; тот же make-таргет — job `policy` в CI. Тесты на маршруты этапов 4–9 добавляются в `authz_test.rego` вместе с маршрутами. Намеренная опечатка в имени действия, неверный уровень и слишком широкий `export:run` роняют тесты.
 
 **Как читать Rego.** Обращение к отсутствующему ключу в Rego даёт не ошибку, а «нет значения» (undefined). Правило, в котором встретилось такое значение, просто не срабатывает, и берётся значение `default`. Поэтому для неописанного эндпоинта: `action` нет → ни одно `allow` не сработало → `allow = false`, `decision = {allow: false}`. Строка `permissions[action]` проверяет только, что ключ есть: значение `own` / `team` / `org` в условии считается истиной.
 
@@ -1242,7 +1242,7 @@ raise Conflict("member.last_admin")        # → 409, code=member.last_admin, ti
 - Теги по ресурсам, версия API в префиксе `/api/v1`.
 - У каждой операции: требуемое право в описании (раздел 5) и `responses={401: …, 403: …, 404: …}` с моделью `ErrorOut`.
 - Примеры тел (`model_config = {"json_schema_extra": {"examples": [...]}}`) для bulk-эндпоинтов.
-- Swagger отключается в prod-профиле флагом `DOCS_ENABLED`; схема экспортируется в CI в `openapi.json` и на её основе генерируется TS-клиент для фронта.
+- Swagger отключается в prod-профиле флагом `DOCS_ENABLED`. Схема лежит в git — `backend/openapi.json` (шаг 6.3): `make openapi` (`python -m app.cli export-openapi`) строит её без запуска сервисов — `app.openapi()` без lifespan, ключи по алфавиту, тот же файл при каждом запуске. Пометок «Требуется: …» в файле нет: их Swagger берёт у OPA при старте, а согласованность маршрутов и политик и так проверяет `test_routes_match_policy`. CI проверяет, что файл свежий, и сравнивает его с файлом из `main` (раздел 12); `make openapi-diff` — то же локально. По этому файлу на этапе 11 генерируется TS-клиент.
 
 ### Health-эндпоинты
 
@@ -1325,6 +1325,8 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 3. `alembic downgrade base` → `upgrade head` — миграции обратимы.
 4. Проверка «одна голова» (`alembic heads` = 1), чтобы параллельные ветки не сломали историю.
 
+Все четыре — `backend/scripts/check_migrations.sh` (голова проверяется первой: без базы и с понятным сообщением). Его запускают job `migrations` на пустом Postgres-сервисе Actions (`postgres:18.6`, как в compose) и `make migrations-check` — на одноразовом контейнере (порт 55432, удаляется после проверки): скрипт делает `downgrade base`, поэтому на базе стенда его не запускают. Нужен только `DATABASE_URL` — остальные настройки при импорте моделей не читаются. `ensure-partitions` в проверку не входит: партиции на два месяца вперёд создаёт сама миграция. Отдельного pytest-теста миграций нет (до шага 6.2 был `test_migrations.py`): те же проверки шли бы дважды, а `downgrade base` посреди прогона стирал бы общую базу тестов.
+
 ## 10. Тесты
 
 Три уровня: unit — сервисы и authz без БД (fake UoW), integration — реальные Postgres и Redis в контейнерах, e2e — несколько сценариев против поднятого стенда. Самый ценный набор — матрица прав «роль × эндпоинт × чужой/свой объект», генерируемая из кода.
@@ -1334,15 +1336,17 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 | Уровень | Что тестируем | Инструменты | Скорость |
 | --- | --- | --- | --- |
 | unit | `Access.matches` / `ensure_allowed`, `sql_filter` (компиляция SQL), сервисы с `FakeUnitOfWork`, правила управления пользователями (нельзя менять себе роль, отдел обязателен), нарезка чанков, маппинг ошибок | pytest, pytest-asyncio, polyfactory | секунды |
-| integration | репозитории на настоящем Postgres, API через `httpx.AsyncClient(transport=ASGITransport(app))`, миграции, Celery-задачи с реальным воркером на Redis из testcontainers, бот через `feed_update` | testcontainers (postgres, redis), factory-boy | десятки секунд |
+| integration | репозитории на настоящем Postgres, API через `httpx.AsyncClient(transport=ASGITransport(app))`, Celery-задачи с реальным воркером на Redis из testcontainers, бот через `feed_update` | testcontainers (postgres, redis), factory-boy | десятки секунд |
 | e2e (smoke) | логин → создать контакт → передать клиентов (bulk) → дождаться job | pytest против `tilt`/kind-стенда | минуты, в CD |
 | нагрузка (опц.) | список контактов и bulk на 5 млн | locust / k6 | вручную |
 | policy (Rego) | роль × эндпоинт (allow / 403), опечатки в действиях и уровнях `data.yaml` | opa test --coverage, Regal (линтер) | миллисекунды |
 | auth flow | приглашение → письмо → accept → login → refresh → повтор старого refresh (отзыв семьи) → reset | integration + Mailpit API (чтение писем из теста), freezegun для сроков | секунды |
 
+**Маркеры и запуск (шаг 6.1).** Уровень теста — его каталог: `tests/unit` и `tests/integration`; маркеры `unit` и `integration` ставит хук `pytest_collection_modifyitems` в `tests/conftest.py`, руками их не пишут. `policy` — код, который обязан совпадать с `policies/` (`test_roles.py`, `test_openapi_permissions.py`, `test_routes_policy.py`, `test_opa_client.py`, `test_access_matrix.py`; `pytestmark` в файле): это не отдельный уровень, а метка поверх него — после правки `.rego` или `data.yaml` хватает `make test-policy` (Regal, `opa test` и `pytest -m policy`). Сам Rego проверяет job `policy` (`make policy-test`) без Python. В pytest включён `strict = true`: незарегистрированный маркер или опечатка в настройке — ошибка. Выборки: `make test-unit`, `make test-integration` (по каталогу — так не импортируются модули другого уровня), `pytest -m "integration and not worker"`.
+
 ### Изоляция БД в integration-тестах
 
-- Один контейнер Postgres на сессию pytest, `alembic upgrade head` один раз.
+- Один контейнер Postgres на сессию pytest, `alembic upgrade head` один раз. С шага 6.5 тесты идут в 4 процесса (`pytest-xdist -n 4 --dist worksteal`, переменная `XDIST` в Makefile; `XDIST=` — в один процесс): сессионные фикстуры выполняются в каждом процессе, поэтому у каждого свои Postgres, Redis, Mailpit, OPA, RustFS и воркер Celery — `TRUNCATE` `committing`-тестов и общий Redis не задевают соседей, а pytest-cov сам собирает покрытие процессов. Больше 4 не ставим: на раннере CI 4 ядра, а процесс поднимает ~5 контейнеров. Полный набор локально — 2 мин 52 с вместо 9 мин 13 с, покрытие то же.
 - Каждый тест — во внешней транзакции с `SAVEPOINT` (`join_transaction_mode="create_savepoint"`), откат после теста: быстро и без очистки таблиц. Подменённая `get_session` при ошибке в запросе откатывает его SAVEPOINT — как настоящий запрос, который при ошибке ничего не сохраняет. После такого отката объекты сессии «протухают», поэтому значения, нужные тесту после ответа 4xx (например, email), держат в переменных.
 - Сессия подменяется через `app.dependency_overrides[get_session]`.
 - Таймаут запроса к OPA — настройка `OPA_TIMEOUT_SECONDS` (0,5 с: сайдкар отвечает за ~1 мс); в integration-тестах — 5 с: в полном прогоне pytest (тысячи тестов в памяти) пауза сборщика мусора дольше 0,5 с роняла кейс матрицы в 503 `opa`, всегда один и тот же.
@@ -1394,7 +1398,7 @@ async def test_access(role, route, target, route_actions, client, ...):
 - Бот: `create_dispatcher(...)` и `dp.feed_update(bot, update)` без сети — обработчики возвращают метод (`return message.answer(...)`), тест сравнивает его текст.
 - Время: freezegun для расписания, напоминаний и дайджеста.
 
-Покрытие собирается `pytest-cov`, порог в CI — 80% для `services/` и `authz/`, остальное без жёсткого порога.
+Покрытие собирается `pytest-cov` (настройки — `[tool.coverage.*]` в `pyproject.toml`), только строки. Ядро — `sysmon` (`sys.monitoring`): на Python 3.13 почти без накладных, а привычный ctrace замедлял прогон на 39% и без `concurrency = greenlet` терял строки после `await` в SQLAlchemy async (сервис организаций — 50% вместо 97%). `branch = true` и `concurrency = greenlet` не включаем: с ними `sysmon` на 3.13 не работает, и coverage одним предупреждением переключается на ctrace. Пороги проверяет `make coverage` (его же вызывает job `integration`): все тесты одним прогоном, `services/` и `authz/` — не ниже 80% каждый, всё приложение — не ниже 90%. Отдельно в job `unit` порога нет: unit-тесты сами по себе покрывают `services/` на 37% — сервисы проверяются на настоящей базе. `fail_under` в конфиг не пишется: pytest-cov применил бы его к любому прогону с `--cov`. На момент шага 6.1: `services/` — 96,7%, `authz/` — 96,5%, всё — 96,4% (1457 тестов, 9 мин 13 с локально).
 
 ## 11. Деплой: compose → Kubernetes → Tilt
 
@@ -1547,17 +1551,40 @@ CI проверяет каждый PR (качество, тесты, мигра�
 | Job | Шаги | Зависит от |
 | --- | --- | --- |
 | `lint` | `ruff check`, `ruff format --check`, `mypy app` | — |
-| `unit` | `pytest tests/unit --cov` | — |
-| `integration` | `pytest tests/integration`: Postgres и Redis поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре; там же проверки миграций (одна голова, `alembic check`, downgrade → upgrade) | lint |
-| `migrations` | upgrade → `alembic check` → downgrade base → upgrade; одна голова | lint |
-| `openapi` | экспорт `openapi.json`, diff с main (ломающие изменения подсвечиваются) | lint |
-| `build` | `docker buildx` с кэшем GHA, без push | unit |
+| `unit` | `pytest tests/unit` (без покрытия — оно считается в `integration`) | — |
+| `integration` | `make coverage`: все тесты (unit + integration) с покрытием и порогами раздела 10; Postgres, Redis, OPA и др. поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре; 4 процесса (`pytest-xdist`, раздел 10), `timeout-minutes: 20` | — |
+| `migrations` | `scripts/check_migrations.sh` на Postgres-сервисе: одна голова → upgrade → `alembic check` → downgrade base → upgrade (раздел 9) | lint |
+| `openapi` | `export-openapi` → `backend/openapi.json` не изменился (иначе — «схема устарела: make openapi»); в PR — `oasdiff` против файла из базовой ветки (`git show`, без запуска её кода): `changelog` — в Summary, `breaking` — аннотациями; ломающие изменения подсвечиваются, но job не валят (API 0.x, часть ломок намеренные; блокировать — `--fail-on ERR`). В базовой ветке файла ещё нет — notice и без сравнения | lint |
+| `build` | `docker/build-push-action` (стадия `runtime`, без push), кэш слоёв `type=gha`, `mode=max` — с ним кэшируется и стадия `builder` с `uv sync`; smoke-проверка образа без сети: импорт `app.main`, `app.cli`, воркеров, relay и бота, `alembic` и `celery` на месте — так ловится зависимость, попавшая только в dev-группу. Кэш-маунт uv из Dockerfile в GHA не сохраняется — не нужен: слой `uv sync` и так берётся из кэша, пока не менялся `uv.lock`. `backend/.dockerignore` не пускает в контекст сборки `tmp` (CSV `make import-csv` — десятки МБ), ключи, `.env`, тесты, данные покрытия и `openapi.json` | unit |
 | `helm` | `helm lint`, `helm template` + `kubeconform` | — |
 | `monitoring` | `promtool check rules`, `promtool test rules` | — |
 | `frontend` (если есть) | `npm ci`, lint, `vitest`, `vite build` | — |
-| `policy` | `make policy-test`: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies` и `--coverage --threshold 90` (OPA 1.21.3 из Docker); Regal (линтер Rego) — на этапе 6 | — |
+| `policy` | `make policy-test`: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies` и `--coverage --threshold 90` (OPA 1.21.3 из Docker), перед ними Regal 0.43.0 (линтер Rego, `.regal/config.yaml`; замечания — аннотациями в PR) | — |
+| `ci-ok` | агрегатор: `if: always()`, `needs` — все jobs выше; падает, если хоть один `failure`, `cancelled` или `skipped`. Единственная обязательная проверка защиты `main`; `tests/unit/test_ci.py` падает, если новый job забыли добавить в `needs` | все |
 
-Параллельность: всё, что не зависит друг от друга, идёт одновременно; кэш uv и Docker-слоёв обязателен, иначе CI будет медленным. Ветка `main` защищена: мерж только при зелёных обязательных проверках.
+Параллельность: всё, что не зависит друг от друга, идёт одновременно; кэш uv и Docker-слоёв обязателен, иначе CI будет медленным. `integration` — самый долгий job, поэтому он не ждёт `lint` (быстрая ошибка линтера экономит минуты раннера, но не время до результата; минуты публичного репозитория бесплатны). Кэш uv — `setup-uv` с `enable-cache` (ключ — `uv.lock`), версия uv закреплена (`version: "0.11.6"`) и совпадает с Dockerfile: CI и образ ставят зависимости одним и тем же uv. Образы testcontainers не кэшируются: ~1 ГБ через `docker save/load` грузился бы дольше, чем скачивается, а лимитов Docker Hub у раннеров GitHub нет. Новый пуш в PR отменяет идущий прогон этого PR, а у каждого коммита `main` своя группа concurrency (по sha): его прогон не отменяется и не ждёт соседей. Одна группа на `main` без отмены не помогла бы: GitHub держит в группе один ждущий прогон и заменяет его более новым — коммит в середине серии быстрых мержей остался бы без результата CI. Ветка `main` защищена: мерж только при зелёных обязательных проверках.
+
+### Защита ветки `main` (шаг 6.6)
+
+Включается руками в настройках GitHub, один раз; в репозитории — `.github/rulesets/main.json` (его можно импортировать) и job `ci-ok`.
+
+**Ruleset, а не классическая защита ветки.** Оба механизма умеют не пускать мерж без CI. Ruleset новее: его можно выключить, не удаляя, правила видны всем, у кого есть доступ на чтение (поэтому их проверяет `curl` без токена), обходы — явным списком. Включать оба не нужно — они складываются, и разбираться в них сложнее.
+
+**Одна обязательная проверка — `ci-ok`.** Требовать каждый job по отдельности неудобно: новый job (а их добавят этапы 7–9) — снова правка настроек; job-матрица даёт проверки `integration (1)`, `integration (2)`, и обязательная `integration` ждала бы вечно; workflow, пропущенный фильтром `paths`, оставляет обязательную проверку в «Expected» навсегда. Поэтому `on: pull_request` без `paths`, а обязательна только `ci-ok`. Имя проверки — id job-а (`ci-ok`), а не подпись `CI / ci-ok (pull_request)` со страницы PR; источник — GitHub Actions (`integration_id` 15368), чтобы её не подделал статус из другого места.
+
+| Правило | Значение | Почему |
+| --- | --- | --- |
+| Цель | ветка по умолчанию (`~DEFAULT_BRANCH`) | переживёт переименование `main` |
+| Restrict deletions, Block force pushes | вкл. | историю `main` не переписать и ветку не удалить |
+| Require a pull request | вкл., **0 одобрений** | в `main` — только через PR; одобрить свой PR GitHub не даёт, с 1 одобрением мерж был бы невозможен |
+| Require status checks | `ci-ok` из GitHub Actions | PR нельзя смержить без зелёного CI |
+| Require branches to be up to date | вкл. | смержен ровно тот результат, что проверен; если `main` ушёл вперёд — «Update branch» и CI ещё раз |
+| Linear history | выкл. | этапы мержатся merge-коммитами («Merge pull request #5») |
+| Обходы (bypass list) | пусто | иначе «нельзя без зелёного CI» не правда; в аварии — ruleset в Disabled и обратно |
+
+**Как включить.** Сначала `ci-ok` должен хоть раз отработать — запушить ветку с этим job-ом и открыть PR: иначе поиск проверок в настройках его не предложит, а PR без такого job-а повис бы в «Expected». Дальше Settings → Rules → Rulesets → New ruleset → **Import a ruleset** → файл `.github/rulesets/main.json` → Create. Или то же руками: New branch ruleset, имя `main protection`, Enforcement `Active`, Target — Include default branch, отметить правила из таблицы, в Require status checks → Add checks → `ci-ok`, источник GitHub Actions. Через API — `POST /repos/IhorVoskoboinikov/sales_hub/rulesets` с этим же JSON (токен с правом Administration: write); повторный POST создаёт второй ruleset, правка — `PUT …/rulesets/{id}`.
+
+**Как проверить.** `curl -s https://api.github.com/repos/IhorVoskoboinikov/sales_hub/rules/branches/main | jq '.[].type'` → `deletion`, `non_fast_forward`, `pull_request`, `required_status_checks`. И на деле: PR с заведомо падающим тестом — кнопка мержа заблокирована; `git push origin main` — отказ.
 
 ### CD — `.github/workflows/cd.yml` (на push в main и теги `v*`)
 
@@ -1791,7 +1818,7 @@ deploy/
 
 **Готово, когда:** передача 100 тыс. клиентов идёт с прогрессом, переживает рестарт воркера, новый ответственный получает одно сообщение в Telegram и одно письмо (автор job — своё одно письмо и одно сообщение с итогом).
 
-**Статус: ✅ этап выполнен** (2026-10-27, ветка `stage-5`, ждёт PR в `main`) — передача 100 тыс. клиентов переживает `kill -9` процесса пула (job `done` через 2–3 с) и убийство контейнера `worker-bulk` (reaper — через 5,4–6,2 мин), ни одна строка не посчитана дважды, автор и получатель получают ровно по одному письму (`make chaos`, `docs/experiments.md`); «ровно по одному письму и одному сообщению в Telegram» с повторным finalize и повторной публикацией — `test_bulk_reassign_e2e.py`. Telegram на стенде с настоящим Bot API не проверен (нет токена и чатов) — команда для однократной проверки в пункте 5.15. Замеры способов UPDATE — `docs/experiments.md`. Полный набор — 1457 тестов, политики 30/30.
+**Статус: ✅ этап выполнен и закрыт** (2026-10-27, ветка `stage-5`, смержен в `main` — PR #5) — передача 100 тыс. клиентов переживает `kill -9` процесса пула (job `done` через 2–3 с) и убийство контейнера `worker-bulk` (reaper — через 5,4–6,2 мин), ни одна строка не посчитана дважды, автор и получатель получают ровно по одному письму (`make chaos`, `docs/experiments.md`); «ровно по одному письму и одному сообщению в Telegram» с повторным finalize и повторной публикацией — `test_bulk_reassign_e2e.py`. Telegram на стенде с настоящим Bot API не проверен (нет токена и чатов) — команда для однократной проверки в пункте 5.15. Замеры способов UPDATE — `docs/experiments.md`. Полный набор — 1457 тестов, политики 30/30.
 
 **API этапа 5** (пути — из `routes.rego`, раздел 5; все POST массовых операций принимают `Idempotency-Key` и отвечают `202 BulkJobOut` + `Location`):
 
@@ -1819,12 +1846,12 @@ deploy/
 
 CI растёт с этапа 1; здесь он доводится до полного набора из раздела 12.
 
-- [ ] 6.1 Разделить тесты на `unit` / `integration` / `policy`, маркеры pytest, пороги покрытия.
-- [ ] 6.2 Job `migrations`: upgrade → `alembic check` → downgrade → upgrade, одна голова.
-- [ ] 6.3 Job `openapi`: экспорт схемы и сравнение с `main`.
-- [ ] 6.4 Job `build`: сборка образа с кэшем, без публикации.
-- [ ] 6.5 Кэш uv и Docker в Actions, параллельные jobs.
-- [ ] 6.6 Обязательные проверки в защите ветки `main`.
+- [x] 6.1 Уровни тестов: маркеры `unit` / `integration` (ставятся по каталогу) и `policy` (код, который обязан совпадать с `policies/`), `strict = true` в pytest, `make test-policy`; покрытие — ядро `sysmon`, только строки (без `branch` и `concurrency = greenlet`: с ними sysmon на 3.13 откатывается на ctrace, а ctrace без greenlet теряет строки после `await`), пороги 80% для `services/` и `authz/` и 90% всего — на общем покрытии unit + integration в job `integration` (unit сам по себе покрывает `services/` на 37%); Regal в `make policy-test` и job `policy`.
+- [x] 6.2 Job `migrations`: `scripts/check_migrations.sh` (одна голова → upgrade → `alembic check` → downgrade base → upgrade) на пустом Postgres-сервисе Actions и `make migrations-check` с одноразовым контейнером; `test_migrations.py` удаляется — его проверки переехали в job, а downgrade посреди общего прогона мешает xdist.
+- [x] 6.3 Job `openapi`: `python -m app.cli export-openapi` → `backend/openapi.json` в git (`make openapi`); CI проверяет, что файл свежий, и сравнивает его с файлом из `main` через `oasdiff` — ломающие изменения подсвечиваются аннотациями и списком в Summary, job из-за них не падает.
+- [x] 6.4 Job `build`: `docker/build-push-action` с кэшем слоёв `type=gha`, без публикации, и проверка, что образ без dev-зависимостей импортирует приложение и воркеры.
+- [x] 6.5 Скорость: integration в 4 процесса (`pytest-xdist -n 4`, у каждого свои контейнеры), integration без `needs: lint`, одна версия uv в CI и Dockerfile, кэш uv; отмена устаревших прогонов только у PR.
+- [ ] 6.6 Обязательная проверка: job-агрегатор `ci-ok` (зелёный, только если зелёные все jobs; `test_ci.py` следит, что в его `needs` все jobs) и ruleset на `main` — PR, `ci-ok` из GitHub Actions, ветка свежая, без force push и удаления; ruleset — `.github/rulesets/main.json`, включается руками в GitHub по инструкции из раздела 12, «Защита ветки `main`». **Код готов; осталось включить ruleset** — галочка после этого.
 
 **Готово, когда:** PR нельзя смержить без зелёного CI, полный прогон занимает меньше 10 минут.
 
@@ -1963,12 +1990,16 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Уведомления (шаг 5.12) | события — хук `_events` CRM-сервисов и `_record_final` bulk (любой финальный переход, любой вид job, `rows = null` у импорта); notifier пишет команды только активным пользователям организации события, Telegram — только привязанным, «вам передано N» — только при N > 0 (сумма по сущностям); текст Telegram = `.txt` письма; `TelegramApiError` с `retry_after`, пауза 429 — через `retry_countdown` в `BaseTask`, сеть — `TelegramUnavailable(ConnectionError)` без цепочки; нет токена — пропуск до ключа дедупа; `PUT /me/notifications` — замена под advisory lock пользователя (последний `PUT` побеждает целиком, без deadlock; строка `users` не блокируется); `send_email` письмо notifier отключённому после notify не отправляет; 403 Telegram удаляет привязку по `(user_id, chat_id, linked_at)` (раздел 16) |
 | Команды бота (шаг 5.13) | только свои записи: `Access.for_user(user, action, roles).own()` без OPA, нет действия у роли — `Forbidden` → «недоступно»; повестка — `AgendaService.day(user, now)` (её же возьмёт дайджест 5.14): граница — местная полночь по `coalesce(users.timezone, organizations.timezone)`, сегодня до 20 и просроченные до 10 (недавние первыми — иначе вчерашний пропущенный звонок терялся бы за давно забытыми), «…та інші», у просроченных — дата, тема и название сделки до 80 единиц UTF-16 (так Telegram считает лимит 4096); `/deals` — 10 новых и итог по всем открытым в валюте организации, при `fx.stale` — «(курс на <дата>)», нет открытых — ответ без курса (не зависит от НБУ); `/stop` вне `LinkedUserMiddleware` удаляет привязку по `chat_id` (и у отключённого, повтор — не ошибка), настройки уведомлений не трогает (раздел 16) |
 | Напоминания и дайджест (шаг 5.14) | по одному запросу на тик от `telegram_links`, умолчание настройки — параметр из `catalog.DEFAULTS`; уже отправленные ключи вычитаются внутри `LATERAL` до лимита 20 (21-е уходит следующим тиком); ключ занимает только отправитель — тик до отправки может записать команду повторно, её гасит дедуп; у команды срок `not_after` (напоминание — `min(due_at, тик + 2 мин)`, дайджест — местные 12:00), устаревшую `send_telegram` пропускает без ключа; в ключе напоминания есть `user_id` (передача звонка — напоминание новому ответственному); дайджест коммитит пачками по 100 с бюджетом 200 с; ключи — парами Python / SQL в `keys.py` (`floor` секунд); дайджест — `AgendaService.day` без изменений, заголовок с двоеточием, как у `/today`; без токена бота обе задачи выходят сразу; индекс `(owner_id, due_at, id) WHERE done_at IS NULL` уже был (раздел 16) |
+| Покрытие (этап 6) | `coverage` с ядром `sysmon` (на Python 3.13 почти без накладных, ctrace — +39%), только строки (ветки на 3.13 sysmon не умеет и молча откатывается на ctrace); порог проверяется на общем покрытии unit + integration, а не в job `unit` |
+| Скорость CI (этап 6) | integration через `pytest-xdist -n 4`: у каждого процесса свои Postgres, Redis, Mailpit, OPA, RustFS; не шардинг по раннерам — матрица прав одна занимает 61% времени, а шардам нужны файл длительностей и сборка покрытия |
+| Схема API в git (этап 6) | `backend/openapi.json` коммитится: CI проверяет свежесть, сравнение с `main` — `git show` + `oasdiff` (образ `tufin/oasdiff`), без запуска кода `main`; из этого же файла этап 11 генерирует TS-клиент |
+| Защита `main` (этап 6) | ruleset, а не классическая защита ветки; одна обязательная проверка `ci-ok` — новые jobs добавляются в её `needs`, настройки GitHub не меняются; 0 одобрений (свой PR одобрить нельзя), обходов нет |
 
 ### Открытые вопросы
 
 - [x] Уведомления — email и Telegram-бот (раздел 16).
 - [x] Поиск — Elasticsearch (раздел 17).
-- [ ] Новых открытых вопросов нет; этапы 1–4 закрыты, идёт этап 5 (ветка `stage-5`).
+- [ ] Новых открытых вопросов нет; этапы 1–5 закрыты, идёт этап 6 (ветка `stage-6`).
 
 ## 15. Модуль: система воркеров
 

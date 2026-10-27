@@ -1,4 +1,4 @@
-# CI на каждый pull request и push в main: lint, unit, integration, policy (раздел 12).
+# CI на каждый pull request и push в main (раздел 12).
 name: CI
 
 on:
@@ -6,9 +6,12 @@ on:
   push:
     branches: [main]
 
-# Новый пуш в ту же ветку отменяет ещё идущий прогон.
+# Новый пуш в PR отменяет ещё идущий прогон этого PR. В main у каждого коммита своя группа (sha):
+# его прогон не отменяется и не ждёт соседей. Общая группа на main не годится даже без отмены:
+# GitHub держит в группе один ждущий прогон и заменяет его новым — коммит в середине серии
+# быстрых мержей остался бы без результата CI.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: true
 
 defaults:
@@ -20,8 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.0  # у setup-uv нет тега v10, только точные версии
+      - uses: astral-sh/setup-uv@v10.3.2  # у setup-uv нет тега v10, только точные версии
         with:
+          version: "0.11.6"  # как в backend/Dockerfile
           enable-cache: true
       - run: uv sync --locked
       - run: uv run ruff check .
@@ -32,26 +36,123 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.0  # у setup-uv нет тега v10, только точные версии
+      - uses: astral-sh/setup-uv@v10.3.2  # у setup-uv нет тега v10, только точные версии
         with:
+          version: "0.11.6"  # как в backend/Dockerfile
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run pytest tests/unit --cov=app --cov-report=term-missing
+      # Без --cov: unit сам по себе покрывает services/ на 37%, порог считается в integration.
+      - run: uv run pytest tests/unit
 
+  # Самый долгий job — без needs: lint, чтобы не ждать его (раздел 12, шаг 6.5).
   integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20  # зависший тест (ожидание воркера, контейнера) не держит раннер 6 часов
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2  # у setup-uv нет тега v10, только точные версии
+        with:
+          version: "0.11.6"  # как в backend/Dockerfile
+          enable-cache: true
+      - run: uv sync --locked
+      # Postgres, Redis и др. поднимает сам pytest через testcontainers (Docker на раннере есть).
+      # Здесь и unit: пороги покрытия (раздел 10) — на общем покрытии unit + integration.
+      - run: make coverage
+        working-directory: .
+
+  # Миграции (раздел 9) на пустой базе: одна голова, upgrade → check → downgrade base → upgrade.
+  migrations:
     needs: lint
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.6  # как в compose и testcontainers
+        env:
+          POSTGRES_USER: saleshub
+          POSTGRES_PASSWORD: saleshub
+          POSTGRES_DB: saleshub
+        ports: ["5432:5432"]
+        # -h 127.0.0.1: пока образ инициализирует базу, он слушает только сокет — ждём настоящий сервер
+        options: >-
+          --health-cmd "pg_isready -U saleshub -d saleshub -h 127.0.0.1"
+          --health-interval 2s --health-timeout 3s --health-retries 15
+    env:
+      DATABASE_URL: postgresql+asyncpg://saleshub:saleshub@localhost:5432/saleshub
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2  # у setup-uv нет тега v10, только точные версии
+        with:
+          version: "0.11.6"  # как в backend/Dockerfile
+          enable-cache: true
+      - run: uv sync --locked
+      - run: bash scripts/check_migrations.sh
+
+  # Схема API (раздел 12): backend/openapi.json свежая, ломающие изменения относительно базовой
+  # ветки подсвечиваются аннотациями и списком в Summary, но job не валят. Сервисы не нужны.
+  openapi:
+    needs: lint
+    runs-on: ubuntu-latest
+    env:
+      OASDIFF: docker run --rm -v ${{ github.workspace }}:/repo:ro -w /repo tufin/oasdiff:v1.34.1  # как в Makefile
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.2  # у setup-uv нет тега v10, только точные версии
+        with:
+          version: "0.11.6"  # как в backend/Dockerfile
+          enable-cache: true
+      - run: uv sync --locked
+      - name: openapi.json is up to date
+        run: |
+          uv run python -m app.cli export-openapi
+          # status, а не diff: diff не видит файла, который удалили из git, а команда создала снова.
+          if [ -n "$(git status --porcelain -- openapi.json)" ]; then
+            echo "::error file=backend/openapi.json::схема устарела: make openapi и закоммить backend/openapi.json"
+            git diff --stat -- openapi.json
+            exit 1
+          fi
+      - name: Breaking changes vs base branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth=1 origin "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
+          if ! git cat-file -e "origin/$GITHUB_BASE_REF:backend/openapi.json" 2>/dev/null; then
+            echo "::notice::в $GITHUB_BASE_REF ещё нет backend/openapi.json — сравнивать не с чем"
+            exit 0
+          fi
+          mkdir -p tmp
+          git show "origin/$GITHUB_BASE_REF:backend/openapi.json" > tmp/openapi.base.json
+          # Пути — от корня репозитория (/repo в контейнере). Аннотация указывает на файл, где найдено
+          # изменение: новое и изменённое — на backend/openapi.json, удалённое — на копию из базовой
+          # ветки (её нет в PR, поэтому такие ошибки видны только в списке аннотаций прогона).
+          $OASDIFF changelog backend/tmp/openapi.base.json backend/openapi.json --format markdown >> "$GITHUB_STEP_SUMMARY"
+          $OASDIFF breaking backend/tmp/openapi.base.json backend/openapi.json --format githubactions
+
+  # Образ API и воркеров (раздел 11): собирается, но не публикуется — публикация в cd.yml (этап 9).
+  # Слои кэшируются в кэше GitHub Actions: без изменений uv.lock зависимости не ставятся заново.
+  build:
+    needs: unit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.3.0  # у setup-uv нет тега v10, только точные версии
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
-          enable-cache: true
-      - run: uv sync --locked
-      # Postgres и Redis поднимает сам pytest через testcontainers (Docker на раннере есть).
-      - run: uv run pytest tests/integration
+          context: backend
+          target: runtime
+          push: false
+          load: true  # образ нужен следующему шагу
+          tags: saleshub-api:ci
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max  # max: и слои стадии builder (uv sync)
+      # Образ ставит зависимости без dev-группы (uv sync --no-dev): всё, что запускает compose,
+      # должно импортироваться и без неё. Сеть не нужна — проверяется только сам образ.
+      - name: Smoke check
+        run: >-
+          docker run --rm --network none saleshub-api:ci sh -c
+          'python -c "import app.main, app.cli, app.workers.celery_app, app.events.relay, app.bot"
+          && alembic --help > /dev/null && celery --version'
 
-  # Политики OPA (раздел 5): формат, строгая проверка, opa test и покрытие не ниже 90%.
-  # Та же версия OPA, что в compose и testcontainers; ставить opa не нужно — make запускает его в Docker.
+  # Политики OPA (раздел 5): Regal, формат, строгая проверка, opa test и покрытие не ниже 90%.
+  # Та же версия OPA, что в compose и testcontainers; ставить opa и regal не нужно — make запускает их в Docker.
   policy:
     runs-on: ubuntu-latest
     defaults:
@@ -59,4 +160,27 @@ jobs:
         working-directory: .
     steps:
       - uses: actions/checkout@v7
-      - run: make policy-test
+      - run: make policy-test REGAL_ARGS="--format github"  # замечания Regal — аннотациями в PR
+
+  # Единственная обязательная проверка защиты main (раздел 12, шаг 6.6): зелёная, только если
+  # зелёные все jobs из needs. Новый job добавляется сюда — настройки GitHub менять не нужно.
+  # if: always() — job идёт и тогда, когда что-то упало: пропущенный по if job GitHub считает
+  # успешным, поэтому условие провала — в шаге, а не в if job-а. skipped — тоже провал: так
+  # пропущенный из-за упавшей зависимости job (migrations после lint) не сойдёт за зелёный.
+  ci-ok:
+    if: always()
+    needs: [lint, unit, integration, migrations, openapi, build, policy]
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .  # checkout нет — каталога backend тоже
+    steps:
+      - name: All required jobs passed
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled') ||
+          contains(needs.*.result, 'skipped')
+        run: |
+          echo '${{ toJSON(needs) }}'
+          exit 1
+      - run: echo "все jobs зелёные"

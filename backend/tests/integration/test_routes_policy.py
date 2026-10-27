@@ -7,6 +7,7 @@
 from typing import Any
 
 import httpx
+import pytest
 from fastapi.dependencies.models import Dependant
 from fastapi.routing import APIRoute
 from httpx import AsyncClient
@@ -14,6 +15,8 @@ from httpx import AsyncClient
 from app.api.v1 import admin_router, protected_router
 from app.authz.deps import opa_decision
 from app.authz.opa import OpaClient
+
+pytestmark = pytest.mark.policy  # совпадает с policies/: make test-policy
 
 
 def needs_opa(dependant: Dependant) -> bool:

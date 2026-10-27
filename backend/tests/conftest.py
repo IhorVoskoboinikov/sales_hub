@@ -17,7 +17,18 @@ from app.core.jwt import generate_private_key, private_key_to_pem
 from app.main import create_app
 
 CLOSED_PORT = 9  # на этом порту никто не слушает — соединение сразу отклоняется
-POLICIES_DIR = Path(__file__).resolve().parents[2] / "policies"
+TESTS_DIR = Path(__file__).resolve().parent
+POLICIES_DIR = TESTS_DIR.parents[1] / "policies"
+LEVELS = ("unit", "integration")
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    # Уровень теста — его каталог (раздел 10): tests/unit/… → unit, tests/integration/… →
+    # integration. Руками маркер не ставится, поэтому -m "integration and not worker" надёжен.
+    for item in items:
+        level = item.path.relative_to(TESTS_DIR).parts[0]
+        if level in LEVELS:
+            item.add_marker(level)
 
 
 @pytest.fixture(scope="session")

@@ -9,6 +9,8 @@ import pytest
 from app.authz.opa import OpaClient
 from app.errors import ServiceUnavailable
 
+pytestmark = pytest.mark.policy  # совпадает с policies/: make test-policy
+
 USER = uuid.uuid4()
 
 

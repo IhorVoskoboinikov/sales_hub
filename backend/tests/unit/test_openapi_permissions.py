@@ -2,9 +2,13 @@
 
 from typing import Any
 
+import pytest
+
 from app.authz.openapi import describe_permissions
 from app.authz.roles import RoleCatalog
 from tests.conftest import POLICIES_DIR
+
+pytestmark = pytest.mark.policy  # совпадает с policies/: make test-policy
 
 ROLES = RoleCatalog.load(POLICIES_DIR)
 

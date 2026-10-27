@@ -1,0 +1,13 @@
+# Regal — линтер Rego (раздел 12), запуск: make policy-lint (входит в make policy-test).
+rules:
+  idiomatic:
+    # Раскладка плоская: policies/saleshub/*.rego. Имена пакетов — пути в API OPA
+    # (data.saleshub.authz.decision), их не меняем ради каталогов.
+    directory-package-mismatch:
+      level: ignore
+  imports:
+    unresolved-reference:
+      # data.saleshub.roles приходит из data.yaml, а Regal читает только .rego.
+      except-paths:
+        - data.saleshub.roles
+        - data.saleshub.roles.**

@@ -18,6 +18,9 @@ allow if {
 }
 
 # 3. Ответ бэкенду: можно ли и какое это действие (по нему бэкенд найдёт уровень в data.yaml).
+# METADATA
+# description: ответ бэкенду — его запрашивает app/authz/opa.py
+# entrypoint: true
 default decision := {"allow": false}
 
 decision := {"allow": allow, "action": action} if action

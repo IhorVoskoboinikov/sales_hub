@@ -64,6 +64,8 @@ from tests.integration.conftest import (
     multipart_body,
 )
 
+pytestmark = pytest.mark.policy  # совпадает с policies/: make test-policy
+
 ROLES = ["org_admin", "team_lead", "sales_rep", "viewer", "super_admin"]
 CATALOG = RoleCatalog.load(POLICIES_DIR)
 CRM_TARGETS = ("own", "same_team", "same_org", "other_org")

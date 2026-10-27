@@ -60,6 +60,15 @@ class TelegramLinkRepository:
     async def delete_for_user(self, user_id: uuid.UUID) -> None:
         await self.session.execute(delete(TelegramLink).where(TelegramLink.user_id == user_id))
 
+    async def delete_by_chat(self, chat_id: int) -> uuid.UUID | None:
+        """/stop: отвязать этот чат, чей бы он ни был. Возвращает, чью привязку удалили
+        (None — чат не был привязан)."""
+        return await self.session.scalar(
+            delete(TelegramLink)
+            .where(TelegramLink.chat_id == chat_id)
+            .returning(TelegramLink.user_id)
+        )
+
     async def delete(self, user_id: uuid.UUID, chat_id: int, linked_at: datetime) -> None:
         """Удалить именно ту привязку, которую прочитали: пару (user_id, chat_id) и её
         linked_at. Свежую перепривязку это не задевает — ни к другому чату, ни к тому же: upsert

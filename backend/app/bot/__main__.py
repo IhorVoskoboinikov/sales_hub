@@ -69,7 +69,13 @@ async def main(settings: Settings) -> int:
         settings.telegram_bot_token.get_secret_value(),
         session=AiohttpSession(api=TelegramAPIServer.from_base(settings.telegram_api_url)),
     )
-    dp = create_dispatcher(resources.session_factory, resources.redis, settings)
+    dp = create_dispatcher(
+        resources.session_factory,
+        resources.redis,
+        settings,
+        roles=resources.roles,
+        nbu=resources.nbu,
+    )
     try:
         me = await prepare(bot)
         if settings.telegram_bot_username and me.username != settings.telegram_bot_username:

@@ -7,6 +7,7 @@
 - Заметку добавляет тот, кто может менять контакт.
 """
 
+import uuid
 from datetime import UTC, datetime, time, timedelta
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -22,6 +23,16 @@ from app.services.crm import ensure_reference, get_for_change, owner_for_restore
 from app.uow import UnitOfWork
 
 Due = Literal["today", "overdue"]
+
+
+async def user_zone(uow: UnitOfWork, user_id: uuid.UUID, org_id: uuid.UUID) -> ZoneInfo:
+    """Часовой пояс пользователя — coalesce(users.timezone, organizations.timezone): одно
+    правило для «сегодня» задач в API, /today в боте и утреннего дайджеста (раздел 16)."""
+    user = await uow.users.get(user_id)
+    if user is not None and user.timezone:
+        return ZoneInfo(user.timezone)
+    org = await uow.organizations.get(org_id)
+    return ZoneInfo(org.timezone if org else "UTC")
 
 
 class ActivityService:
@@ -126,11 +137,7 @@ class ActivityService:
         await repo.get_visible_or_404(entity_id, read)
 
     async def _zone(self, access: Access) -> ZoneInfo:
-        user = await self.uow.users.get(access.user_id)
-        if user is not None and user.timezone:
-            return ZoneInfo(user.timezone)
-        org = await self.uow.organizations.get(access.org_id)
-        return ZoneInfo(org.timezone if org else "UTC")
+        return await user_zone(self.uow, access.user_id, access.org_id)
 
 
 class NoteService:

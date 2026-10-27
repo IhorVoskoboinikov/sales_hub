@@ -22,12 +22,14 @@ from structlog.testing import capture_logs
 from app.api.deps import current_member
 from app.api.v1 import me
 from app.authz.deps import opa_decision
+from app.authz.roles import RoleCatalog
 from app.bot import __main__ as bot_main
 from app.bot import dispatcher as bot_dispatcher
 from app.bot.dispatcher import create_dispatcher
 from app.bot.handlers import commands_text
 from app.core.config import Settings
 from app.core.resources import Resources
+from app.services.fx import NbuClient
 
 
 async def test_bot_exits_without_token(settings: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -153,8 +155,15 @@ async def run_until_update_started(
         yield None  # обработчик «любого текста» в БД не ходит
         finished.set()
 
-    # Redis не нужен: UserCache только хранит клиента, а обработчик списка команд его не трогает.
-    dp = create_dispatcher(slow_scope, cast(Redis, None), settings)
+    # Redis, роли и НБУ не нужны: сервисы только хранят их, а обработчик списка команд их не
+    # трогает.
+    dp = create_dispatcher(
+        slow_scope,
+        cast(Redis, None),
+        settings,
+        roles=cast(RoleCatalog, None),
+        nbu=cast(NbuClient, None),
+    )
     bot = Bot("42:TEST-token", session=session)
 
     async def stop() -> None:

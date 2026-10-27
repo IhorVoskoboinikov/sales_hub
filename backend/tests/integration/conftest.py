@@ -604,6 +604,16 @@ async def member(
     )
 
 
+def roles_without(action: str) -> RoleCatalog:
+    """Файл ролей, где ни у одной роли нет action: команда бота отвечает «недоступно»."""
+    catalog = RoleCatalog.load(POLICIES_DIR)
+    permissions = {
+        role: {a: scope for a, scope in catalog.permissions(role).items() if a != action}
+        for role in catalog.titles
+    }
+    return RoleCatalog(permissions, catalog.titles)
+
+
 async def tokens_for(client: AsyncClient, user: User) -> dict[str, str]:
     return bearer(await login(client, user.email))
 

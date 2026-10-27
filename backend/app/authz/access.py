@@ -8,10 +8,13 @@
 
 Массовая операция (раздел 6) хранит Access автора в bulk_jobs.params (to_params), а воркер
 восстанавливает его в каждом чанке (from_params): чанк обновляет только строки в уровне автора.
+
+Вне HTTP (бот, задачи beat — раздел 16) Access строится без OPA: for_user() берёт уровень роли
+из data.yaml, а own() сужает его до своих записей.
 """
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, cast
 
 from sqlalchemy import ColumnElement, and_, false
@@ -31,6 +34,19 @@ class Scoped(Protocol):
     def owner_id(self) -> uuid.UUID | None: ...
 
 
+class Member(Protocol):
+    """Пользователь организации, от имени которого читаются данные: CachedUser или User."""
+
+    @property
+    def id(self) -> uuid.UUID: ...
+    @property
+    def org_id(self) -> uuid.UUID | None: ...
+    @property
+    def team_id(self) -> uuid.UUID | None: ...
+    @property
+    def role(self) -> str | None: ...
+
+
 @dataclass(frozen=True)
 class Access:
     action: str  # что делаем: deal:write
@@ -39,6 +55,21 @@ class Access:
     org_id: uuid.UUID
     team_id: uuid.UUID | None  # у org_admin и viewer отдела нет — уровень team им и не выдаётся
     role: str | None = None  # чтобы получить уровень другого действия: for_action()
+
+    @classmethod
+    def for_user(cls, user: Member, action: str, roles: RoleCatalog) -> "Access | None":
+        """Access без OPA — для бота и задач beat, которые не ходят через HTTP-маршруты:
+        уровень действия у роли из data.yaml. None — у роли нет действия или у пользователя
+        нет организации (супер-админ)."""
+        scope = roles.scope_or_none(user.role, action)
+        if scope is None or user.org_id is None:
+            return None
+        return cls(action, scope, user.id, user.org_id, user.team_id, user.role)
+
+    def own(self) -> "Access":
+        """Тот же человек и действие, уровень own — только записи, где я ответственный. Бот
+        показывает только свои данные, даже руководителю и админу (раздел 16)."""
+        return replace(self, scope="own")
 
     def for_action(self, action: str, roles: RoleCatalog) -> "Access | None":
         """Тот же человек, другое действие: сделку создают с deal:write, а привязанный к ней

@@ -134,6 +134,19 @@ class TelegramService:
         logger.info("telegram_linked", user_id=str(user.id))
         return user
 
+    async def stop(self, chat_id: int) -> bool:
+        """/stop: отвязать этот чат — сообщения в Telegram идут только привязанным, поэтому
+        уведомления сюда прекращаются; настройки каналов не меняются (после новой привязки
+        всё как было), письма идут как шли. Пользователя не проверяем: отвязаться может и
+        отключённый — владение чатом доказывает сам апдейт. False — чат не был привязан
+        (повтор /stop — тоже успех)."""
+        user_id = await self.uow.telegram_links.delete_by_chat(chat_id)
+        await self.uow.commit()
+        if user_id is None:
+            return False
+        logger.info("telegram_unlinked", user_id=str(user_id), reason="stop")
+        return True
+
     async def _take_chat(self, chat_id: int, user_id: uuid.UUID) -> None:
         """Чат свободен или уже этого пользователя — ничего не делать. Привязан к другому:
         тот ещё может пользоваться ботом — Conflict (сначала отвязать: /stop или профиль того

@@ -6,11 +6,13 @@
 """
 
 from aiogram import Router
-from aiogram.filters import CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.methods import SendMessage
 from aiogram.types import Message
 
 from app.bot.middlewares import LinkedUserMiddleware
+from app.repositories.user_cache import CachedUser
+from app.services.agenda import AgendaService, render_agenda, render_deals
 from app.services.telegram import TelegramService
 from app.texts import uk
 
@@ -32,6 +34,31 @@ async def start(message: Message, telegram: TelegramService) -> SendMessage:
     return message.answer(uk.BOT["connected_as"].format(email=user.email))
 
 
+async def stop(message: Message, telegram: TelegramService) -> SendMessage:
+    """/stop — отвязать чат. Стоит вне LinkedUserMiddleware: отключённый пользователь тоже
+    может отвязаться, а повтор без привязки — не ошибка."""
+    stopped = await telegram.stop(message.chat.id)
+    return message.answer(uk.BOT["stopped"] if stopped else uk.BOT["not_linked"])
+
+
+async def today(message: Message, user: CachedUser, agenda: AgendaService) -> SendMessage:
+    """/today — мои задачи на сегодня и просроченные (AgendaService.day — тот же, что у
+    утреннего дайджеста)."""
+    day = await agenda.day(user)
+    if day.empty:
+        return message.answer(uk.BOT["today_empty"])
+    title = uk.BOT["today_title"].format(date=day.date.strftime("%d.%m.%Y"))
+    return message.answer(render_agenda(day, title))
+
+
+async def deals(message: Message, user: CachedUser, agenda: AgendaService) -> SendMessage:
+    """/deals — мои открытые сделки и итог по ним в валюте организации."""
+    summary = await agenda.deals(user)
+    if summary is None:
+        return message.answer(uk.BOT["deals_empty"])
+    return message.answer(render_deals(summary))
+
+
 async def unknown(message: Message) -> SendMessage:
     """Любой другой текст — список команд."""
     return message.answer(commands_text())
@@ -43,18 +70,21 @@ def commands_text() -> str:
 
 
 def create_routers() -> list[Router]:
-    """Роутеры в порядке проверки: команды без привязки (/start; /stop — шаг 5.13), команды
+    """Роутеры в порядке проверки: команды без привязки (/start, /stop), команды
     привязанного пользователя, «всё остальное». Новые на каждый вызов: роутер нельзя
     подключить к двум диспетчерам, а тесты создают диспетчер на тест."""
     public = Router(name="public")
     public.message.register(start_with_token, CommandStart(deep_link=True))
     public.message.register(start, CommandStart())
+    public.message.register(stop, Command("stop"))
 
-    # Команды привязанного пользователя (/today, /deals) добавит шаг 5.13: обработчик получит
-    # user из LinkedUserMiddleware. Внутренний middleware работает, только когда нашёлся
-    # обработчик, поэтому пустой роутер ничего не делает.
+    # Команды привязанного пользователя: обработчик получает user из LinkedUserMiddleware.
+    # Внутренний middleware работает, только когда нашёлся обработчик, — любой другой текст
+    # проходит к fallback без запросов к привязкам.
     linked = Router(name="linked")
     linked.message.middleware(LinkedUserMiddleware())
+    linked.message.register(today, Command("today"))
+    linked.message.register(deals, Command("deals"))
 
     fallback = Router(name="fallback")
     fallback.message.register(unknown)

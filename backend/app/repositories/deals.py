@@ -134,6 +134,17 @@ class DealRepository(SoftDeleteRepository[Deal]):
         query = self.list_query(access, filters, page)
         return await fetch_page(self.session, query, self.order(filters), page)
 
+    def open_totals_query(self, access: Access) -> Select[int, Decimal]:
+        """Число и сумма в USD всех открытых сделок уровня — итог /deals в боте (уровень own:
+        частичный индекс ix_deals_owner_id_created_at, у одного менеджера строк немного)."""
+        return select(func.count(), func.coalesce(func.sum(Deal.amount_usd), 0)).where(
+            open_alive(), access.sql_filter(Deal)
+        )
+
+    async def open_totals(self, access: Access) -> tuple[int, Decimal]:
+        count, amount = (await self.session.execute(self.open_totals_query(access))).one()
+        return count, amount
+
     def kanban_totals_query(self, access: Access, pipeline_id: int) -> Select[int, int, Decimal]:
         """Число и сумма открытых сделок по этапам — index-only scan по ix_deals_kanban."""
         return (

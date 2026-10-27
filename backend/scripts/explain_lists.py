@@ -21,6 +21,9 @@ seed-организации, включая менеджера с наиболь
 контакта без сделки. Это фоновые запросы, но они читают маленькую корзину — Seq Scan в них
 ошибка.
 
+С шага 5.13 — запросы команд бота /today и /deals: те же списки задач и сделок и итог открытых
+сделок, но на уровне own у каждой роли (бот показывает только свои записи).
+
 Ошибка — Seq Scan по большой таблице (companies, contacts, deals, activities и её партиции)
 больше SEQ_SCAN_PAGES страниц: код выхода 1. Запрос дольше SLOW_MS — предупреждение: индекс
 используется, но данных слишком много (например, частая подстрока в ?q= — см.
@@ -49,7 +52,13 @@ from app.authz.access import Access
 from app.authz.roles import RoleCatalog
 from app.core.config import get_settings
 from app.models import Company, Contact, Deal
-from app.repositories.activities import ActivityRepository, AuditFilters, AuditQueries, TaskWindow
+from app.repositories.activities import (
+    TASKS_RECENT_ORDER,
+    ActivityRepository,
+    AuditFilters,
+    AuditQueries,
+    TaskWindow,
+)
 from app.repositories.bulk import BulkRepository, close_overdue_filter, tag_filter
 from app.repositories.contacts import (
     EXPORT_BATCH,
@@ -61,6 +70,7 @@ from app.repositories.deals import DealFilters, DealRepository
 from app.repositories.pagination import Page, encode_cursor
 from app.repositories.reports import ReportRepository
 from app.repositories.trash import TrashRepository
+from app.services.agenda import DEALS_LIMIT, OVERDUE_LIMIT, TODAY_LIMIT
 from app.services.trash import PURGE_CHUNK
 
 BIG = re.compile(r"^(companies|contacts|deals|activities)(_p\d{4}_\d{2})?$")
@@ -434,6 +444,29 @@ async def main() -> int:
                 "contact:read",
                 lambda a: TrashRepository.contact_activities_query([sample["contact_id"]]),
             ),
+            # --- шаг 5.13: команды бота — только свои записи (Access.own()), у каждой роли.
+            (
+                "бот /today: на сегодня",
+                "activity:read",
+                lambda a: activities.tasks_query(
+                    a.own(), TaskWindow(today, today + timedelta(days=1)), Page(limit=TODAY_LIMIT)
+                ),
+            ),
+            (
+                "бот /today: просроченные",
+                "activity:read",
+                lambda a: activities.tasks_query(
+                    a.own(), TaskWindow(due_to=today), Page(limit=OVERDUE_LIMIT), TASKS_RECENT_ORDER
+                ),
+            ),
+            (
+                "бот /deals: новые",
+                "deal:read",
+                lambda a: deals.list_query(
+                    a.own(), DealFilters(status="open"), Page(limit=DEALS_LIMIT)
+                ),
+            ),
+            ("бот /deals: итог", "deal:read", lambda a: deals.open_totals_query(a.own())),
         ]
 
         results: list[Result] = []

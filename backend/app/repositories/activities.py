@@ -20,6 +20,9 @@ from app.repositories.pagination import Key, Page, PageResult, decode_cursor, fe
 
 HISTORY_ORDER = (Key(Activity.created_at, desc=True), Key(Activity.id, desc=True))
 TASKS_ORDER = (Key(Activity.due_at), Key(Activity.id))
+# Просроченные в боте и дайджесте (раздел 16): недавние первыми — тот же индекс
+# (owner_id, due_at, id) обратным проходом.
+TASKS_RECENT_ORDER = (Key(Activity.due_at, desc=True), Key(Activity.id, desc=True))
 AUDIT_ORDER = (Key(AuditEntry.occurred_at, desc=True), Key(AuditEntry.id, desc=True))
 NOTES_ORDER = (Key(Note.created_at, desc=True), Key(Note.id, desc=True))
 
@@ -63,7 +66,9 @@ class ActivityRepository:
         query = self.history_query(deal_id=deal_id, contact_id=contact_id, page=page)
         return await fetch_page(self.session, query, HISTORY_ORDER, page)
 
-    def tasks_query(self, access: Access, window: TaskWindow, page: Page) -> Select[Any]:
+    def tasks_query(
+        self, access: Access, window: TaskWindow, page: Page, order: tuple[Key, ...] = TASKS_ORDER
+    ) -> Select[Any]:
         """Открытые задачи в уровне activity:read по сроку. Предикат done_at IS NULL — литералом,
         как в частичных индексах ix_activities_*_due_at."""
         query = select(Activity).where(literal_column(OPEN), access.sql_filter(Activity))
@@ -71,11 +76,13 @@ class ActivityRepository:
             query = query.where(Activity.due_at >= window.due_from)
         if window.due_to is not None:
             query = query.where(Activity.due_at < window.due_to)
-        return paginate(query, TASKS_ORDER, page)
+        return paginate(query, order, page)
 
-    async def tasks(self, access: Access, window: TaskWindow, page: Page) -> PageResult[Activity]:
-        query = self.tasks_query(access, window, page)
-        return await fetch_page(self.session, query, TASKS_ORDER, page)
+    async def tasks(
+        self, access: Access, window: TaskWindow, page: Page, order: tuple[Key, ...] = TASKS_ORDER
+    ) -> PageResult[Activity]:
+        query = self.tasks_query(access, window, page, order)
+        return await fetch_page(self.session, query, order, page)
 
     async def get_visible(self, activity_id: int, access: Access) -> Activity | None:
         """По id без created_at Postgres смотрит индексы всех партиций — это видно в EXPLAIN."""

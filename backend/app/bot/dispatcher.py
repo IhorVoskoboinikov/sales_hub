@@ -7,6 +7,7 @@ from aiogram import Dispatcher, F
 from aiogram.enums import ChatType
 from redis.asyncio import Redis
 
+from app.authz.roles import RoleCatalog
 from app.bot.handlers import create_routers
 from app.bot.middlewares import (
     InFlightUpdates,
@@ -15,13 +16,22 @@ from app.bot.middlewares import (
     UpdateContextMiddleware,
 )
 from app.core.config import Settings
+from app.services.fx import NbuClient
 
 # Сколько при остановке ждать начатые апдейты: меньше --sigint-timeout 25 у watchfiles и
 # stop_grace_period 30s в compose, иначе процесс убьют раньше.
 DRAIN_TIMEOUT = 20.0
 
 
-def create_dispatcher(session_scope: SessionScope, redis: Redis, settings: Settings) -> Dispatcher:
+def create_dispatcher(
+    session_scope: SessionScope,
+    redis: Redis,
+    settings: Settings,
+    *,
+    roles: RoleCatalog,
+    nbu: NbuClient,
+) -> Dispatcher:
+    """roles — уровни Access для /today и /deals, nbu — курс для итога /deals (раздел 16)."""
     # FSM не используется (раздел 16): без него и хранилища состояний.
     dp = Dispatcher(disable_fsm=True)
     # Первым: задача апдейта запоминается до всего остального; на остановке — ждать её.
@@ -38,6 +48,8 @@ def create_dispatcher(session_scope: SessionScope, redis: Redis, settings: Setti
             session_scope,
             redis,
             link_ttl=timedelta(minutes=settings.telegram_link_ttl_minutes),
+            roles=roles,
+            nbu=nbu,
         )
     )
     dp.include_routers(*create_routers())

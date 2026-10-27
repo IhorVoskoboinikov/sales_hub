@@ -21,9 +21,12 @@ from aiogram.types import Message, TelegramObject, Update
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.authz.roles import RoleCatalog
 from app.core.context import request_id_var
 from app.errors import AppError
 from app.repositories.user_cache import UserCache
+from app.services.agenda import AgendaService
+from app.services.fx import FxService, NbuClient
 from app.services.telegram import TelegramService
 from app.texts import uk
 from app.uow import UnitOfWork
@@ -106,24 +109,38 @@ def reply(update: Update, text: str) -> SendMessage | None:
 
 
 class SessionMiddleware(BaseMiddleware):
-    """Сессия БД на апдейт — как сессия на запрос в API — и сервисы для обработчиков.
-    Соединение берётся из пула при первом запросе, а не здесь."""
+    """Сессия БД на апдейт — как сессия на запрос в API — и сервисы для обработчиков:
+    telegram (TelegramService) и agenda (AgendaService). Соединение берётся из пула при первом
+    запросе, а не здесь."""
 
-    def __init__(self, session_scope: SessionScope, redis: Redis, *, link_ttl: timedelta) -> None:
+    def __init__(
+        self,
+        session_scope: SessionScope,
+        redis: Redis,
+        *,
+        link_ttl: timedelta,
+        roles: RoleCatalog,
+        nbu: NbuClient,
+    ) -> None:
         self.session_scope = session_scope
+        self.redis = redis
         self.cache = UserCache(redis)
         self.link_ttl = link_ttl
+        self.roles = roles
+        self.nbu = nbu
 
     async def __call__(self, handler: Handler, event: TelegramObject, data: dict[str, Any]) -> Any:
         async with self.session_scope() as session:
             uow = UnitOfWork(session)
             data["uow"] = uow
             data["telegram"] = TelegramService(uow, self.cache, link_ttl=self.link_ttl)
+            fx = FxService(uow, self.redis, self.nbu)
+            data["agenda"] = AgendaService(uow, self.roles, fx)
             return await handler(event, data)
 
 
 class LinkedUserMiddleware(BaseMiddleware):
-    """Перед каждой командой привязанного пользователя (/today, /deals — шаг 5.13): привязка по
+    """Перед каждой командой привязанного пользователя (/today, /deals): привязка по
     chat_id → пользователь из кэша Redis (как у current_user) → активен, email подтверждён, есть
     организация. Отключённому — «доступ закрито» и привязка удаляется (TelegramService), без
     привязки — как привязать. Обработчик получает пользователя в аргументе user."""

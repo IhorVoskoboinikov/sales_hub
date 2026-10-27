@@ -13,18 +13,20 @@ from app.db.base import Base
 class EmailTokenPurpose(StrEnum):
     INVITE = "invite"
     RESET_PASSWORD = "reset_password"
+    TELEGRAM_LINK = "telegram_link"  # с шага 5.11: ссылка на бота из профиля (раздел 16)
 
 
 class EmailToken(Base):
-    """Одноразовый токен из письма: приглашение или сброс пароля.
+    """Одноразовый токен: приглашение и сброс пароля (из письма), привязка Telegram (из ссылки
+    на бота в профиле, раздел 16).
 
-    В письмо уходит случайная строка, здесь — только её SHA-256 хэш.
+    Пользователю уходит случайная строка, здесь — только её SHA-256 хэш.
     """
 
     __tablename__ = "email_tokens"
     __table_args__ = (
         CheckConstraint(
-            "purpose IN ('invite', 'reset_password')",
+            "purpose IN ('invite', 'reset_password', 'telegram_link')",
             name="purpose",
         ),
     )

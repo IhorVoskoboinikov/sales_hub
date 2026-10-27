@@ -100,9 +100,11 @@ class MemberService:
             raise Conflict("member.last_admin")
 
         if user.is_active and not is_active:
-            # Отключение действует сразу: все сессии закрыты, живые access-токены мертвы.
+            # Отключение действует сразу: все сессии закрыты, живые access-токены мертвы,
+            # Telegram отвязан (раздел 16).
             user.token_version += 1
             await self.uow.refresh_tokens.revoke_all_for_user(user.id, datetime.now(UTC))
+            await self.uow.telegram_links.delete_for_user(user.id)
         before = {"role": user.role, "team_id": user.team_id, "is_active": user.is_active}
         user.role, user.team_id, user.is_active = role, team_id, is_active
         after = {"role": user.role, "team_id": user.team_id, "is_active": user.is_active}

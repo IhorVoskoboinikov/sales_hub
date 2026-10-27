@@ -68,5 +68,6 @@ class PasswordResetService:
         user.password_hash = await hash_password(new_password)
         user.token_version += 1
         await self.uow.refresh_tokens.revoke_all_for_user(user.id, datetime.now(UTC))
+        await self.uow.telegram_links.delete_for_user(user.id)  # как в AuthService.logout_all
         await self.uow.commit()
         await self.cache.invalidate(user.id)

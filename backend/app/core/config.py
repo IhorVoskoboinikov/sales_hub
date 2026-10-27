@@ -79,6 +79,17 @@ class Settings(BaseSettings):
     smtp_start_tls: bool = False
     email_from: str = "SalesHub <noreply@saleshub.local>"
 
+    # --- Telegram-бот пользователей (раздел 16). Без токена или имени бот не запускается
+    # (telegram_bot_token_missing), а POST /me/telegram/link отвечает 503 telegram.disabled.
+    telegram_bot_token: SecretStr | None = None
+    # Имя бота без @ — для ссылки https://t.me/<имя>?start=<токен> без запроса getMe.
+    telegram_bot_username: str | None = None
+    # Bot API: для бота и, с шага 5.12, для отправки из воркера; другой адрес — свой Bot API
+    # сервер или заглушка.
+    telegram_api_url: str = "https://api.telegram.org"
+    # Сколько живёт токен привязки из ссылки (email_tokens, цель telegram_link).
+    telegram_link_ttl_minutes: int = Field(10, ge=1)
+
     # --- Права (раздел 5): OPA и файл ролей policies/saleshub/data.yaml, который читают оба.
     opa_url: str = "http://localhost:8181"
     # Ответ сайдкара — ~1 мс. В тестах больше: паузы сборщика мусора полного прогона pytest
@@ -104,6 +115,11 @@ class Settings(BaseSettings):
         if self.docs_enabled is not None:
             return self.docs_enabled
         return self.app_env != "prod"
+
+    @property
+    def telegram_enabled(self) -> bool:
+        """Бот настроен: есть и токен, и имя для ссылки."""
+        return self.telegram_bot_token is not None and bool(self.telegram_bot_username)
 
     @property
     def log_json(self) -> bool:

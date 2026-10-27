@@ -18,6 +18,7 @@ from app.api.v1 import (  # noqa: F401 — модули с эндпоинтам�
     deals,
     failed_tasks,
     invites,
+    me,
     organizations,
     pipelines,
     protected_router,
@@ -91,6 +92,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(health.router)
     app.include_router(well_known.router)
     app.include_router(auth.router)
+    app.include_router(me.router)
     # Модули с эндпоинтами импортированы выше и объявили маршруты на этих роутерах. FastAPI 0.151
     # подключает роутер обёрткой (_IncludedRouter) и берёт его маршруты при каждом поиске.
     app.include_router(protected_router)

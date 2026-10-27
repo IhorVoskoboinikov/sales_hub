@@ -19,6 +19,7 @@ from app.repositories.outbox import OutboxRepository
 from app.repositories.refresh_tokens import RefreshTokenRepository
 from app.repositories.reports import ReportRepository
 from app.repositories.sent_notifications import SentNotificationRepository
+from app.repositories.telegram_links import TelegramLinkRepository
 from app.repositories.trash import TrashRepository
 from app.repositories.users import UserRepository
 
@@ -44,6 +45,7 @@ class UnitOfWork:
         self.live_records = LiveRecords(session, (Company, Contact, Deal, Activity))
         self.outbox = OutboxRepository(session)
         self.sent_notifications = SentNotificationRepository(session)
+        self.telegram_links = TelegramLinkRepository(session)  # раздел 16
         self.bulk_jobs = BulkJobRepository(session)
         self.bulk_chunks = BulkChunkRepository(session)
         self.bulk = BulkRepository(session)

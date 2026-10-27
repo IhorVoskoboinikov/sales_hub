@@ -30,6 +30,12 @@ x-app-env: &app-env
   EXPORT_RATE_PER_HOUR: 10
   EXPORT_MAX_CONCURRENT: 3
   SMTP_HOST: mailpit  # письма видно на localhost:8025
+  # Telegram-бот пользователей (раздел 16): токен и имя бота — в deploy/compose/.env. Без них
+  # make bot завершается с telegram_bot_token_missing, а POST /me/telegram/link — 503.
+  TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+  TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME:-}
+  TELEGRAM_API_URL: https://api.telegram.org
+  TELEGRAM_LINK_TTL_MINUTES: 10
   OPA_URL: http://opa:8181
   POLICIES_DIR: /policies  # тот же data.yaml, что читает OPA
   LOG_LEVEL: INFO
@@ -190,6 +196,22 @@ services:
       postgres: {condition: service_healthy}
       redis: {condition: service_healthy}
     # Батч — доли секунды; дольше ждёт только подключение к недоступной базе.
+    stop_grace_period: 30s
+
+  # Telegram-бот (раздел 16): long polling, ровно одна копия — две конфликтуют в getUpdates.
+  # Профиль telegram: make up его не запускает (токена может не быть), make bot — запускает.
+  # watchfiles, как у relay: правка .py — SIGINT, бот дожидается начатых апдейтов (до 20 с) и
+  # стартует заново. Вышедший сам процесс (нет токена) watchfiles не перезапускает: контейнер
+  # остаётся Up, причина — в make bot-logs.
+  # Файл ролей — для команд /today и /deals (шаг 5.13); OPA боту не нужен.
+  telegram-bot:
+    image: saleshub-api:dev
+    profiles: [telegram]
+    command: ["watchfiles", "--filter", "python", "--sigint-timeout", "25",
+              "python -m app.bot", "/app/app"]
+    volumes: *worker-volumes
+    environment: *app-env
+    depends_on: *worker-depends-on
     stop_grace_period: 30s
 
   # Мониторинг задач по событиям воркеров. Без входа — порт только на localhost.

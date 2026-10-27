@@ -85,6 +85,13 @@ ERRORS: dict[str, str] = {
     # Валюти
     "fx.unknown_currency": "НБУ не встановлює курс для цієї валюти",
     "fx.unavailable": "Курс НБУ тимчасово недоступний",
+    # Telegram (раздел 16)
+    "telegram.disabled": "Telegram-бот не налаштовано",
+    "telegram.access_denied": "Доступ закрито: обліковий запис SalesHub відключено або він не "
+    "належить до організації",
+    "telegram.link_conflict": "Не вдалося підключити Telegram, спробуйте ще раз",
+    "telegram.chat_taken": "Цей чат уже підключено до іншого акаунта SalesHub (надішліть /start, "
+    "щоб побачити, до якого). Спершу відключіть його в профілі того акаунта",
     # Права
     "authz.policy_out_of_sync": "Правила доступу не узгоджені, зверніться до адміністратора",
     # Пароль
@@ -106,6 +113,29 @@ EMAIL_SUBJECTS: dict[str, str] = {
     "invite": "Запрошення до SalesHub",
     "already_member": "Запрошення до SalesHub",
     "reset_password": "Зміна пароля в SalesHub",
+}
+
+# Telegram-бот (раздел 16). Простой текст без parse_mode: экранировать ничего не нужно.
+BOT: dict[str, str] = {
+    "linked": "Акаунт SalesHub {email} підключено. Сюди надходитимуть сповіщення.",
+    "connected_as": "Ви підключені як {email}.",
+    "how_to_link": "Щоб підключити бота, відкрийте профіль у SalesHub, натисніть «Підключити "
+    "Telegram» і перейдіть за посиланням — воно діє кілька хвилин.",
+    "commands": "Доступні команди:\n{commands}",
+    "error": "Сталася помилка, спробуйте пізніше",
+}
+
+# Команды бота: меню Telegram (set_my_commands) и ответ на любой другой текст.
+# /today, /deals и /stop добавит шаг 5.13.
+BOT_COMMANDS: dict[str, str] = {
+    "start": "підключити акаунт SalesHub",
+}
+
+# Ответ бота на ошибку по её коду, если он отличается от title ошибки API (ERRORS).
+BOT_ERRORS: dict[str, str] = {
+    "email_token.invalid": "Посилання недійсне або вже використане — отримайте нове в профілі "
+    "SalesHub",
+    "email_token.expired": "Термін дії посилання минув — отримайте нове в профілі SalesHub",
 }
 
 # Сообщения валидации по типу ошибки Pydantic. В фигурных скобках — поля из ctx ошибки.
@@ -143,6 +173,11 @@ VALIDATION_DEFAULT = "Некоректне значення"
 def error_title(code: str) -> str:
     # Код без своего текста (например, редкий HTTP-статус Starlette) — общий заголовок.
     return ERRORS.get(code, ERRORS["http_error"])
+
+
+def bot_error_text(code: str, title: str) -> str:
+    """Ответ бота на AppError: свой текст для бота, иначе — title ошибки."""
+    return BOT_ERRORS.get(code, title)
 
 
 def validation_message(error_type: str, ctx: dict[str, Any] | None) -> str:

@@ -5,7 +5,7 @@ OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.2
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs logs-workers restart-workers urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
+.PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -34,6 +34,12 @@ logs-workers:  ## логи воркеров, beat и outbox relay в реаль�
 
 restart-workers:  ## перезапустить воркеры, beat и relay (beat перечитывает расписание только при старте)
 	$(COMPOSE) restart worker worker-bulk beat outbox-relay
+
+bot:  ## запустить Telegram-бота (профиль telegram; нужны TELEGRAM_BOT_TOKEN и _USERNAME в deploy/compose/.env)
+	$(COMPOSE) --profile telegram up -d --build telegram-bot
+
+bot-logs:  ## логи Telegram-бота в реальном времени
+	$(COMPOSE) --profile telegram logs -f telegram-bot
 
 urls:  ## адреса веб-интерфейсов
 	@echo "Swagger      http://localhost:8000/docs   супер-админ admin@example.com / admin-password"

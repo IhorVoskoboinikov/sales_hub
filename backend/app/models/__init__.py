@@ -22,6 +22,7 @@ from app.models.notifications import NotificationChannel, SentNotification
 from app.models.organization import Organization, Team
 from app.models.outbox import OutboxEvent
 from app.models.refresh_token import RefreshToken
+from app.models.telegram import TelegramLink
 from app.models.user import ROLES_WITH_TEAM, Role, User
 
 __all__ = [
@@ -58,5 +59,6 @@ __all__ = [
     "Role",
     "SentNotification",
     "Team",
+    "TelegramLink",
     "User",
 ]

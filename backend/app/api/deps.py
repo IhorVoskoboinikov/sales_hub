@@ -16,7 +16,7 @@ from app.authz.opa import OpaClient
 from app.authz.roles import RoleCatalog
 from app.core.config import Settings
 from app.core.jwt import KeySet
-from app.errors import Unauthorized
+from app.errors import Forbidden, Unauthorized
 from app.repositories.pagination import DEFAULT_LIMIT, MAX_LIMIT, Page
 from app.repositories.rate_limiter import RateLimiter
 from app.repositories.user_cache import UserCache
@@ -34,6 +34,7 @@ from app.services.members import MemberService
 from app.services.organizations import OrganizationService, TeamService
 from app.services.password_reset import PasswordResetService
 from app.services.reports import ReportService
+from app.services.telegram import TelegramService
 from app.storage import FileStorage
 from app.uow import UnitOfWork
 from app.workers.celery_app import celery_app
@@ -262,6 +263,20 @@ def get_failed_task_service(
     return FailedTaskService(uow, sender)
 
 
+def get_telegram_service(
+    uow: UnitOfWork = Depends(get_uow),
+    cache: UserCache = Depends(get_user_cache),
+    settings: Settings = Depends(get_app_settings),
+) -> TelegramService:
+    # Имя бота — только если бот настроен целиком: без токена ссылка вела бы в никуда.
+    return TelegramService(
+        uow,
+        cache,
+        link_ttl=timedelta(minutes=settings.telegram_link_ttl_minutes),
+        bot_username=settings.telegram_bot_username if settings.telegram_enabled else None,
+    )
+
+
 def get_page(
     limit: int = Query(DEFAULT_LIMIT, ge=1, le=MAX_LIMIT, description="Строк на странице"),
     cursor: str | None = Query(None, description="next_cursor из предыдущей страницы"),
@@ -288,4 +303,12 @@ async def current_user(
     user = await auth.authenticate(token)
     request.state.user_id = user.id  # для access-лога
     structlog.contextvars.bind_contextvars(user_id=str(user.id))  # для остальных строк лога
+    return user
+
+
+async def current_member(user: CurrentUser = Depends(current_user)) -> CurrentUser:
+    """Пользователь организации — для личных эндпоинтов /api/v1/me/* (раздел 5): они без OPA и
+    работают только с записями самого пользователя. Без организации (супер-админ) — 403."""
+    if user.org_id is None:
+        raise Forbidden()
     return user

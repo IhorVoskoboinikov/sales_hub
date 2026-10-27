@@ -1,4 +1,4 @@
-# CI на каждый pull request и push в main: lint, unit, integration, policy (раздел 12).
+# CI на каждый pull request и push в main (раздел 12).
 name: CI
 
 on:
@@ -36,7 +36,8 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run pytest tests/unit --cov=app --cov-report=term-missing
+      # Без --cov: unit сам по себе покрывает services/ на 37%, порог считается в integration.
+      - run: uv run pytest tests/unit
 
   integration:
     needs: lint
@@ -47,11 +48,13 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked
-      # Postgres и Redis поднимает сам pytest через testcontainers (Docker на раннере есть).
-      - run: uv run pytest tests/integration
+      # Postgres, Redis и др. поднимает сам pytest через testcontainers (Docker на раннере есть).
+      # Здесь и unit: пороги покрытия (раздел 10) — на общем покрытии unit + integration.
+      - run: make coverage
+        working-directory: .
 
-  # Политики OPA (раздел 5): формат, строгая проверка, opa test и покрытие не ниже 90%.
-  # Та же версия OPA, что в compose и testcontainers; ставить opa не нужно — make запускает его в Docker.
+  # Политики OPA (раздел 5): Regal, формат, строгая проверка, opa test и покрытие не ниже 90%.
+  # Та же версия OPA, что в compose и testcontainers; ставить opa и regal не нужно — make запускает их в Docker.
   policy:
     runs-on: ubuntu-latest
     defaults:
@@ -59,4 +62,4 @@ jobs:
         working-directory: .
     steps:
       - uses: actions/checkout@v7
-      - run: make policy-test
+      - run: make policy-test REGAL_ARGS="--format github"  # замечания Regal — аннотациями в PR

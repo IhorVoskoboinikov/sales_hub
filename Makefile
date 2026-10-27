@@ -2,10 +2,13 @@
 COMPOSE = docker compose -f deploy/compose/docker-compose.yml
 # opa из Docker — ставить его локально не нужно. Версия — как в compose и CI.
 OPA = docker run --rm -v $(CURDIR)/policies:/policies:ro openpolicyagent/opa:1.21.3
+# Regal — линтер Rego, тоже из Docker; конфиг .regal/config.yaml находится, потому что смонтирован весь репозиторий.
+REGAL = docker run --rm -v $(CURDIR):/work:ro -w /work ghcr.io/open-policy-agent/regal:0.43.0
+REGAL_ARGS ?=
 BACKEND = cd backend &&
 
 .DEFAULT_GOAL := help
-.PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate revision run test test-unit test-integration lint fmt policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
+.PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate revision run test test-unit test-integration test-policy coverage lint fmt policy-lint policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
 
 help:  ## показать команды
 	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-17s %s\n", $$1, $$2}'
@@ -99,13 +102,25 @@ test-unit:  ## только unit-тесты, без Docker
 test-integration:  ## тесты с настоящими Postgres и Redis (testcontainers)
 	$(BACKEND) uv run pytest tests/integration
 
+coverage:  ## все тесты с покрытием и порогами, как job integration в CI: services/ и authz/ — 80%, всё — 90%
+	$(BACKEND) uv run pytest --cov --cov-report=
+	$(BACKEND) uv run coverage report --skip-covered --include='app/services/*' --fail-under=80
+	$(BACKEND) uv run coverage report --skip-covered --include='app/authz/*' --fail-under=80
+	$(BACKEND) uv run coverage report --format=total --fail-under=90
+
+test-policy: policy-test  ## политики целиком: Regal, opa test и pytest-тесты кода, который обязан совпадать с policies/ (нужен Docker)
+	$(BACKEND) uv run pytest -m policy
+
 lint:  ## ruff + mypy, как в CI
 	$(BACKEND) uv run ruff check . && uv run ruff format --check . && uv run mypy app
 
 fmt:  ## отформатировать код и исправить то, что ruff умеет сам
 	$(BACKEND) uv run ruff format . && uv run ruff check --fix .
 
-policy-test:  ## тесты политик OPA: формат, проверка, opa test с покрытием не ниже 90%
+policy-lint:  ## линтер Rego (Regal)
+	$(REGAL) lint $(REGAL_ARGS) policies
+
+policy-test: policy-lint  ## тесты политик OPA: Regal, формат, проверка, opa test с покрытием не ниже 90%
 	$(OPA) fmt --list --fail /policies
 	$(OPA) check --strict /policies
 	$(OPA) test -b /policies -v

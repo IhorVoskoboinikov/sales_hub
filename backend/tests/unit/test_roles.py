@@ -10,6 +10,8 @@ from app.authz.roles import RoleCatalog
 from app.errors import ServiceUnavailable
 from tests.conftest import POLICIES_DIR
 
+pytestmark = pytest.mark.policy  # совпадает с policies/: make test-policy
+
 
 @pytest.fixture(scope="module")
 def roles() -> RoleCatalog:

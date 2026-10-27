@@ -660,7 +660,7 @@ roles:
 
 ### Политики
 
-В проекте — OPA 1.21.3 (compose, testcontainers и CI). `make policy-test` запускает OPA из Docker: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies -v` и покрытие `--coverage --threshold 90`; тот же make-таргет — job `policy` в CI. Тесты на маршруты этапов 4–9 добавляются в `authz_test.rego` вместе с маршрутами. Намеренная опечатка в имени действия, неверный уровень и слишком широкий `export:run` роняют тесты.
+В проекте — OPA 1.21.3 (compose, testcontainers и CI). `make policy-test` запускает из Docker Regal 0.43.0 (линтер Rego, `.regal/config.yaml`), затем OPA: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies -v` и покрытие `--coverage --threshold 90`; тот же make-таргет — job `policy` в CI. Тесты на маршруты этапов 4–9 добавляются в `authz_test.rego` вместе с маршрутами. Намеренная опечатка в имени действия, неверный уровень и слишком широкий `export:run` роняют тесты.
 
 **Как читать Rego.** Обращение к отсутствующему ключу в Rego даёт не ошибку, а «нет значения» (undefined). Правило, в котором встретилось такое значение, просто не срабатывает, и берётся значение `default`. Поэтому для неописанного эндпоинта: `action` нет → ни одно `allow` не сработало → `allow = false`, `decision = {allow: false}`. Строка `permissions[action]` проверяет только, что ключ есть: значение `own` / `team` / `org` в условии считается истиной.
 
@@ -1340,6 +1340,8 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 | policy (Rego) | роль × эндпоинт (allow / 403), опечатки в действиях и уровнях `data.yaml` | opa test --coverage, Regal (линтер) | миллисекунды |
 | auth flow | приглашение → письмо → accept → login → refresh → повтор старого refresh (отзыв семьи) → reset | integration + Mailpit API (чтение писем из теста), freezegun для сроков | секунды |
 
+**Маркеры и запуск (шаг 6.1).** Уровень теста — его каталог: `tests/unit` и `tests/integration`; маркеры `unit` и `integration` ставит хук `pytest_collection_modifyitems` в `tests/conftest.py`, руками их не пишут. `policy` — код, который обязан совпадать с `policies/` (`test_roles.py`, `test_openapi_permissions.py`, `test_routes_policy.py`, `test_opa_client.py`, `test_access_matrix.py`; `pytestmark` в файле): это не отдельный уровень, а метка поверх него — после правки `.rego` или `data.yaml` хватает `make test-policy` (Regal, `opa test` и `pytest -m policy`). Сам Rego проверяет job `policy` (`make policy-test`) без Python. В pytest включён `strict = true`: незарегистрированный маркер или опечатка в настройке — ошибка. Выборки: `make test-unit`, `make test-integration` (по каталогу — так не импортируются модули другого уровня), `pytest -m "integration and not worker"`.
+
 ### Изоляция БД в integration-тестах
 
 - Один контейнер Postgres на сессию pytest, `alembic upgrade head` один раз.
@@ -1394,7 +1396,7 @@ async def test_access(role, route, target, route_actions, client, ...):
 - Бот: `create_dispatcher(...)` и `dp.feed_update(bot, update)` без сети — обработчики возвращают метод (`return message.answer(...)`), тест сравнивает его текст.
 - Время: freezegun для расписания, напоминаний и дайджеста.
 
-Покрытие собирается `pytest-cov`, порог в CI — 80% для `services/` и `authz/`, остальное без жёсткого порога.
+Покрытие собирается `pytest-cov` (настройки — `[tool.coverage.*]` в `pyproject.toml`), только строки. Ядро — `sysmon` (`sys.monitoring`): на Python 3.13 почти без накладных, а привычный ctrace замедлял прогон на 39% и без `concurrency = greenlet` терял строки после `await` в SQLAlchemy async (сервис организаций — 50% вместо 97%). `branch = true` и `concurrency = greenlet` не включаем: с ними `sysmon` на 3.13 не работает, и coverage одним предупреждением переключается на ctrace. Пороги проверяет `make coverage` (его же вызывает job `integration`): все тесты одним прогоном, `services/` и `authz/` — не ниже 80% каждый, всё приложение — не ниже 90%. Отдельно в job `unit` порога нет: unit-тесты сами по себе покрывают `services/` на 37% — сервисы проверяются на настоящей базе. `fail_under` в конфиг не пишется: pytest-cov применил бы его к любому прогону с `--cov`. На момент шага 6.1: `services/` — 96,7%, `authz/` — 96,5%, всё — 96,4% (1457 тестов, 9 мин 13 с локально).
 
 ## 11. Деплой: compose → Kubernetes → Tilt
 
@@ -1547,15 +1549,15 @@ CI проверяет каждый PR (качество, тесты, мигра�
 | Job | Шаги | Зависит от |
 | --- | --- | --- |
 | `lint` | `ruff check`, `ruff format --check`, `mypy app` | — |
-| `unit` | `pytest tests/unit --cov` | — |
-| `integration` | `pytest tests/integration`: Postgres и Redis поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре; там же проверки миграций (одна голова, `alembic check`, downgrade → upgrade) | lint |
+| `unit` | `pytest tests/unit` (без покрытия — оно считается в `integration`) | — |
+| `integration` | `make coverage`: все тесты (unit + integration) с покрытием и порогами раздела 10; Postgres, Redis, OPA и др. поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре; там же проверки миграций (одна голова, `alembic check`, downgrade → upgrade) | lint |
 | `migrations` | upgrade → `alembic check` → downgrade base → upgrade; одна голова | lint |
 | `openapi` | экспорт `openapi.json`, diff с main (ломающие изменения подсвечиваются) | lint |
 | `build` | `docker buildx` с кэшем GHA, без push | unit |
 | `helm` | `helm lint`, `helm template` + `kubeconform` | — |
 | `monitoring` | `promtool check rules`, `promtool test rules` | — |
 | `frontend` (если есть) | `npm ci`, lint, `vitest`, `vite build` | — |
-| `policy` | `make policy-test`: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies` и `--coverage --threshold 90` (OPA 1.21.3 из Docker); Regal (линтер Rego) — на этапе 6 | — |
+| `policy` | `make policy-test`: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies` и `--coverage --threshold 90` (OPA 1.21.3 из Docker), перед ними Regal 0.43.0 (линтер Rego, `.regal/config.yaml`; замечания — аннотациями в PR) | — |
 
 Параллельность: всё, что не зависит друг от друга, идёт одновременно; кэш uv и Docker-слоёв обязателен, иначе CI будет медленным. Ветка `main` защищена: мерж только при зелёных обязательных проверках.
 
@@ -1819,12 +1821,12 @@ deploy/
 
 CI растёт с этапа 1; здесь он доводится до полного набора из раздела 12.
 
-- [ ] 6.1 Разделить тесты на `unit` / `integration` / `policy`, маркеры pytest, пороги покрытия.
-- [ ] 6.2 Job `migrations`: upgrade → `alembic check` → downgrade → upgrade, одна голова.
-- [ ] 6.3 Job `openapi`: экспорт схемы и сравнение с `main`.
-- [ ] 6.4 Job `build`: сборка образа с кэшем, без публикации.
-- [ ] 6.5 Кэш uv и Docker в Actions, параллельные jobs.
-- [ ] 6.6 Обязательные проверки в защите ветки `main`.
+- [x] 6.1 Уровни тестов: маркеры `unit` / `integration` (ставятся по каталогу) и `policy` (код, который обязан совпадать с `policies/`), `strict = true` в pytest, `make test-policy`; покрытие — ядро `sysmon`, только строки (без `branch` и `concurrency = greenlet`: с ними sysmon на 3.13 откатывается на ctrace, а ctrace без greenlet теряет строки после `await`), пороги 80% для `services/` и `authz/` и 90% всего — на общем покрытии unit + integration в job `integration` (unit сам по себе покрывает `services/` на 37%); Regal в `make policy-test` и job `policy`.
+- [ ] 6.2 Job `migrations`: `scripts/check_migrations.sh` (одна голова → upgrade → `alembic check` → downgrade base → upgrade) на пустом Postgres-сервисе Actions и `make migrations-check` с одноразовым контейнером; `test_migrations.py` удаляется — его проверки переехали в job, а downgrade посреди общего прогона мешает xdist.
+- [ ] 6.3 Job `openapi`: `python -m app.cli export-openapi` → `backend/openapi.json` в git (`make openapi`); CI проверяет, что файл свежий, и сравнивает его с файлом из `main` через `oasdiff` — ломающие изменения подсвечиваются аннотациями и списком в Summary, job из-за них не падает.
+- [ ] 6.4 Job `build`: `docker/build-push-action` с кэшем слоёв `type=gha`, без публикации, и проверка, что образ без dev-зависимостей импортирует приложение и воркеры.
+- [ ] 6.5 Скорость: integration в 4 процесса (`pytest-xdist -n 4`, у каждого свои контейнеры), integration без `needs: lint`, одна версия uv в CI и Dockerfile, кэш uv; отмена устаревших прогонов только у PR.
+- [ ] 6.6 Обязательная проверка: job-агрегатор `ci-ok` (зелёный, только если зелёные все jobs) и ruleset на `main` — PR, `ci-ok` из GitHub Actions, ветка свежая, без force push и удаления; включается руками в GitHub по инструкции из раздела 12.
 
 **Готово, когда:** PR нельзя смержить без зелёного CI, полный прогон занимает меньше 10 минут.
 
@@ -1963,12 +1965,16 @@ CI растёт с этапа 1; здесь он доводится до пол�
 | Уведомления (шаг 5.12) | события — хук `_events` CRM-сервисов и `_record_final` bulk (любой финальный переход, любой вид job, `rows = null` у импорта); notifier пишет команды только активным пользователям организации события, Telegram — только привязанным, «вам передано N» — только при N > 0 (сумма по сущностям); текст Telegram = `.txt` письма; `TelegramApiError` с `retry_after`, пауза 429 — через `retry_countdown` в `BaseTask`, сеть — `TelegramUnavailable(ConnectionError)` без цепочки; нет токена — пропуск до ключа дедупа; `PUT /me/notifications` — замена под advisory lock пользователя (последний `PUT` побеждает целиком, без deadlock; строка `users` не блокируется); `send_email` письмо notifier отключённому после notify не отправляет; 403 Telegram удаляет привязку по `(user_id, chat_id, linked_at)` (раздел 16) |
 | Команды бота (шаг 5.13) | только свои записи: `Access.for_user(user, action, roles).own()` без OPA, нет действия у роли — `Forbidden` → «недоступно»; повестка — `AgendaService.day(user, now)` (её же возьмёт дайджест 5.14): граница — местная полночь по `coalesce(users.timezone, organizations.timezone)`, сегодня до 20 и просроченные до 10 (недавние первыми — иначе вчерашний пропущенный звонок терялся бы за давно забытыми), «…та інші», у просроченных — дата, тема и название сделки до 80 единиц UTF-16 (так Telegram считает лимит 4096); `/deals` — 10 новых и итог по всем открытым в валюте организации, при `fx.stale` — «(курс на <дата>)», нет открытых — ответ без курса (не зависит от НБУ); `/stop` вне `LinkedUserMiddleware` удаляет привязку по `chat_id` (и у отключённого, повтор — не ошибка), настройки уведомлений не трогает (раздел 16) |
 | Напоминания и дайджест (шаг 5.14) | по одному запросу на тик от `telegram_links`, умолчание настройки — параметр из `catalog.DEFAULTS`; уже отправленные ключи вычитаются внутри `LATERAL` до лимита 20 (21-е уходит следующим тиком); ключ занимает только отправитель — тик до отправки может записать команду повторно, её гасит дедуп; у команды срок `not_after` (напоминание — `min(due_at, тик + 2 мин)`, дайджест — местные 12:00), устаревшую `send_telegram` пропускает без ключа; в ключе напоминания есть `user_id` (передача звонка — напоминание новому ответственному); дайджест коммитит пачками по 100 с бюджетом 200 с; ключи — парами Python / SQL в `keys.py` (`floor` секунд); дайджест — `AgendaService.day` без изменений, заголовок с двоеточием, как у `/today`; без токена бота обе задачи выходят сразу; индекс `(owner_id, due_at, id) WHERE done_at IS NULL` уже был (раздел 16) |
+| Покрытие (этап 6) | `coverage` с ядром `sysmon` (на Python 3.13 почти без накладных, ctrace — +39%), только строки (ветки на 3.13 sysmon не умеет и молча откатывается на ctrace); порог проверяется на общем покрытии unit + integration, а не в job `unit` |
+| Скорость CI (этап 6) | integration через `pytest-xdist -n 4`: у каждого процесса свои Postgres, Redis, Mailpit, OPA, RustFS; не шардинг по раннерам — матрица прав одна занимает 61% времени, а шардам нужны файл длительностей и сборка покрытия |
+| Схема API в git (этап 6) | `backend/openapi.json` коммитится: CI проверяет свежесть, сравнение с `main` — `git show` + `oasdiff` (образ `tufin/oasdiff`), без запуска кода `main`; из этого же файла этап 11 генерирует TS-клиент |
+| Защита `main` (этап 6) | ruleset, а не классическая защита ветки; одна обязательная проверка `ci-ok` — новые jobs добавляются в её `needs`, настройки GitHub не меняются; 0 одобрений (свой PR одобрить нельзя), обходов нет |
 
 ### Открытые вопросы
 
 - [x] Уведомления — email и Telegram-бот (раздел 16).
 - [x] Поиск — Elasticsearch (раздел 17).
-- [ ] Новых открытых вопросов нет; этапы 1–4 закрыты, идёт этап 5 (ветка `stage-5`).
+- [ ] Новых открытых вопросов нет; этапы 1–5 закрыты, идёт этап 6 (ветка `stage-6`).
 
 ## 15. Модуль: система воркеров
 

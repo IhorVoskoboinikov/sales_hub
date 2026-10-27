@@ -8,6 +8,9 @@ REGAL_ARGS ?=
 # oasdiff — сравнение схем OpenAPI (раздел 12), версия — как в job openapi.
 OASDIFF = docker run --rm -v $(CURDIR):/repo:ro -w /repo tufin/oasdiff:v1.34.1
 BACKEND = cd backend &&
+# Integration-тесты — в 4 процесса (pytest-xdist): у каждого свои контейнеры testcontainers (раздел 10).
+# Больше не нужно: на раннере CI 4 ядра, а каждый процесс поднимает ~5 контейнеров. XDIST= — без xdist.
+XDIST ?= -n 4 --dist worksteal
 
 .DEFAULT_GOAL := help
 .PHONY: help up infra down clean ps logs logs-workers restart-workers bot bot-logs urls keys migrate migrations-check revision openapi openapi-diff run test test-unit test-integration test-policy coverage lint fmt policy-lint policy-test policy-fmt refresh-reports seed-big seed-big-clean import-csv explain experiments bench-updates chaos
@@ -121,22 +124,22 @@ run: keys  ## API без Docker с автоперезапуском (снача�
 	$(BACKEND) uv run uvicorn app.main:create_app --factory --reload --no-access-log
 
 test:  ## все тесты (интеграционным нужен Docker)
-	$(BACKEND) uv run pytest
+	$(BACKEND) uv run pytest $(XDIST)
 
 test-unit:  ## только unit-тесты, без Docker
 	$(BACKEND) uv run pytest tests/unit
 
 test-integration:  ## тесты с настоящими Postgres и Redis (testcontainers)
-	$(BACKEND) uv run pytest tests/integration
+	$(BACKEND) uv run pytest tests/integration $(XDIST)
 
 coverage:  ## все тесты с покрытием и порогами, как job integration в CI: services/ и authz/ — 80%, всё — 90%
-	$(BACKEND) uv run pytest --cov --cov-report=
+	$(BACKEND) uv run pytest $(XDIST) --cov --cov-report=
 	$(BACKEND) uv run coverage report --skip-covered --include='app/services/*' --fail-under=80
 	$(BACKEND) uv run coverage report --skip-covered --include='app/authz/*' --fail-under=80
 	$(BACKEND) uv run coverage report --format=total --fail-under=90
 
 test-policy: policy-test  ## политики целиком: Regal, opa test и pytest-тесты кода, который обязан совпадать с policies/ (нужен Docker)
-	$(BACKEND) uv run pytest -m policy
+	$(BACKEND) uv run pytest -m policy $(XDIST)
 
 lint:  ## ruff + mypy, как в CI
 	$(BACKEND) uv run ruff check . && uv run ruff format --check . && uv run mypy app

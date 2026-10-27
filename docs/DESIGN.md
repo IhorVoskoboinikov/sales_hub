@@ -28,7 +28,7 @@ SalesHub — мульти-тенантная CRM для отделов прод�
 | События (этап 9) | Transactional outbox → Redpanda (Kafka API), aiokafka или FastStream | сравнение с Celery |
 | Логи | structlog (JSON), Loki |  |
 | Метрики / алерты | Prometheus, Grafana, Alertmanager → Telegram |  |
-| Тесты | pytest, pytest-asyncio, httpx, testcontainers, factory-boy, polyfactory |  |
+| Тесты | pytest, pytest-asyncio, pytest-xdist, pytest-cov (coverage, ядро sysmon), httpx, testcontainers, factory-boy, polyfactory |  |
 | Качество | ruff, mypy, pre-commit |  |
 | Пакеты | uv | быстрый lock и сборка образов |
 | Деплой | Docker, docker compose → k3d + Helm + Tilt, Sealed Secrets |  |
@@ -1346,7 +1346,7 @@ Prometheus собирает метрики (pull по `/metrics`), Grafana их 
 
 ### Изоляция БД в integration-тестах
 
-- Один контейнер Postgres на сессию pytest, `alembic upgrade head` один раз.
+- Один контейнер Postgres на сессию pytest, `alembic upgrade head` один раз. С шага 6.5 тесты идут в 4 процесса (`pytest-xdist -n 4 --dist worksteal`, переменная `XDIST` в Makefile; `XDIST=` — в один процесс): сессионные фикстуры выполняются в каждом процессе, поэтому у каждого свои Postgres, Redis, Mailpit, OPA, RustFS и воркер Celery — `TRUNCATE` `committing`-тестов и общий Redis не задевают соседей, а pytest-cov сам собирает покрытие процессов. Больше 4 не ставим: на раннере CI 4 ядра, а процесс поднимает ~5 контейнеров. Полный набор локально — 2 мин 52 с вместо 9 мин 13 с, покрытие то же.
 - Каждый тест — во внешней транзакции с `SAVEPOINT` (`join_transaction_mode="create_savepoint"`), откат после теста: быстро и без очистки таблиц. Подменённая `get_session` при ошибке в запросе откатывает его SAVEPOINT — как настоящий запрос, который при ошибке ничего не сохраняет. После такого отката объекты сессии «протухают», поэтому значения, нужные тесту после ответа 4xx (например, email), держат в переменных.
 - Сессия подменяется через `app.dependency_overrides[get_session]`.
 - Таймаут запроса к OPA — настройка `OPA_TIMEOUT_SECONDS` (0,5 с: сайдкар отвечает за ~1 мс); в integration-тестах — 5 с: в полном прогоне pytest (тысячи тестов в памяти) пауза сборщика мусора дольше 0,5 с роняла кейс матрицы в 503 `opa`, всегда один и тот же.
@@ -1552,7 +1552,7 @@ CI проверяет каждый PR (качество, тесты, мигра�
 | --- | --- | --- |
 | `lint` | `ruff check`, `ruff format --check`, `mypy app` | — |
 | `unit` | `pytest tests/unit` (без покрытия — оно считается в `integration`) | — |
-| `integration` | `make coverage`: все тесты (unit + integration) с покрытием и порогами раздела 10; Postgres, Redis, OPA и др. поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре | lint |
+| `integration` | `make coverage`: все тесты (unit + integration) с покрытием и порогами раздела 10; Postgres, Redis, OPA и др. поднимает testcontainers, `alembic upgrade head` — в сессионной фикстуре; 4 процесса (`pytest-xdist`, раздел 10), `timeout-minutes: 20` | — |
 | `migrations` | `scripts/check_migrations.sh` на Postgres-сервисе: одна голова → upgrade → `alembic check` → downgrade base → upgrade (раздел 9) | lint |
 | `openapi` | `export-openapi` → `backend/openapi.json` не изменился (иначе — «схема устарела: make openapi»); в PR — `oasdiff` против файла из базовой ветки (`git show`, без запуска её кода): `changelog` — в Summary, `breaking` — аннотациями; ломающие изменения подсвечиваются, но job не валят (API 0.x, часть ломок намеренные; блокировать — `--fail-on ERR`). В базовой ветке файла ещё нет — notice и без сравнения | lint |
 | `build` | `docker/build-push-action` (стадия `runtime`, без push), кэш слоёв `type=gha`, `mode=max` — с ним кэшируется и стадия `builder` с `uv sync`; smoke-проверка образа без сети: импорт `app.main`, `app.cli`, воркеров, relay и бота, `alembic` и `celery` на месте — так ловится зависимость, попавшая только в dev-группу. Кэш-маунт uv из Dockerfile в GHA не сохраняется — не нужен: слой `uv sync` и так берётся из кэша, пока не менялся `uv.lock`. `backend/.dockerignore` не пускает в контекст сборки `tmp` (CSV `make import-csv` — десятки МБ), ключи, `.env`, тесты, данные покрытия и `openapi.json` | unit |
@@ -1561,7 +1561,7 @@ CI проверяет каждый PR (качество, тесты, мигра�
 | `frontend` (если есть) | `npm ci`, lint, `vitest`, `vite build` | — |
 | `policy` | `make policy-test`: `opa fmt --list --fail`, `opa check --strict`, `opa test -b policies` и `--coverage --threshold 90` (OPA 1.21.3 из Docker), перед ними Regal 0.43.0 (линтер Rego, `.regal/config.yaml`; замечания — аннотациями в PR) | — |
 
-Параллельность: всё, что не зависит друг от друга, идёт одновременно; кэш uv и Docker-слоёв обязателен, иначе CI будет медленным. Ветка `main` защищена: мерж только при зелёных обязательных проверках.
+Параллельность: всё, что не зависит друг от друга, идёт одновременно; кэш uv и Docker-слоёв обязателен, иначе CI будет медленным. `integration` — самый долгий job, поэтому он не ждёт `lint` (быстрая ошибка линтера экономит минуты раннера, но не время до результата; минуты публичного репозитория бесплатны). Кэш uv — `setup-uv` с `enable-cache` (ключ — `uv.lock`), версия uv закреплена (`version: "0.11.6"`) и совпадает с Dockerfile: CI и образ ставят зависимости одним и тем же uv. Образы testcontainers не кэшируются: ~1 ГБ через `docker save/load` грузился бы дольше, чем скачивается, а лимитов Docker Hub у раннеров GitHub нет. Новый пуш в PR отменяет идущий прогон, пуш в `main` — нет (иначе у коммита быстрого второго мержа не осталось бы результата CI). Ветка `main` защищена: мерж только при зелёных обязательных проверках.
 
 ### CD — `.github/workflows/cd.yml` (на push в main и теги `v*`)
 
@@ -1827,7 +1827,7 @@ CI растёт с этапа 1; здесь он доводится до пол�
 - [x] 6.2 Job `migrations`: `scripts/check_migrations.sh` (одна голова → upgrade → `alembic check` → downgrade base → upgrade) на пустом Postgres-сервисе Actions и `make migrations-check` с одноразовым контейнером; `test_migrations.py` удаляется — его проверки переехали в job, а downgrade посреди общего прогона мешает xdist.
 - [x] 6.3 Job `openapi`: `python -m app.cli export-openapi` → `backend/openapi.json` в git (`make openapi`); CI проверяет, что файл свежий, и сравнивает его с файлом из `main` через `oasdiff` — ломающие изменения подсвечиваются аннотациями и списком в Summary, job из-за них не падает.
 - [x] 6.4 Job `build`: `docker/build-push-action` с кэшем слоёв `type=gha`, без публикации, и проверка, что образ без dev-зависимостей импортирует приложение и воркеры.
-- [ ] 6.5 Скорость: integration в 4 процесса (`pytest-xdist -n 4`, у каждого свои контейнеры), integration без `needs: lint`, одна версия uv в CI и Dockerfile, кэш uv; отмена устаревших прогонов только у PR.
+- [x] 6.5 Скорость: integration в 4 процесса (`pytest-xdist -n 4`, у каждого свои контейнеры), integration без `needs: lint`, одна версия uv в CI и Dockerfile, кэш uv; отмена устаревших прогонов только у PR.
 - [ ] 6.6 Обязательная проверка: job-агрегатор `ci-ok` (зелёный, только если зелёные все jobs) и ruleset на `main` — PR, `ci-ok` из GitHub Actions, ветка свежая, без force push и удаления; включается руками в GitHub по инструкции из раздела 12.
 
 **Готово, когда:** PR нельзя смержить без зелёного CI, полный прогон занимает меньше 10 минут.

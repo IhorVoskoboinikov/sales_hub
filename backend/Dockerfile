@@ -2,6 +2,7 @@
 
 # --- Сборка: зависимости ставятся в /app/.venv через uv (без dev-зависимостей).
 FROM python:3.13-slim AS builder
+# Версия uv — та же, что у setup-uv в .github/workflows/ci.yml: менять вместе.
 COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /bin/uv
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
